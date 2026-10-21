@@ -1,0 +1,3 @@
+FROM whalegirl-wechat:4.1.1.8-groups-20261020
+USER root
+COPY chat_select_linux.py /opt/tools/chat-select.py

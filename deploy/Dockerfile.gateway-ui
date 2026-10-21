@@ -1,0 +1,4 @@
+FROM whalegirl-wechat:4.1.1.8-20261020
+USER root
+RUN apt-get -o Acquire::http::Proxy=false -o Acquire::https::Proxy=false install -y --no-remove --no-install-recommends binutils
+COPY chat_select_linux.py /opt/tools/chat-select.py

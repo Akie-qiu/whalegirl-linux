@@ -1,0 +1,28 @@
+FROM motricseven7/snowluma@sha256:78b66d568e3c0991a8ba89bfc188281f87d5d45f32e259c885f43e2312ff0f4a
+USER root
+ENV DEBIAN_FRONTEND=noninteractive
+# Reuse the server's cached Linux runtime; no QQ process is launched here.
+RUN python3 -c "from pathlib import Path; root=Path('/etc/apt'); files=list(root.rglob('*.list'))+list(root.rglob('*.sources')); [(p.write_text(p.read_text().replace('http://deb.debian.org/debian-security','https://mirrors.aliyun.com/debian-security').replace('http://deb.debian.org/debian','https://mirrors.aliyun.com/debian').replace('http://security.debian.org/debian-security','https://mirrors.aliyun.com/debian-security'))) for p in files]; p=root/'apt.conf.d/docker-clean'; p.write_text('// Cache retained for inspection\\n') if p.exists() else None" \
+    && apt-get -o Acquire::http::Proxy=false -o Acquire::https::Proxy=false update \
+    && apt-get -o Acquire::http::Proxy=false -o Acquire::https::Proxy=false install -y --no-remove --no-install-recommends \
+    dbus-x11 fluxbox dunst at-spi2-core gir1.2-atspi-2.0 python3-gi \
+    python3-venv xdotool scrot xclip pulseaudio libasound2 libxss1 \
+    libgbm1 libnss3 libgtk-3-0 libatomic1 libxcb-icccm4 libxcb-image0 \
+    libxcb-keysyms1 libxcb-render-util0 libxkbcommon-x11-0 fonts-noto-cjk \
+    ca-certificates libssl3 binutils
+COPY wechat-4.1.0.16-verified.deb /opt/wechat-4.1.0.16-verified.deb
+RUN echo '8445e4eb0074cd5dd1fa2dc34f70a548f1e1feeb7aeb452ad69dcbd2804d01a2  /opt/wechat-4.1.0.16-verified.deb' | sha256sum --check \
+    && dpkg -i /opt/wechat-4.1.0.16-verified.deb \
+    && test "$(dpkg-query -W -f='${Version}' wechat)" = '4.1.0.16' \
+    && apt-mark hold wechat \
+    && sha256sum /opt/wechat/wechat > /opt/wechat-pinned.sha256
+RUN python3 -m venv --system-site-packages /opt/agent-python \
+    && /opt/agent-python/bin/pip install --index-url https://mirrors.aliyun.com/pypi/simple/ 'frida>=16,<18'
+RUN if ! id wechat; then useradd -m -s /bin/bash wechat; fi
+COPY gateway-bin/agent-server /opt/agent-server/agent-server
+COPY gateway-bin/sqlcipher /usr/local/bin/sqlcipher
+COPY tools/ /opt/tools/
+COPY gateway_entry.py /opt/gateway_entry.py
+RUN chmod +x /opt/tools/* /opt/agent-server/agent-server /usr/local/bin/sqlcipher
+ENV PATH=/opt/agent-python/bin:/opt/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENTRYPOINT ["/usr/bin/python3", "/opt/gateway_entry.py"]

@@ -1,0 +1,3 @@
+[submodule "references/agent-wechat-source"]
+	path = references/agent-wechat-source
+	url = https://github.com/thisnick/agent-wechat.git

@@ -1,0 +1,15 @@
+* text=auto
+.gitmodules text eol=lf
+.gitattributes text eol=lf
+*.py text eol=lf
+*.js text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.md text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=crlf
+*.service text eol=lf
+*.timer text eol=lf
+*.path text eol=lf

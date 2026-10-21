@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch a restricted WhaleGirl login QR refresh request
+
+[Path]
+PathChanged=/var/lib/whalegirl-linux/core/qr-refresh.request
+Unit=whalegirl-qr-refresh.service
+
+[Install]
+WantedBy=multi-user.target

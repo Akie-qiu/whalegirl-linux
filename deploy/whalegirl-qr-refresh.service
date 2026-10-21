@@ -1,0 +1,14 @@
+[Unit]
+Description=Refresh only the observed native WeChat login QR widget
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/whalegirl-linux/qr_control.py
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/whalegirl-linux/core
+MemoryMax=64M
+TimeoutStartSec=40

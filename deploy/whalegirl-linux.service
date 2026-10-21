@@ -1,0 +1,31 @@
+[Unit]
+Description=WhaleGirl Linux lightweight chat core
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=whalegirl-ai
+Group=whalegirl-ai
+WorkingDirectory=/opt/whalegirl-linux/current
+Environment=WHALEGIRL_DATA_DIR=/var/lib/whalegirl-linux/core
+Environment=WHALEGIRL_GATEWAY_URL=http://127.0.0.1:6175
+Environment=WHALEGIRL_PORT=8092
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/whalegirl-linux/venv/bin/python -m whalegirl_linux
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/whalegirl-linux/core
+MemoryHigh=128M
+MemoryMax=192M
+MemorySwapMax=256M
+CPUQuota=35%
+
+[Install]
+WantedBy=multi-user.target
