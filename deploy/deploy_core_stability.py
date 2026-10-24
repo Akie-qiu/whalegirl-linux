@@ -198,7 +198,7 @@ TimeoutStopSec=25s
     public_health = api_json('http://127.0.0.1:18092/health', timeout=6)
     core_state = api_json('http://127.0.0.1:8092/api/state',
                           (DATA / 'admin.token').read_text().strip(), timeout=6)
-    auth = api_json('http://127.0.0.1:8092/api/status/auth',
+    auth = api_json('http://127.0.0.1:6175/api/status/auth',
                     (DATA / 'gateway.token').read_text().strip(), timeout=6)
     container_after = validate_container()
     if container_after != container_before:
