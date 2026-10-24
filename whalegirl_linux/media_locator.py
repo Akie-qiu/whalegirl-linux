@@ -17,6 +17,7 @@ def locate_image(raw,nodes,local_id,kind,server_id=''):
              (not server_id or str(r.get('serverId'))==str(server_id))]
     if len(targets)!=1:return None
     target=targets[0]
+    if len(raw)==len(nodes)==1 and db_tokens==ui_tokens:return nodes[0]
     for block in SequenceMatcher(None,db_tokens,ui_tokens,autojunk=False).get_matching_blocks():
         if not (block.a<=target<block.a+block.size and block.size>=2):continue
         anchors=db_tokens[block.a:block.a+block.size]

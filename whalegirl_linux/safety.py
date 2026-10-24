@@ -85,13 +85,19 @@ class SafetyGuard:
             AND COALESCE(json_extract(m.metrics,'$.send_started_at'),i.updated)>=?
             UNION ALL SELECT chat,reply,kind,sent_at FROM outbound_actions
             WHERE account=? AND state IN ('sent','sending','uncertain') AND sent_at>=?''', (account,since,account,since)).fetchall()
-        counts = {'minute':0,'hour':0,'day':0,'chat_hour':0,'text_hour':0,'text_day':0,'sticker_hour':0,'sticker_day':0}
+        if self.store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='moments_actions'").fetchone():
+            rows += self.store.db.execute('''SELECT 'moments:' || kind || ':' ||
+                COALESCE(json_extract(payload,'$.post.id'),'timeline') AS chat,text AS reply,
+                'text' AS kind,updated AS sent_at FROM moments_actions WHERE account=?
+                AND state IN ('sent','sending','uncertain') AND updated>=?''',(account,since)).fetchall()
+        counts = {'minute':0,'hour':0,'day':0,'chat_hour':0,'text_hour':0,'text_day':0,'sticker_hour':0,'sticker_day':0,'image_hour':0,'image_day':0}
         for row in rows:
             when = row['sent_at']
-            counts['minute'] += when > now-60
-            counts['hour'] += when > now-3600
-            counts['day'] += when >= day_start
-            counts['chat_hour'] += row['chat']==chat and when > now-3600
+            if row['kind'] != 'image':
+                counts['minute'] += when > now-60
+                counts['hour'] += when > now-3600
+                counts['day'] += when >= day_start
+                counts['chat_hour'] += row['chat']==chat and when > now-3600
             counts[row['kind']+'_hour'] += when > now-3600
             counts[row['kind']+'_day'] += when >= day_start
         return counts,rows,day_start
@@ -101,6 +107,10 @@ class SafetyGuard:
         held = self.held(account)
         if held:
             return {'allowed':False,'code':'safety_hold','reason':held,'retry_at':None}
+        # Uploaded and previously generated images have no send-count or
+        # duplicate-content cap. Login/permission checks and receipts remain.
+        if kind == 'image':
+            return {'allowed':True}
         if not settings.safety_enabled:
             return {'allowed':True}
         counts,rows,day_start = self.activity(account,now,chat)
@@ -111,7 +121,7 @@ class SafetyGuard:
             ('day',settings.safety_per_day,86400,'day_limit','账号当日发送上限')):
             if settings.safety_send_limits_enabled and cap>0 and counts[field] >= cap:
                 times = [r['sent_at'] for r in rows if
-                    (field != 'chat_hour' or r['chat']==chat) and
+                    r['kind'] != 'image' and (field != 'chat_hour' or r['chat']==chat) and
                     r['sent_at'] >= (day_start if field=='day' else now-seconds)]
                 retry_at = day_start+86400 if field=='day' else sorted(times)[len(times)-cap]+seconds
                 return {'allowed':False,'code':code,'reason':f'本地保护：已达{label}（{cap}条），本次不发送',
@@ -164,7 +174,7 @@ class SafetyGuard:
         counts,rows,_ = self.activity(account)
         per_chat = {}
         for row in rows:
-            if row['sent_at']>time.time()-3600:
+            if row['kind'] != 'image' and row['sent_at']>time.time()-3600:
                 per_chat[row['chat']]=per_chat.get(row['chat'],0)+1
         limits_enabled = settings.safety_enabled and settings.safety_send_limits_enabled
         limited_chats = [{'chat':chat,'count':n} for chat,n in per_chat.items() if

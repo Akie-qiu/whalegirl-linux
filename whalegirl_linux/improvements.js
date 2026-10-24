@@ -2,25 +2,42 @@
 (() => {
   const element=(tag,cls,content) => {const e=document.createElement(tag);if(cls)e.className=cls;if(content)e.textContent=content;return e;};
   const button=(title,fn) => {const b=element('button','secondary',title);b.type='button';b.onclick=()=>action(b,fn);return b;};
-  const styleFields={reply_warmth:'回复温度',sticker_after_text:'文字后配表情',colloquialism:'口语程度',teasing:'吐槽强度',persona_density:'人设浓度',followup_questions:'反问频率',reply_length:'默认句长'};
+  const conversationFields={banter_level:'玩梗程度',play_along:'顺着演的意愿',callback_frequency:'旧梗回忆频率',assertiveness:'主见程度'};
+  const styleFields={reply_warmth:'回复温度',sticker_after_text:'文字后配表情',colloquialism:'口语程度',teasing:'吐槽强度',persona_density:'人设浓度',followup_questions:'反问频率',reply_length:'默认句长',...conversationFields};
   const styleOptions={reply_warmth:[['low','平和简洁'],['normal','自然亲切'],['high','温暖热络']],sticker_after_text:[['off','关闭主动搭配'],['normal','适中 · 合适时搭配'],['high','积极 · 优先文字后配表情']],reply_length:[['short','简短'],['normal','适中'],['detailed','充分解释']]};
+  Object.assign(styleOptions,{
+    banter_level:[['low','偶尔轻松一句'],['normal','自然接梗'],['high','更爱嘴贫']],
+    play_along:[['low','点到为止'],['normal','愿意接一两轮'],['high','愿意继续演']],
+    callback_frequency:[['off','不主动提旧梗'],['low','很相关时偶尔提'],['normal','相关时自然提起'],['high','更愿意回忆共同梗']],
+    assertiveness:[['low','柔和表达'],['normal','有自己的喜恶'],['high','更坦率地表达意见']]
+  });
   const styleBox=element('div','settings-grid');
+  const conversationBox=element('div','settings-grid');
   for(const [name,title] of Object.entries(styleFields)) {
     const label=element('label','',title), select=element('select');select.id='style-'+name;
     for(const [value,text] of styleOptions[name] || [['low','低'],['normal','适中'],['high','高']]) {
       const o=element('option','',text);o.value=value;select.append(o);
     }
-    label.append(select);styleBox.append(label);
+    label.append(select);(name in conversationFields ? conversationBox : styleBox).append(label);
   }
   const stickerCooldownLabel=element('label','','同一表情候选冷却 / 秒'),stickerCooldown=element('input');
   stickerCooldown.type='number';stickerCooldown.id='style-sticker-cooldown';stickerCooldown.min=0;stickerCooldown.max=3600;stickerCooldown.step=1;
   stickerCooldownLabel.append(stickerCooldown,element('span','hint','近期发过的同一表情暂不参与候选；运行保护中的重复内容限制仍独立生效。'));styleBox.append(stickerCooldownLabel);
+  const pairProbabilityLabel=element('label','','合适候选的自动搭配概率 / %'),pairProbability=element('input');
+  pairProbability.type='number';pairProbability.id='style-sticker-pair-probability';pairProbability.min=0;pairProbability.max=100;pairProbability.step=5;
+  pairProbabilityLabel.append(pairProbability,element('span','hint','AI 同一轮选出贴切表情后，按此概率附在文字后；90 表示合适候选有 90% 概率发送，不代表所有消息的 90%。0 关闭自动补配，不影响 AI 已明确安排的表情。'));styleBox.append(pairProbabilityLabel);
   const pairingHint=element('p','hint','回复温度控制亲切感，群聊仍保持朋友语气。文字后配表情控制搭配意愿，不是保证每条都发；每轮上限至少为 2 才能同时发文字和表情。');
   styleBox.append(pairingHint);
+  const conversationSection=element('section','span-all');
+  conversationSection.style.gridColumn='1 / -1';conversationSection.style.minWidth='0';
+  conversationSection.append(element('h3','','接话与玩梗'),element('p','hint','玩梗控制自嘲、找补和顺势发挥；吐槽强度单独控制互损。共同梗只在原群使用，认真求助时收住玩笑。所有选择跟随当前角色，在同一次回复中完成。'),conversationBox);
+  styleBox.append(conversationSection);
   styleBox.append(button('保存说话风格',async()=>{
     const values={};for(const n of Object.keys(styleFields))values[n]=$('style-'+n).value;
     if(!stickerCooldown.checkValidity())throw new Error('同一表情候选冷却需在 0～3600 秒之间');
+    if(!pairProbability.checkValidity())throw new Error('自动搭配概率需在 0～100 之间');
     values.sticker_cooldown_seconds=Number(stickerCooldown.value);
+    values.sticker_pair_probability=Number(pairProbability.value);
     await saveSubset(values);notice('说话风格和配表情设置已保存，下一轮生效');
   }));
   $('save-habits').parentElement.before(styleBox);
@@ -28,12 +45,12 @@
   const summaryLabel=element('label','check-label');const summary=element('input');summary.type='checkbox';summary.id='digest-enabled';summaryLabel.append(summary,document.createTextNode('后台增量整理话题摘要'));
   styleBox.append(contextLabel,summaryLabel,button('保存上下文策略',async()=>{await saveSubset({context_char_budget:Number(budget.value),background_digest_enabled:summary.checked});notice('上下文策略已保存');}));
   const shared=$('global-memory').parentElement;shared.lastChild.textContent='共享相同微信 ID 的个人事实与偏好（群事件独立）';
-  $('memory-panel').querySelector('.muted').textContent='群内事件、梗、关系按会话独立；相同微信 ID 的明确个人事实与偏好可跨群和私聊调用。每条保留来源和修订。';
+  $('memory-panel').querySelector('.muted').textContent='群内事件、梗、关系按会话独立；相同微信 ID 的明确个人事实与偏好可跨群和私聊调用。每条可编辑或删除，删除后不再参与长期记忆调用，可在“含已删除”中恢复。原始聊天和修订记录保留。';
   const filter=element('select');filter.id='memory-filter-chat';filter.setAttribute('aria-label','记忆来源会话');$('memory-search').before(filter);
   filter.onchange=()=>window.habits.refresh().catch(e=>notice(e.message,true));
   const scopeLabel=element('label','','记忆使用范围'),scope=element('select');scope.id='memory-scope';
   for(const [v,t] of [['chat','仅本群 / 本私聊'],['profile','共享人物事实与偏好']]){const o=element('option','',t);o.value=v;scope.append(o);}scopeLabel.append(scope);$('memory-content').parentElement.before(scopeLabel);
-  const event=element('option','','本群事件 / 梗');event.value='event';$('memory-kind').append(event);
+  const event=element('option','','本群事件');event.value='event';$('memory-kind').append(event);
   const autoLabel=element('label','check-label'),auto=element('input');auto.type='checkbox';auto.id='memory-auto-capture';autoLabel.append(auto,document.createTextNode('后台主动整理明确偏好和事实'));
   $('save-memory-switch').before(autoLabel);
   $('save-memory-switch').onclick=()=>action($('save-memory-switch'),async()=>{await saveSubset({editable_memory_enabled:$('editable-memory-enabled').checked,memory_auto_capture:auto.checked,memory_scope_mode:'shared_profiles'});notice('记忆策略已保存');});
@@ -89,7 +106,7 @@
   function chatLabels(){
     for(const select of [filter,chat]){const previous=select.value;select.replaceChildren();const all=element('option','','全部已授权会话');all.value='';select.append(all);for(const id of cfg?.allowed_chat_ids||[]){const o=element('option','',chatName(id));o.value=id;select.append(o);}select.value=previous;}
   }
-  function populate(){if(!cfg)return;for(const n of Object.keys(styleFields))$('style-'+n).value=cfg[n] ?? (['reply_warmth','sticker_after_text'].includes(n)?'high':'normal');stickerCooldown.value=cfg.sticker_cooldown_seconds ?? 180;budget.value=cfg.context_char_budget;summary.checked=cfg.background_digest_enabled;auto.checked=cfg.memory_auto_capture;chatLabels();}
+  function populate(){if(!cfg)return;for(const n of Object.keys(styleFields))$('style-'+n).value=cfg[n] ?? (['reply_warmth','sticker_after_text'].includes(n)?'high':'normal');stickerCooldown.value=cfg.sticker_cooldown_seconds ?? 180;pairProbability.value=cfg.sticker_pair_probability ?? 90;budget.value=cfg.context_char_budget;summary.checked=cfg.background_digest_enabled;auto.checked=cfg.memory_auto_capture;chatLabels();}
   function stateUpdated(s){
     if(!styleBox.dataset.ready){populate();styleBox.dataset.ready='true';}
     if(location.hash==='#inbox-panel' && Date.now()-lastInbox>10000){lastInbox=Date.now();loadInbox(false).catch(e=>notice(e.message,true));}

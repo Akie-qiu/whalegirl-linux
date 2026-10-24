@@ -75,7 +75,13 @@ async def build_context(store, gateway, settings, first, batch, labels):
         # Plain text must not reopen a previous image on every reply.
         visual_reference=bool(re.search(r'图|表情|看一下|看看|看得到|看到|这张|这一张', question))
         images=(references+current_images)[-2:]
-        if not images and not unresolved and visual_reference:
+        # A short caption often arrives as a separate message (e.g. 她好看吧).
+        # Bind it only to that person's immediately preceding incoming image.
+        prior=[r for r in recent if r['key'] not in batch_keys and r['is_self']==0 and
+               r.get('sender_id') in {m.get('sender_id') for m in batch}]
+        caption=bool(prior and needs_image(prior[-1]) and len(question)<100 and
+                     0<=first['timestamp']-prior[-1]['timestamp']<90)
+        if not images and not unresolved and (visual_reference or caption):
             senders={m.get('sender_id') for m in batch}
             candidates=[r for r in recent if needs_image(r) and r['is_self']==0 and 0<=time.time()-r['timestamp']<600]
             same_sender=[r for r in candidates if r['sender_id'] in senders]
@@ -94,7 +100,9 @@ async def build_context(store, gateway, settings, first, batch, labels):
                     except Exception:
                         media = {}
                 data = media.get('data') or ''
-                if not data and media.get('quality') not in ('not_visible','partly_visible'):
+                # Clipboard/viewport failures are recoverable via the exact row's
+                # rendered thumbnail; they must not suppress the fallback itself.
+                if not data:
                     media = await gateway.visible_media(row['chat'],row['local_id'],row['kind'],
                         message_time=row['timestamp'],server_id=row['key'].rsplit('/',1)[-1])
                     data = media.get('data') or ''
@@ -137,6 +145,8 @@ async def build_context(store, gateway, settings, first, batch, labels):
                 image_seconds+=time.monotonic()-image_started
         if images and not attachments:
             blocks[0]['text'] += '\n注意：本次相关图片尚未取得有效图像，不能声称看到了图中内容。'
+        elif attachments:
+            blocks[0]['text'] += '\n本轮已附上对应消息的真实图片。此前聊天中的“图未加载”是旧状态；现在按本轮实际图像回答，不要沿用旧的读取失败说法。'
     return [{'role':'user','content':blocks if attachments else blocks[0]['text']}], attachments, {
         'current_messages':len(recent),'recalled_messages':len(memory),'images':len(attachments),
         'image_seconds':round(image_seconds,3),'context_build_seconds':round(time.monotonic()-context_started,3)}

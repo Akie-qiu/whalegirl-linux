@@ -1,9 +1,10 @@
 """Read a rendered native image when this pinned build lacks an image key profile."""
 import base64
-from difflib import SequenceMatcher
 from io import BytesIO
 import re
+import httpx
 from PIL import Image, ImageChops
+from .media_locator import locate_image, token
 
 
 def walk(node):
@@ -16,13 +17,6 @@ def normal(value):
     return re.sub(r'\s+',' ',str(value or '')).strip()
 
 
-def token(value):
-    value=normal(re.split(r'\n(?:Quote |引用)',str(value or ''),maxsplit=1)[0])
-    if re.fullmatch(r'Image|Photo|图片',value,re.I):return '[image]'
-    if re.fullmatch(r'Animated Stickers|Stickers?|表情包|动画表情',value,re.I):return '[sticker]'
-    return value
-
-
 def correct_chat(root,name,is_group):
     nodes=list(walk(root));lists=[n for n in nodes if n.get('role')=='list' and n.get('name')=='Chats']
     if len(lists)!=1:return False
@@ -33,22 +27,6 @@ def correct_chat(root,name,is_group):
                (is_group and re.fullmatch(re.escape(name)+r'\s*\(\s*\d+\s*\)',normal(n.get('name')))))
                and (n.get('bounds') or {}).get('x',-1)>right and (n.get('bounds') or {}).get('y',1000)<100 for n in nodes)
     return row and header
-
-
-def locate_image(raw,nodes,local_id,kind,server_id=''):
-    db_tokens=['[image]' if r.get('type')==3 else '[sticker]' if r.get('type')==47 else token(r.get('content')) for r in raw]
-    ui_tokens=[token(n.get('name')) for n in nodes]
-    targets=[i for i,r in enumerate(raw) if r.get('localId')==local_id and r.get('type')==kind and
-             (not server_id or str(r.get('serverId'))==str(server_id))]
-    if len(targets)!=1:return None
-    target=targets[0]
-    for block in SequenceMatcher(None,db_tokens,ui_tokens,autojunk=False).get_matching_blocks():
-        if not (block.a<=target<block.a+block.size and block.size>=2):continue
-        anchors=db_tokens[block.a:block.a+block.size]
-        # A unique sequence also anchors an image next to a sticker or a quoted bubble.
-        occurrences=sum(db_tokens[i:i+len(anchors)]==anchors for i in range(len(db_tokens)-len(anchors)+1))
-        if occurrences==1:return nodes[block.b+target-block.a]
-    return None
 
 
 async def capture_message_image(gateway,chat,local_id,kind, *, message_time=None,server_id=''):
@@ -72,7 +50,7 @@ async def capture_message_image(gateway,chat,local_id,kind, *, message_time=None
         raw=await gateway.messages(chat,limit=200,before_time=message_time+1,before_id=2147483647)
     raw=sorted(raw,key=lambda r:(str(r.get('timestamp') or ''),r.get('localId',0)))
     match=locate_image(raw,nodes,local_id,kind,server_id)
-    for _ in range(2 if gateway.ui_jobs_directory and match is None else 0):
+    for _ in range(8 if gateway.ui_jobs_directory and match is None else 0):
         gateway.media_history_moved=True
         await gateway.ui_job('open_chat',chat,scroll='up')
         before=await gateway.client.get('/api/debug/a11y');before.raise_for_status();root=before.json().get('tree') or {}
@@ -81,7 +59,11 @@ async def capture_message_image(gateway,chat,local_id,kind, *, message_time=None
         if len(lists)!=1:return {}
         nodes=[n for n in lists[0].get('children') or [] if n.get('role')=='list-item' and not re.fullmatch(r'\d{1,2}:\d{2}',normal(n.get('name')))]
         match=locate_image(raw,nodes,local_id,kind,server_id)
-        if match is not None:break
+        if match is not None:
+            b=match.get('bounds') or {};area=lists[0].get('bounds') or {}
+            visible=min(b.get('y',0)+b.get('height',0),area.get('y',0)+area.get('height',0))-max(b.get('y',0),area.get('y',0))
+            if visible>=80:break
+            match=None
     if match is None:return {}
     response=await gateway.client.get('/api/debug/screenshot');response.raise_for_status()
     encoded=response.json().get('base64') or ''
@@ -114,7 +96,10 @@ async def capture_message_image(gateway,chat,local_id,kind, *, message_time=None
             click_xy=[left+(run_left+run_right)/2,top+(bounds[1]+bounds[3])/2]
             cropped=cropped.crop((max(0,run_left-2),max(0,bounds[1]-2),min(cropped.width,run_right+2),min(cropped.height,bounds[3]+2)))
     if click_xy and gateway.ui_jobs_directory and kind==3:
-        result=await gateway.ui_job('copy_image',chat,node_name=match.get('name'),bounds=match.get('bounds'),xy=click_xy,local_id=local_id)
+        try:
+            result=await gateway.ui_job('copy_image',chat,node_name=match.get('name'),bounds=match.get('bounds'),xy=click_xy,local_id=local_id)
+        except (OSError, ValueError, httpx.HTTPError):
+            result={}
         if result.get('data'):
             return {'type':'image','format':'png','data':result['data'],'quality':'native_clipboard','partial':False}
     scale=min(4,1024/max(cropped.size))

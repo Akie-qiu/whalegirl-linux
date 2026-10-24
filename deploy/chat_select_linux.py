@@ -14,6 +14,11 @@ import unicodedata
 import urllib.request
 from urllib.parse import urlencode
 
+sys.path.insert(0, '/data/native-tools')
+from native_process import run as run_process
+SKIP_MESSAGES = False
+PROFILE = {'snapshots': 0, 'snapshot_seconds': 0.0}
+
 
 def walk(node):
     yield node
@@ -26,7 +31,13 @@ def normal(value):
 
 
 def tree():
-    result = subprocess.run(["/opt/tools/a11y-dump", "--format", "json"], capture_output=True, text=True, check=True, timeout=8)
+    started = time.monotonic()
+    command = ["/opt/tools/a11y-dump", "--format", "json"]
+    if SKIP_MESSAGES:
+        command.append('--skip-messages')
+    result = run_process(command, capture_output=True, text=True, check=True, timeout=8)
+    PROFILE['snapshots'] += 1
+    PROFILE['snapshot_seconds'] += time.monotonic() - started
     value = json.loads(result.stdout)
     return value.get("tree", value)
 
@@ -63,7 +74,7 @@ def selected(root, display_name, is_group=False):
 
 
 def preview_windows():
-    result = subprocess.run(['xdotool', 'search', '--onlyvisible', '--name', '^Photos and Videos$'],
+    result = run_process(['xdotool', 'search', '--onlyvisible', '--name', '^Photos and Videos$'],
                             capture_output=True, text=True, timeout=3)
     if result.returncode not in (0, 1):
         raise ValueError('Cannot inspect native image preview')
@@ -72,8 +83,8 @@ def preview_windows():
 
 def close_previews(windows):
     for window in windows:
-        subprocess.run(['xdotool', 'windowactivate', '--sync', window], check=True, timeout=3)
-        subprocess.run(['xdotool', 'key', '--clearmodifiers', 'alt+F4'], check=True, timeout=3)
+        run_process(['xdotool', 'windowactivate', '--sync', window], check=True, timeout=3)
+        run_process(['xdotool', 'key', '--clearmodifiers', 'alt+F4'], check=True, timeout=3)
     if windows:
         deadline=time.monotonic()+1.5
         while preview_windows().intersection(windows) and time.monotonic()<deadline:
@@ -84,7 +95,7 @@ def close_previews(windows):
 
 def click_node(node):
     b=node['bounds']
-    subprocess.run(['/opt/tools/click',str(round(b['x']+b['width']/2)),str(round(b['y']+b['height']/2))],
+    run_process(['/opt/tools/click',str(round(b['x']+b['width']/2)),str(round(b['y']+b['height']/2))],
                    check=True,stdout=subprocess.DEVNULL,timeout=3)
 
 
@@ -157,12 +168,12 @@ def quote_context_menu(job, root):
                 lists = [n for n in walk(root) if n.get('role') == 'list' and n.get('name') == 'Messages']
                 if len(lists) == 1:
                     b = lists[0]['bounds']
-                    subprocess.run(['xdotool','mousemove',str(round(b['x']+b['width']/2)),
+                    run_process(['xdotool','mousemove',str(round(b['x']+b['width']/2)),
                                     str(round(b['y']+b['height']/2)),'click','--repeat','40','--delay','5','5'],check=True,timeout=3)
             time.sleep(.2)
             root = tree()
     b = chosen['bounds']
-    subprocess.run(['xdotool', 'mousemove', str(round(b['x'] + 80)),
+    run_process(['xdotool', 'mousemove', str(round(b['x'] + 80)),
                     str(round(b['y'] + b['height'] - 20)), 'click', '3'], check=True, timeout=3)
     return tree(), original
 
@@ -172,7 +183,7 @@ def prepare_quote(job, root):
     choices = [n for n in walk(menu) if n.get('role') in ('menu-item','push-button')
                and normal(n.get('name')) in ('Quote','Reply','引用','引用回复')]
     if len(choices) != 1:
-        subprocess.run(['xdotool','key','--clearmodifiers','Escape'],check=True,timeout=3)
+        run_process(['xdotool','key','--clearmodifiers','Escape'],check=True,timeout=3)
         raise ValueError('Native Quote action is unavailable for this message')
     click_node(choices[0])
     job['quote_applied'] = True
@@ -203,11 +214,11 @@ def collect_native_sticker(job,path,root,name,is_group):
                 b=chosen['bounds'];top=max(area['y'],b['y']);bottom=min(area['y']+area['height'],b['y']+b['height'])
                 if bottom-top>=35:break
             if attempt==3:raise ValueError('Source sticker is outside the visible recent messages')
-            subprocess.run(['xdotool','mousemove',str(round(area['x']+area['width']/2)),str(round(area['y']+area['height']/2)),
+            run_process(['xdotool','mousemove',str(round(area['x']+area['width']/2)),str(round(area['y']+area['height']/2)),
                 'click','--repeat','40' if attempt==0 else '4','--delay','5' if attempt==0 else '65','5' if attempt==0 else '4'],check=True,timeout=3)
             moved=True;time.sleep(.12);root=tree()
         if not selected(root,name,is_group):raise ValueError('Destination changed before collecting')
-        subprocess.run(['xdotool','mousemove',str(round(b['x']+min(80,b['width']/3))),str(round((top+bottom)/2)),'click','3'],check=True,timeout=3)
+        run_process(['xdotool','mousemove',str(round(b['x']+min(80,b['width']/3))),str(round((top+bottom)/2)),'click','3'],check=True,timeout=3)
         menu=tree()
         choices=[n for n in walk(menu) if n.get('role')=='menu-item' and n.get('name')=='Add Sticker']
         if len(choices)!=1:raise ValueError('Native Add Sticker action is unavailable')
@@ -220,13 +231,22 @@ def collect_native_sticker(job,path,root,name,is_group):
                 job['state']='collected';return
         raise ValueError('Native favorite did not appear after Add Sticker')
     finally:
-        subprocess.run(['xdotool','key','--clearmodifiers','Escape'],check=True,timeout=3)
+        run_process(['xdotool','key','--clearmodifiers','Escape'],check=True,timeout=3)
         if moved:
-            subprocess.run(['xdotool','mousemove',str(round(area['x']+area['width']/2)),str(round(area['y']+area['height']/2)),
+            run_process(['xdotool','mousemove',str(round(area['x']+area['width']/2)),str(round(area['y']+area['height']/2)),
                 'click','--repeat','40','--delay','5','5'],check=True,timeout=3)
 
 
 def send_native_sticker(job,path,root,name,is_group):
+    try:
+        return _send_native_sticker(job,path,root,name,is_group)
+    finally:
+        # Always dismiss the popup, including errors before clicking a tile.
+        # Otherwise the next chat/Moments click only closes this overlay.
+        run_process(['xdotool','key','--clearmodifiers','Escape'],check=True,timeout=3)
+
+
+def _send_native_sticker(job,path,root,name,is_group):
     md5=job.get('md5','')
     if not re.fullmatch(r'[0-9a-f]{32}',md5):raise ValueError('Invalid sticker identity')
     order=[r['md5'] for r in native_read('/stickers')['stickers']]
@@ -235,9 +255,6 @@ def send_native_sticker(job,path,root,name,is_group):
         buttons=[n for n in walk(root) if n.get('role')=='push-button' and n.get('name')=='Send sticker(Alt+E)']
         if len(buttons)!=1:raise ValueError('Sticker button is not unique')
         click_node(buttons[0]);time.sleep(.1);root=tree()
-    tabs=[n for n in walk(root) if n.get('role')=='page-tab' and n.get('name')=='Custom Stickers']
-    if len(tabs)!=1:raise ValueError('Custom sticker tab is not unique')
-    click_node(tabs[0]);time.sleep(.1);root=tree()
     index=order.index(md5)
     def panel(root):
         tiles=sorted([n for n in walk(root) if n.get('role')=='label' and n.get('name')=='Custom Stickers'
@@ -246,46 +263,90 @@ def send_native_sticker(job,path,root,name,is_group):
         if not tiles or len(lists)!=1:raise ValueError('Native favorite layout needs refresh')
         return tiles,lists[0]['bounds']
     def scroll(area,direction):
-        subprocess.run(['xdotool','mousemove',str(round(area['x']+area['width']/2)),str(round(area['y']+area['height']/2)),
+        run_process(['xdotool','mousemove',str(round(area['x']+area['width']/2)),str(round(area['y']+area['height']/2)),
                         'click','--repeat','40','--delay','5',direction],check=True,timeout=3)
         time.sleep(.15)
-    tiles,area=panel(root)
-    tail_first=index>=len(order)-20 and index>=20
-    scroll(area,'5' if tail_first else '4');root=tree();tiles,area=panel(root)
-    initial_index=index-(len(order)-len(tiles)) if tail_first else index
-    chosen=tiles[initial_index] if 0<=initial_index<len(tiles) else None
-    if chosen is None or chosen['bounds']['y']+chosen['bounds']['height']>area['y']+area['height']:
-        scroll(area,'5');root=tree();tiles,area=panel(root)
-        tail_index=index-(len(order)-len(tiles))
-        chosen=tiles[tail_index] if 0<=tail_index<len(tiles) else None
+    def clickable(node,viewport):
+        if node is None:return False
+        b=node['bounds']
+        return min(b['y']+b['height'],viewport['y']+viewport['height'])-max(b['y'],viewport['y'])>=24
+    try:
+        tiles,area=panel(root)
+    except ValueError:
+        tabs=[n for n in walk(root) if n.get('role')=='page-tab' and n.get('name')=='Custom Stickers']
+        if len(tabs)!=1:raise ValueError('Custom sticker tab is not unique')
+        click_node(tabs[0]);time.sleep(.1);root=tree();tiles,area=panel(root)
+    if len(tiles)==len(order):
+        # A full grid has an exact native index. Keep the current scroll position
+        # when the desired tile is already visible instead of resetting it twice.
+        chosen=tiles[index]
+        if not clickable(chosen,area):
+            b=chosen['bounds']
+            scroll(area,'4' if b['y']<area['y'] else '5')
+            root=tree();tiles,area=panel(root)
+            chosen=tiles[index] if len(tiles)==len(order) else None
+    else:
+        tail_first=index>=len(order)-20 and index>=20
+        scroll(area,'5' if tail_first else '4');root=tree();tiles,area=panel(root)
+        initial_index=index-(len(order)-len(tiles)) if tail_first else index
+        chosen=tiles[initial_index] if 0<=initial_index<len(tiles) else None
+        if chosen is None and not tail_first:
+            # Qt virtualizes this grid and accelerates wheel events. Align the
+            # stable accessible objects shared by consecutive pages instead of
+            # inferring the row offset from pixel displacement.
+            if any(not n.get('native_ref') for n in tiles):raise ValueError('Native favorite identities are unavailable')
+            known={n['native_ref']:i for i,n in enumerate(tiles)}
+            first_index=0
+            job['favorite_scroll']=[]
+            for _ in range(12):
+                before_index=first_index
+                run_process(['xdotool','mousemove',str(round(area['x']+area['width']/2)),str(round(area['y']+area['height']/2)),
+                    'click','--repeat','3','--delay','40','5'],check=True,timeout=3)
+                time.sleep(.1);root=tree();tiles,area=panel(root)
+                offsets={known[n['native_ref']]-i for i,n in enumerate(tiles) if n.get('native_ref') in known}
+                if len(offsets)!=1 or any(not n.get('native_ref') for n in tiles):
+                    raise ValueError('Native favorite pages have no unique shared anchor')
+                first_index=offsets.pop()
+                for i,n in enumerate(tiles):known[n['native_ref']]=first_index+i
+                job['favorite_scroll'].append([before_index,first_index,len(tiles)])
+                relative=index-first_index
+                chosen=tiles[relative] if 0<=relative<len(tiles) else None
+                if clickable(chosen,area):break
+                if first_index==before_index and relative<0:break
+        if not clickable(chosen,area):
+            scroll(area,'5');root=tree();tiles,area=panel(root)
+            tail_index=index-(len(order)-len(tiles))
+            chosen=tiles[tail_index] if 0<=tail_index<len(tiles) else None
     if chosen is None:raise ValueError('Requested favorite is outside the currently exposed native page')
     # Qt normally exposes the full grid even when most rows are outside the viewport.
     # With a full grid the native order gives an exact index for middle favorites too.
     for _ in range(8):
         if len(tiles)!=len(order):break
         chosen=tiles[index];b=chosen['bounds']
-        if area['y']<=b['y'] and b['y']+b['height']<=area['y']+area['height']+1:break
+        if clickable(chosen,area):break
         direction='4' if b['y']<area['y'] else '5'
-        subprocess.run(['xdotool','mousemove',str(round(area['x']+area['width']/2)),str(round(area['y']+area['height']/2)),
+        run_process(['xdotool','mousemove',str(round(area['x']+area['width']/2)),str(round(area['y']+area['height']/2)),
                         'click','--repeat','2','--delay','40',direction],check=True,timeout=3)
         time.sleep(.1);root=tree();tiles,area=panel(root)
     b=chosen['bounds']
-    if not area['y']<=b['y'] or b['y']+b['height']>area['y']+area['height']+1:
-        raise ValueError('Requested favorite is not fully visible')
+    if not clickable(chosen,area):
+        raise ValueError('Requested favorite has no clickable visible area')
     current=[r['md5'] for r in native_read('/stickers')['stickers']]
     if current!=order:raise ValueError('Favorite sync changed the order before sending')
     if not selected(root,name,is_group):raise ValueError('Destination changed before sticker send')
     job['state']='sending';path.write_text(json.dumps(job,ensure_ascii=False))
     # A favorite tile sends immediately as WeChat type 47; never paste an image instead.
-    click_node(chosen);job['state']='submitted'
-    subprocess.run(['xdotool','key','--clearmodifiers','Escape'],check=True,timeout=3)
+    visible_top=max(b['y'],area['y']);visible_bottom=min(b['y']+b['height'],area['y']+area['height'])
+    run_process(['/opt/tools/click',str(round(b['x']+b['width']/2)),str(round((visible_top+visible_bottom)/2))],
+                   check=True,stdout=subprocess.DEVNULL,timeout=3)
+    job['state']='submitted'
 
 
 def run_job(path, target_id, name, is_group, root=None):
     job=json.loads(path.read_text())
     if job.get('chat')!=target_id or not 0<=time.time()-job.get('created',0)<30:
         raise ValueError('UI job destination or age is invalid')
-    if job.get('operation') not in ['send_text','send_sticker','collect_sticker','copy_image','read_image','open_chat','inspect_quote_menu']:
+    if job.get('operation') not in ['send_text','send_image','send_sticker','collect_sticker','copy_image','read_image','open_chat','inspect_quote_menu']:
         raise ValueError('Unknown UI job operation')
     previews=preview_windows();close_previews(previews)
     if root is None or previews:root=tree()
@@ -305,11 +366,14 @@ def run_job(path, target_id, name, is_group, root=None):
                                     for n in lst.get('children') or [] if n.get('role') == 'list-item']
             job['state'] = 'done'
         finally:
-            subprocess.run(['xdotool','key','--clearmodifiers','Escape'],check=True,timeout=3)
+            run_process(['xdotool','key','--clearmodifiers','Escape'],check=True,timeout=3)
     elif job['operation']=='collect_sticker':
         collect_native_sticker(job,path,root,name,is_group)
     elif job['operation']=='send_sticker':
         send_native_sticker(job,path,root,name,is_group)
+    elif job['operation']=='send_image':
+        from native_image_send import send_image
+        send_image(job,path,root,name,is_group)
     elif job['operation']=='send_text':
         text=job.get('text')
         if not isinstance(text,str) or not text.strip() or len(text)>2000:raise ValueError('Invalid text input')
@@ -319,22 +383,40 @@ def run_job(path, target_id, name, is_group, root=None):
                 root = prepare_quote(job, root)
             except (ValueError, OSError) as exc:
                 # Optional quoting must not prevent an otherwise valid text reply.
-                subprocess.run(['xdotool','key','--clearmodifiers','Escape'],check=True,timeout=3)
+                run_process(['xdotool','key','--clearmodifiers','Escape'],check=True,timeout=3)
                 job['quote_fallback'] = str(exc)[:180]
                 root = tree()
         editors=[n for n in walk(root) if n.get('role')=='text' and 'EDITABLE' in (n.get('states') or [])
                  and (n.get('bounds') or {}).get('height',0)>35 and (n.get('bounds') or {}).get('y',0)>200]
         if len(editors)!=1:raise ValueError('Composer was not uniquely identified')
         b=editors[0]['bounds']
-        subprocess.run(['/opt/tools/click',str(round(b['x']+b['width']/2)),str(round(b['y']+b['height']/2))],check=True,stdout=subprocess.DEVNULL,timeout=3)
-        subprocess.run(['xdotool','key','--clearmodifiers','ctrl+a'],check=True,timeout=3)
-        subprocess.run(['xclip','-selection','clipboard'],input=text.encode(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=3)
-        subprocess.run(['xdotool','key','--clearmodifiers','ctrl+v'],check=True,timeout=3)
+        run_process(['/opt/tools/click',str(round(b['x']+b['width']/2)),str(round(b['y']+b['height']/2))],check=True,stdout=subprocess.DEVNULL,timeout=3)
+        run_process(['xdotool','key','--clearmodifiers','ctrl+a'],check=True,timeout=3)
+        if job.get('mentions'):
+            from native_group_mentions import insert_mentions, clear_generated_mentions
+            run_process(['xdotool','key','--clearmodifiers','BackSpace'],check=True,timeout=3)
+            try:
+                if not is_group:raise ValueError('私聊不发送群成员@提醒')
+                job['mentions_applied'] = insert_mentions(job,editors[0])
+            except (ValueError,OSError,subprocess.SubprocessError) as exc:
+                clear_generated_mentions()
+                job['mentions_applied'] = []
+                job['mention_fallback'] = str(exc)[:180]
+        run_process(['xclip','-selection','clipboard'],input=text.encode(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=3)
+        run_process(['xdotool','key','--clearmodifiers','ctrl+v'],check=True,timeout=3)
         time.sleep(.1)
+        if job.get('mentions_applied'):
+            from native_group_mentions import mention_allowed, clear_generated_mentions
+            if not mention_allowed(target_id):
+                clear_generated_mentions()
+                run_process(['xclip','-selection','clipboard'],input=text.encode(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=3)
+                run_process(['xdotool','key','--clearmodifiers','ctrl+v'],check=True,timeout=3)
+                job['mentions_applied'] = []
+                job['mention_fallback'] = '发送前群聊@成员总开关已关闭'
         if not selected(tree(),name,is_group):raise ValueError('Destination changed before send')
         # Claim and persist the non-idempotent boundary before pressing Return once.
         job['state']='sending';path.write_text(json.dumps(job,ensure_ascii=False))
-        subprocess.run(['xdotool','key','--clearmodifiers','Return'],check=True,timeout=3)
+        run_process(['xdotool','key','--clearmodifiers','Return'],check=True,timeout=3)
         job['state']='submitted'
     elif job['operation'] in ('copy_image','read_image'):
         if job['operation']=='read_image':
@@ -362,8 +444,8 @@ def run_job(path, target_id, name, is_group, root=None):
         if len(nodes)!=1:raise ValueError('Image position changed before copy')
         b=nodes[0]['bounds'];x,y=job['xy']
         if not b['x']<=x<=b['x']+b['width'] or not b['y']<=y<=b['y']+b['height']:raise ValueError('Image click outside message')
-        subprocess.run(['xclip','-selection','clipboard'],input=('image-job-'+path.stem).encode(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=3)
-        subprocess.run(['xdotool','mousemove',str(round(x)),str(round(y)),'click','--repeat','2','--delay','100','1'],check=True,timeout=3)
+        run_process(['xclip','-selection','clipboard'],input=('image-job-'+path.stem).encode(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=3)
+        run_process(['xdotool','mousemove',str(round(x)),str(round(y)),'click','--repeat','2','--delay','100','1'],check=True,timeout=3)
         opened=set()
         for _ in range(4):
             time.sleep(.15)
@@ -372,15 +454,15 @@ def run_job(path, target_id, name, is_group, root=None):
         data=b''
         if opened:
             try:
-                subprocess.run(['xdotool','key','--clearmodifiers','ctrl+c'],check=True,timeout=3)
+                run_process(['xdotool','key','--clearmodifiers','ctrl+c'],check=True,timeout=3)
                 for _ in range(3):
                     time.sleep(.15)
-                    p=subprocess.run(['xclip','-selection','clipboard','-t','image/png','-o'],capture_output=True,timeout=2)
+                    p=run_process(['xclip','-selection','clipboard','-t','image/png','-o'],capture_output=True,timeout=2)
                     if p.returncode==0 and p.stdout.startswith(b'\x89PNG\r\n\x1a\n') and len(p.stdout)<=10*1024*1024:
                         data=p.stdout;break
             finally:
                 close_previews(opened)
-        job['state']='done';job['data']=base64.b64encode(data).decode();job['format']='png';job['quality']='native_clipboard' if data else ''
+        job['state']='done';job['data']=base64.b64encode(data).decode();job['format']='png';job['quality']='native_clipboard' if data else 'clipboard_unavailable'
     else:
         direction=job.get('scroll')
         if direction:
@@ -388,14 +470,52 @@ def run_job(path, target_id, name, is_group, root=None):
             lists=[n for n in walk(root) if n.get('role')=='list' and n.get('name')=='Messages']
             if len(lists)!=1:raise ValueError('Message list is not unique')
             b=lists[0]['bounds']
-            subprocess.run(['xdotool','mousemove',str(round(b['x']+b['width']/2)),str(round(b['y']+b['height']/2)),
+            run_process(['xdotool','mousemove',str(round(b['x']+b['width']/2)),str(round(b['y']+b['height']/2)),
                             'click','--repeat','40' if direction=='latest' else '4','--delay','5' if direction=='latest' else '65','4' if direction=='up' else '5'],check=True,timeout=3)
             time.sleep(.15)
         job['state']='done'
     path.write_text(json.dumps(job,ensure_ascii=False))
 
 
-def main():
+def visible_chat(root, name):
+    lists = [n for n in walk(root) if n.get('role') == 'list' and n.get('name') == 'Chats']
+    if len(lists) != 1:
+        raise ValueError('Native chat list not uniquely identified')
+    matches = [n for n in lists[0].get('children') or [] if n.get('role') == 'list-item'
+               and (normal(n.get('name')) == name or normal(n.get('name')).startswith(name + ' '))]
+    if len(matches) > 1:
+        raise ValueError('Target chat is not uniquely visible in the native chat list')
+    return lists[0], matches[0] if matches else None
+
+
+def locate_chat(root, name):
+    """Only scroll the chat list, keeping the normal visible-target path immediate."""
+    listing, candidate = visible_chat(root, name)
+    if candidate:
+        return candidate
+    bounds = listing.get('bounds') or {}
+    if not bounds.get('width') or not bounds.get('height'):
+        raise ValueError('Native chat list has no usable bounds')
+    x, y = round(bounds['x'] + bounds['width'] / 2), round(bounds['y'] + bounds['height'] / 2)
+    run_process(['xdotool', 'mousemove', str(x), str(y), 'click', '--repeat', '80', '--delay', '1', '4'],
+                check=True, timeout=3)
+    previous = None
+    for _ in range(18):
+        time.sleep(.1)
+        listing, candidate = visible_chat(tree(), name)
+        if candidate:
+            return candidate
+        signature = tuple(normal(n.get('name')) for n in listing.get('children') or [] if n.get('role') == 'list-item')
+        if signature == previous:
+            break
+        previous = signature
+        run_process(['xdotool', 'mousemove', str(x), str(y), 'click', '--repeat', '4', '--delay', '20', '5'],
+                    check=True, timeout=3)
+    raise ValueError('遍历微信会话列表后仍未找到目标会话，尚未发送')
+
+
+def select_chat():
+    global SKIP_MESSAGES
     arguments = sys.argv[1:]
     positional = []
     index = 0
@@ -415,9 +535,27 @@ def main():
         target_id,nonce=target_id.split('::whalejob::',1)
         if not re.fullmatch('[0-9a-f]{32}',nonce):raise ValueError('Invalid UI job identity')
         job_path=Path('/data/whalegirl-jobs')/(nonce+'.json')
+        job_spec=json.loads(job_path.read_text())
+        SKIP_MESSAGES = (str(job_spec.get('operation','')).startswith('moments_') or job_spec.get('operation') in ('send_sticker','send_image','open_chat') or
+                         job_spec.get('operation')=='send_text' and not job_spec.get('quote_to'))
+        if str(job_spec.get('operation', '')).startswith('moments_'):
+            try:
+                from moments_ui import run
+                run(job_path, target_id)
+            except Exception as exc:
+                job=json.loads(job_path.read_text())
+                if not job.get('state'):job['state']='failed_before_send'
+                job['error']=str(exc)[:200];job_path.write_text(json.dumps(job,ensure_ascii=False))
+                raise
+            return {'ok':True,'username':target_id,'skipped':True}
     def finish(skipped):
         if job_path:
-            try:run_job(job_path,target_id,name,is_group,root)
+            try:
+                run_job(job_path,target_id,name,is_group,root)
+                completed=json.loads(job_path.read_text())
+                completed['ui_timing']={k:round(v,3) if isinstance(v,float) else v for k,v in PROFILE.items()}
+                completed['ui_timing']['compact_snapshot']=SKIP_MESSAGES
+                job_path.write_text(json.dumps(completed,ensure_ascii=False))
             except Exception as exc:
                 job=json.loads(job_path.read_text())
                 if not job.get('state'):job['state']='failed_before_send'
@@ -433,19 +571,20 @@ def main():
     if not name or sum(normal(c.get("remark") or c.get("name")) == name for c in rows) != 1:
         raise ValueError("Chat display name is not unique")
     root = tree()
+    moments_frames=[n for n in walk(root) if n.get('role')=='frame' and n.get('name')=='Moments']
+    if moments_frames:
+        from moments_ui import editors, button
+        if len(moments_frames)!=1 or editors(moments_frames[0]):
+            raise ValueError('Moments editor is still open; do not type into the wrong window')
+        click_node(button(moments_frames[0],'Close'))
+        time.sleep(.12)
+        root=tree()
     if selected(root, name, is_group):
         return finish(True)
-    lists = [n for n in walk(root) if n.get("role") == "list" and n.get("name") == "Chats"]
-    if len(lists) != 1:
-        raise ValueError("Native chat list not uniquely identified")
-    candidates = [n for n in lists[0].get("children") or [] if n.get("role") == "list-item"
-                  and (normal(n.get("name")) == name or normal(n.get("name")).startswith(name + " "))]
-    if len(candidates) != 1:
-        raise ValueError("Target chat is not uniquely visible in the native chat list")
-    b = candidates[0].get("bounds") or {}
+    b = locate_chat(root, name).get("bounds") or {}
     if not b.get("width") or not b.get("height"):
         raise ValueError("Target chat has no usable bounds")
-    subprocess.run(["/opt/tools/click", str(round(b["x"] + b["width"] / 2)), str(round(b["y"] + b["height"] / 2))],
+    run_process(["/opt/tools/click", str(round(b["x"] + b["width"] / 2)), str(round(b["y"] + b["height"] / 2))],
                    capture_output=True, check=True, timeout=8)
     for _ in range(10):
         root=tree()
@@ -453,6 +592,27 @@ def main():
             return finish(False)
         time.sleep(.15)
     raise ValueError("Native chat selection was not confirmed by both selected row and header")
+
+
+def main():
+    try:
+        return select_chat()
+    except Exception as exc:
+        # Selection can fail before run_job() is called. Persist that failure too,
+        # rather than leaking the upstream plan's generic "No action selected".
+        match = re.fullmatch(r'(.+)::whalejob::([0-9a-f]{32})', sys.argv[-1] if len(sys.argv) > 1 else '')
+        if match:
+            path = Path('/data/whalegirl-jobs') / (match[2] + '.json')
+            try:
+                job = json.loads(path.read_text())
+                if job.get('chat') == match[1]:
+                    if not job.get('state'):
+                        job['state'] = 'failed_before_send'
+                    job['error'] = str(exc)[:200]
+                    path.write_text(json.dumps(job, ensure_ascii=False))
+            except (OSError, ValueError):
+                pass
+        raise
 
 
 if __name__ == "__main__":

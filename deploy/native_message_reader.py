@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 import urllib.request
 import xml.etree.ElementTree as ET
 from message_payload import parse_app_message
+from moments_payload import parse_post, parse_notification
 
 
 ROOT = Path('/data/whalegirl-jobs')
@@ -64,9 +65,11 @@ class ReadOnlyDatabase:
 
     def start(self):
         path = next(BASE.glob('*/' + self.name))
+        stat = path.stat()
+        self.identity = (stat.st_dev, stat.st_ino)
         self.process = subprocess.Popen(
             ['/usr/local/bin/sqlcipher', '-readonly', 'file:' + str(path) + '?mode=ro'],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1)
         self.output = queue.Queue()
         output, process = self.output, self.process
@@ -81,6 +84,11 @@ class ReadOnlyDatabase:
 
     def query(self, sql):
         with self.lock:
+            if self.process is not None:
+                path = next(BASE.glob('*/' + self.name))
+                stat = path.stat()
+                if self.identity != (stat.st_dev, stat.st_ino):
+                    self.close()
             if self.process is None or self.process.poll() is not None:
                 self.start()
             marker = 'whale_end_' + uuid.uuid4().hex
@@ -187,6 +195,21 @@ def message_database(chat):
     return (names[0] if names else None),table
 
 
+def group_members(chat):
+    authorized(chat)
+    if not chat.endswith('@chatroom') or 'contact.db' not in KEYS:
+        return []
+    room = chat.replace("'", "''")
+    rows = query('contact.db', f'''SELECT mn.username,c.nick_name,c.remark
+        FROM chatroom_member m JOIN name2id rn ON rn.rowid=m.room_id
+        JOIN name2id mn ON mn.rowid=m.member_id
+        LEFT JOIN contact c ON c.username=mn.username
+        WHERE rn.username='{room}' LIMIT 1000;''')
+    return [{'id':r['username'], 'name':r.get('remark') or r.get('nick_name') or r['username'],
+             'aliases':list(dict.fromkeys(v for v in (r.get('remark'),r.get('nick_name'),r['username']) if v))}
+            for r in rows if not is_account(r['username'])]
+
+
 def message_databases(chat):
     table = 'Msg_' + hashlib.md5(chat.encode()).hexdigest()
     if table not in TABLE_DATABASES or time.monotonic()-TABLE_SCANNED.get(table,0)>60:
@@ -266,13 +289,13 @@ def messages(chat, limit, offset=0, *, before_time=None, before_id=0, after_time
         if before_time is not None:
             conditions.append(f'(m.create_time<{int(float(before_time))} OR (m.create_time={int(float(before_time))} AND m.local_id<{int(before_id)}))')
         if after_time is not None:
-            # Re-read the boundary second: server IDs and bodies can be enriched later.
+            # Strict forward pagination; runtime separately reconciles the tail.
             conditions.append(f'(m.create_time>{int(float(after_time))} OR '
                               f'(m.create_time={int(float(after_time))} AND m.local_id>{int(after_id)}))')
         if server_id is not None:conditions.append(f'm.server_id={int(server_id)}')
         where='WHERE '+' AND '.join(conditions) if conditions else ''
         ordering='ASC' if after_time is not None else 'DESC'
-        rows.extend(query(name, f'''SELECT m.local_id,m.server_id,m.local_type,m.create_time,
+        rows.extend(query(name, f'''SELECT m.local_id,m.server_id,m.local_type,m.create_time,m.status,m.upload_status,
             hex(m.message_content) AS body,m.WCDB_CT_message_content AS compressed,
             hex(m.source) AS source,m.WCDB_CT_source AS source_compressed,n.user_name AS sender
             FROM "{table}" m LEFT JOIN Name2Id n ON m.real_sender_id=n.rowid
@@ -324,9 +347,11 @@ def messages(chat, limit, offset=0, *, before_time=None, before_id=0, after_time
         else:
             content = body
         value = {'localId': row['local_id'], 'serverId': row['server_id'], 'chatId': chat,
+                 'nativeStatus': row.get('status'), 'uploadStatus': row.get('upload_status'),
                  'sender': sender, 'senderName': NAMES.get(sender, sender), 'type': kind,
                  'content': content, 'timestamp': datetime.fromtimestamp(row['create_time'], timezone.utc).isoformat(),
                  'isMentioned': mentioned, 'isSelf': is_account(sender)}
+        value['mentionedUserIds'] = [v.strip() for v in xml_tag(source, 'atuserlist').split(',') if v.strip()]
         if not sender:
             value.pop('isSelf')
         if reply:
@@ -350,12 +375,53 @@ def messages(chat, limit, offset=0, *, before_time=None, before_id=0, after_time
     return output
 
 
+def moments_snapshot():
+    authority = json.loads((ROOT / 'authorized-chats.json').read_text())
+    if authority.get('account_id') != ACCOUNT or authority.get('moments_authorized') is not True:
+        raise PermissionError('Moments read access is not authorized')
+    # Use the existing bounded authentication check and the same read-only cipher pool.
+    scope = allowed_chats()
+    if not scope:
+        raise PermissionError('No authorized account scope')
+    authorized(next(iter(scope)))
+    own_ids = {ACCOUNT, credentials['account']}
+    own_sql = ','.join("'" + v.replace("'", "''") + "'" for v in sorted(own_ids))
+    rows = query('sns.db', 'SELECT tid,user_name,content FROM SnsTimeLine ORDER BY CASE WHEN tid<0 THEN 1 ELSE 0 END DESC,tid DESC LIMIT 100;')
+    rows += query('sns.db', 'SELECT tid,user_name,content FROM SnsTimeLine WHERE user_name IN (' + own_sql + ') ORDER BY CASE WHEN tid<0 THEN 1 ELSE 0 END DESC,tid DESC LIMIT 30;')
+    posts = {}
+    for row in rows:
+        post = parse_post(row, own_ids)
+        if post:
+            posts[post['id']] = post
+    notifications = query('sns.db', '''SELECT create_time,feed_id,from_username,from_nickname,
+        to_username,content,comment_id,comment64_id FROM SnsMessage_tmp3
+        WHERE length(content)>0 ORDER BY local_id DESC LIMIT 60;''')
+    for row in notifications:
+        comment = parse_notification(row, own_ids)
+        if not comment:
+            continue
+        post = posts.get(comment['post_id'])
+        if post and post['own'] and not any(c['id'] == comment['id'] for c in post['comments']):
+            post['comments'].append(comment)
+    friend_ids={p['author'] for p in posts.values() if not p.get('own')}
+    friend_ids.update(authority.get('moments_friend_ids') or [])
+    friends=[]
+    if friend_ids and 'contact.db' in KEYS:
+        names=','.join("'"+v.replace("'","''")+"'" for v in sorted(friend_ids))
+        friends=[{'id':r['username'],'name':r.get('nick_name') or r['username'],'remark':r.get('remark') or ''}
+                 for r in query('contact.db','SELECT username,nick_name,remark FROM contact WHERE username IN ('+names+');')]
+    return {'account': ACCOUNT, 'posts': sorted(posts.values(), key=lambda p:p['created'], reverse=True), 'friends':friends,
+            'read_at': time.time(), 'coverage': 'native_cached_timeline', 'own_ids': sorted(own_ids)}
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             url = urlsplit(self.path)
             params = parse_qs(url.query)
-            if url.path == '/stickers':
+            if url.path == '/moments':
+                result = moments_snapshot()
+            elif url.path == '/stickers':
                 result = {'stickers':favorites()}
             elif url.path == '/favorite-media':
                 result = favorite_media(params['md5'][0])
@@ -366,6 +432,8 @@ class Handler(BaseHTTPRequestHandler):
                 value = messages(params['chat'][0], max(1, min(200, int(params.get('limit', ['100'])[0]))),
                              max(0, min(20000, int(params.get('offset', ['0'])[0]))),**cursors)
                 result = {'account': ACCOUNT, 'messages': value}
+            elif url.path == '/members':
+                result = {'account':ACCOUNT, 'chat':params['chat'][0], 'members':group_members(params['chat'][0])}
             else:
                 raise ValueError('Unsupported native read route')
             payload = json.dumps(result, ensure_ascii=False).encode()
@@ -373,11 +441,16 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             payload = json.dumps({'error': type(exc).__name__}).encode()
             status = 503
-        self.send_response(status)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            # The caller timed out/cancelled; don't turn that into a traceback
+            # or attempt a second response. Its poll cursor remains unchanged.
+            return
 
     def log_message(self, *args):
         pass

@@ -25,6 +25,9 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS inbox_state ON inbox(state,timestamp);
             CREATE TABLE IF NOT EXISTS baselines(account TEXT,chat TEXT,PRIMARY KEY(account,chat));
+            CREATE TABLE IF NOT EXISTS poll_progress(
+                account TEXT,chat TEXT,after_time REAL NOT NULL,after_id INTEGER NOT NULL,
+                updated REAL NOT NULL,PRIMARY KEY(account,chat));
             CREATE TABLE IF NOT EXISTS history(
                 id INTEGER PRIMARY KEY, account TEXT, chat TEXT, role TEXT, content TEXT
             );
@@ -117,6 +120,28 @@ class Store:
                             (account,chat)).fetchone()
         return (float(row['timestamp']),int(row['local_id'] or 0)) if row else None
 
+    def poll_cursor(self, account, chat):
+        # Archive imports must never move the live reader past unprocessed rows.
+        row = self.db.execute('SELECT after_time,after_id FROM poll_progress WHERE account=? AND chat=?',
+                              (account, chat)).fetchone()
+        if row:
+            return float(row[0]), int(row[1])
+        row = self.db.execute('SELECT timestamp,local_id FROM inbox WHERE account=? AND chat=? '
+                              'ORDER BY timestamp DESC,local_id DESC LIMIT 1', (account, chat)).fetchone()
+        return (float(row[0]), int(row[1] or 0)) if row else None
+
+    def save_poll_cursor(self, account, chat, cursor):
+        if cursor is None:
+            return
+        with self.lock:
+            self.db.execute('''INSERT INTO poll_progress VALUES(?,?,?,?,?)
+                ON CONFLICT(account,chat) DO UPDATE SET after_time=excluded.after_time,
+                after_id=excluded.after_id,updated=excluded.updated
+                WHERE excluded.after_time>poll_progress.after_time OR
+                (excluded.after_time=poll_progress.after_time AND excluded.after_id>=poll_progress.after_id)''',
+                (account, chat, cursor[0], cursor[1], time.time()))
+            self.db.commit()
+
     def received(self, account, allowed, chat='', query='', before_time=None, before_id=0, before_key='', limit=50):
         scope=[chat] if chat and chat in allowed else allowed if not chat else []
         if not scope:return {'messages':[],'next':None}
@@ -135,7 +160,7 @@ class Store:
             FROM ranked m LEFT JOIN inbox i ON i.key=(
                 SELECT x.key FROM inbox x WHERE x.account=m.account AND x.chat=m.chat
                 AND (x.key=m.key OR (m.local_id>0 AND x.local_id=m.local_id))
-                ORDER BY CASE WHEN x.state IN ('sent','sending','uncertain','failed') THEN 1 ELSE 0 END DESC,
+                ORDER BY CASE WHEN x.state IN ('sent','partial','sending','uncertain','failed') THEN 1 ELSE 0 END DESC,
                 x.updated DESC LIMIT 1)
             LEFT JOIN media_attempts a ON a.key=m.key
             WHERE m.rank=1 ORDER BY m.timestamp DESC,m.local_id DESC,m.key DESC LIMIT ?''',
@@ -214,12 +239,27 @@ class Store:
 
     def insert(self, event: dict, state="queued"):
         with self.lock:
-            if event.get('local_id') and self.db.execute('SELECT 1 FROM inbox WHERE account=? AND chat=? AND local_id=?',
-                                                        (event['account'],event['chat'],event['local_id'])).fetchone():
-                return False
+            existing = self.db.execute('SELECT * FROM inbox WHERE key=? OR '
+                '(account=? AND chat=? AND local_id=? AND local_id>0) LIMIT 1',
+                (event['key'], event['account'], event['chat'], event.get('local_id') or 0)).fetchone()
+            if existing:
+                payload = event.get('payload_json', '{}')
+                enriched = (not existing['sender_id'] and event.get('sender_id') or
+                    existing['content'] != event['content'] or existing['payload_json'] != payload or
+                    existing['trigger'] != event.get('trigger', ''))
+                retry = (enriched and state == 'queued' and existing['state'] == 'ignored' and
+                    existing['error'] in ('', '已收录，未符合当前会话唤醒规则或消息类型'))
+                if enriched or existing['sender'] != event['sender']:
+                    self.db.execute('''UPDATE inbox SET content=?,sender=?,sender_id=?,payload_json=?,trigger=?,
+                        state=?,error=?,updated=? WHERE key=?''',
+                        (event['content'],event['sender'],event.get('sender_id') or existing['sender_id'],payload,
+                         event.get('trigger',''), 'queued' if retry else existing['state'],
+                         '' if retry else existing['error'],time.time() if retry else existing['updated'],existing['key']))
+                    self.db.commit()
+                return bool(retry)
             cursor = self.db.execute(
-                "INSERT OR IGNORE INTO inbox(key,account,chat,sender,content,timestamp,state,updated,local_id,sender_id,trigger,payload_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (event["key"], event["account"], event["chat"], event["sender"], event["content"], event["timestamp"], state, time.time(),event.get('local_id'),event.get('sender_id',''),event.get('trigger',''),event.get('payload_json','{}')),
+                "INSERT OR IGNORE INTO inbox(key,account,chat,sender,content,timestamp,state,updated,local_id,sender_id,trigger,payload_json,error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (event["key"], event["account"], event["chat"], event["sender"], event["content"], event["timestamp"], state, time.time(),event.get('local_id'),event.get('sender_id',''),event.get('trigger',''),event.get('payload_json','{}'),event.get('read_reason','')[:300]),
             )
             self.db.commit()
             return cursor.rowcount == 1
@@ -278,7 +318,7 @@ class Store:
 
     def latest_sent(self, account, chat):
         row = self.db.execute("""SELECT MAX(COALESCE(json_extract(m.metrics,'$.send_started_at'),i.updated))
-            FROM inbox i LEFT JOIN reply_metrics m ON i.key=m.key WHERE i.account=? AND i.chat=? AND i.state='sent'""", (account, chat)).fetchone()
+            FROM inbox i LEFT JOIN reply_metrics m ON i.key=m.key WHERE i.account=? AND i.chat=? AND i.state IN ('sent','partial')""", (account, chat)).fetchone()
         sent=self.db.execute("SELECT MAX(sent_at) FROM outbound_actions WHERE account=? AND chat=? AND state IN ('sent','uncertain')",
                              (account,chat)).fetchone()[0] or 0
         return max(row[0] or 0,sent)
@@ -297,8 +337,11 @@ class Store:
                                 (event["account"], event["chat"], role, content))
             self.db.commit()
 
-    def recent(self):
-        rows=[dict(r) for r in self.db.execute("SELECT key,chat,sender,content,state,reply,error,updated FROM inbox WHERE state NOT IN ('baseline','ignored') ORDER BY updated DESC LIMIT 35")]
+    def recent(self, include_ignored=False):
+        where = '' if include_ignored else "WHERE state NOT IN ('baseline','ignored')"
+        order = 'timestamp DESC,updated DESC' if include_ignored else 'updated DESC'
+        rows=[dict(r) for r in self.db.execute('SELECT key,chat,sender,content,state,reply,error,updated,timestamp '
+                                             'FROM inbox '+where+' ORDER BY '+order+' LIMIT 50')]
         for row in rows:row['actions']=self.actions(row['key'])
         return rows
 

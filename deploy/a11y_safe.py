@@ -27,7 +27,8 @@ INTERACTIVE = {'push-button', 'toggle-button', 'check-box', 'radio-button',
 
 
 class A11yBus:
-    def __init__(self):
+    def __init__(self, *, deadline=None):
+        self.deadline = deadline
         import gi
         gi.require_version('Atspi', '2.0')
         from gi.repository import Atspi, Gio, GLib
@@ -53,9 +54,12 @@ class A11yBus:
         self.pids = {}
 
     def call(self, ref, interface, method, signature=None, values=()):
+        remaining = self.deadline-time.monotonic() if self.deadline is not None else 1.5
+        if remaining <= 0:
+            raise TimeoutError('Accessibility snapshot deadline reached')
         args = self.GLib.Variant(signature, values) if signature else None
         reply = self.connection.call_sync(ref[0], ref[1], interface, method, args, None,
-                                          self.Gio.DBusCallFlags.NONE, 1500, None)
+                                          self.Gio.DBusCallFlags.NONE, max(1, min(1500, int(remaining*1000))), None)
         result = reply.unpack()
         return result[0] if len(result) == 1 else result
 
@@ -97,12 +101,14 @@ class A11yBus:
         return {'pid': self.pids[ref[0]]}
 
 
-def dump_tree(bus, max_depth=30):
+def dump_tree(bus, max_depth=30, *, skip_messages=False, deadline=None):
     stats = {'nodes': 0, 'bulk_requests': 0, 'stale_nodes_skipped': 0,
              'child_index_requests': 0}
     seen = set()
 
     def walk(ref, depth):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError('Accessibility snapshot deadline reached')
         if depth > max_depth or ref in seen:
             return None
         seen.add(ref)
@@ -116,6 +122,10 @@ def dump_tree(bus, max_depth=30):
             if depth > 1 and bounds is None or role == 'label' and not name:
                 return None
             result = {'role': role, 'name': name}
+            if role == 'label' and name == 'Custom Stickers':
+                # Stable object identity lets the selector align overlapping
+                # virtual pages without guessing how far a wheel event moved.
+                result['native_ref'] = ref[0] + '|' + ref[1]
             if bounds:
                 result['bounds'] = bounds
             try:
@@ -130,6 +140,10 @@ def dump_tree(bus, max_depth=30):
                 except Exception:
                     pass
             stats['nodes'] += 1
+            # Sending only needs the destination, composer and sticker controls.
+            # Message/quote/image reads continue to request the complete tree.
+            if skip_messages and role == 'list' and name == 'Messages':
+                return result
             # Freeze this parent's object references in one native call. An
             # item that vanishes later is skipped; never fall back to an index.
             stats['bulk_requests'] += 1
@@ -138,6 +152,8 @@ def dump_tree(bus, max_depth=30):
             if children:
                 result['children'] = children
             return result
+        except TimeoutError:
+            raise
         except Exception:
             stats['stale_nodes_skipped'] += 1
             return None
@@ -168,24 +184,47 @@ def publish_stats(directory, stats):
     os.replace(pending, target)
 
 
+def acquire_read_lock(lock, *, timeout=1.2):
+    # The gateway doesn't reap timed-out child commands. Unbounded flock would
+    # leave cancelled readers queued for tens of seconds and starve health scans.
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError('Accessibility reader busy') from None
+            time.sleep(.025)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--format', choices=['json', 'aria'], default='json')
     parser.add_argument('--max-depth', type=int, default=30)
+    parser.add_argument('--skip-messages', action='store_true')
     args = parser.parse_args()
     directory = Path('/data/native-tools/a11y-state')
     started = time.monotonic()
     with (directory / 'read.lock').open('r+') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        locked = time.monotonic()
+        locked = started
         try:
-            tree, stats = dump_tree(A11yBus(), args.max_depth)
+            acquire_read_lock(lock)
+            locked = time.monotonic()
+            deadline = started + 6.5
+            tree, stats = dump_tree(A11yBus(deadline=deadline), args.max_depth,
+                                    skip_messages=args.skip_messages, deadline=deadline)
             stats.update(at=time.time(), elapsed_seconds=round(time.monotonic() - started, 4),
                          lock_wait_seconds=round(locked - started, 4), ok=bool(tree))
             publish_stats(directory, stats)
             if not tree:
                 raise RuntimeError('Native accessibility snapshot unavailable')
             print(tree_aria(tree) if args.format == 'aria' else json.dumps(tree, ensure_ascii=False))
+        except Exception as exc:
+            publish_stats(directory, {'at': time.time(), 'ok': False, 'error': type(exc).__name__,
+                'elapsed_seconds': round(time.monotonic()-started,4),
+                'lock_wait_seconds': round((locked if locked>started else time.monotonic())-started,4)})
+            raise
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
 

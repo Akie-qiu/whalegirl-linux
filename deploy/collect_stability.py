@@ -110,6 +110,11 @@ def record(result):
         event('bot_core_unavailable', '机器人管理服务暂不可用，微信客户端状态单独记录', 'warning')
     elif previous.get('core_available') is False and result.get('core_available') is True:
         event('bot_core_recovered', '机器人管理服务恢复')
+    guard = result.get('restart_guard', {})
+    old_guard = previous.get('restart_guard', {})
+    guard_delta = max(0, guard.get('blocked_count', 0) - old_guard.get('blocked_count', 0))
+    if guard_delta:
+        event('ui_timeout_restart_prevented', f'界面读取超时触发了 {guard_delta} 次自动强杀请求，已保留仍运行的微信；需核对界面读取状态', 'warning')
     reader = result.get('a11y_reader', {})
     old_reader = previous.get('a11y_reader', {})
     if reader.get('mounted') and not old_reader.get('mounted'):
@@ -183,13 +188,20 @@ def collect():
             helper = Path('/var/lib/whalegirl-linux/candidate-4.1.1.8/gateway/native-tools/a11y_safe.py')
             if helper.is_file():
                 try:
-                    mounted = helper.samefile(Path('/proc') / str(pid) / 'root/opt/tools/a11y-dump')
+                    mounted = helper.read_bytes() == (Path('/proc') / str(pid) / 'root/opt/tools/a11y-dump').read_bytes()
                     samples = list((helper.parent / 'a11y-state').glob('latest-*.json'))
                     newest = max(samples, key=lambda p: p.stat().st_mtime) if samples else None
                     result['a11y_reader'] = {'version': 'bulk-references-v1', 'mounted': mounted,
                                              'latest': read_json(newest) if newest else {}}
                 except OSError:
                     result['a11y_reader'] = {'version': 'bulk-references-v1', 'mounted': False}
+            tools = Path('/var/lib/whalegirl-linux/candidate-4.1.1.8/gateway/native-tools')
+            guard = read_json(tools / 'health-state/restart-guard.json')
+            try:
+                installed = (tools/'health_restart_guard.py').read_bytes() == (Path('/proc')/str(pid)/'root/usr/local/sbin/kill').read_bytes()
+            except OSError:
+                installed = False
+            result['restart_guard'] = {**guard, 'installed': installed}
     except Exception as exc:
         errors['resources'] = type(exc).__name__
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))

@@ -1,5 +1,6 @@
 """Native identity, reversible retirement and asynchronous collection regressions."""
 import base64
+import hashlib
 from io import BytesIO
 import json
 from pathlib import Path
@@ -70,8 +71,9 @@ class StickerLibraryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.library.inventory('account',self.settings.allowed_chat_ids)['candidates'][0]['state'],'selected')
 
     async def test_background_collection_tags_once_and_confirms_native_readback(self):
-        event=self.sticker();self.library.offer('account',[event])
         stream=BytesIO();Image.new('RGB',(32,32),'red').save(stream,'PNG');data=base64.b64encode(stream.getvalue()).decode()
+        md5=hashlib.md5(stream.getvalue()).hexdigest()
+        event=self.sticker(md5=md5);self.library.offer('account',[event])
         class Gateway:
             def __init__(self,existing):self.favorites=list(existing);self.collections=0
             async def media(self,*args,**kwargs):return {'data':data}
@@ -86,7 +88,7 @@ class StickerLibraryTests(unittest.IsolatedAsyncioTestCase):
         await self.library.work('account',gateway,engine,self.settings,lambda:True)
         await self.library.work('account',gateway,engine,self.settings,lambda:True)
         self.assertEqual((gateway.collections,engine.calls),(1,1))
-        self.assertIn('f'*32,self.catalog.choices());self.assertEqual(self.catalog.entries['f'*32],'尴尬挠头')
+        self.assertIn(md5,self.catalog.choices());self.assertEqual(self.catalog.entries[md5],'尴尬挠头')
         self.assertEqual(self.library.used_today('account','collect'),1)
 
     async def test_disabled_source_is_not_automatically_readded(self):

@@ -24,6 +24,8 @@ PRESETS = {
     '82c478c608a7f8c20b76ee9c0ade7c9a': '蓝发小人瞪大眼，惊讶、震惊、没想到',
 }
 
+PROFILE_FIELDS = ('meaning','visual','text','emotion','tone','use_when','avoid_when','example','persona_fit','intensity','usage_scope')
+
 
 def parse_json(text):
     return json.loads(re.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip()))
@@ -71,16 +73,20 @@ class StickerCatalog:
         return {m:available[m] for m in ranked[:limit]}
 
     def details(self,choices):
-        fields=('meaning','visual','text','emotion','use_when','avoid_when','tone','example')
+        fields=PROFILE_FIELDS
         return {m:{k:str(v)[:160] for k,v in self.profiles.get(m,{}).items() if k in fields} for m in choices if m in self.profiles}
 
     def edit(self,md5,value, *, actor='admin'):
         if not re.fullmatch('[0-9a-f]{32}',md5) or md5 not in self.entries and md5 not in self.available:
             raise ValueError('表情不在当前收藏目录')
-        fields=('meaning','visual','text','emotion','use_when','avoid_when','tone','example')
-        profile={k:str(value.get(k,''))[:400].strip() for k in fields}
+        old=self.profiles.get(md5,{})
+        if actor!='admin' and old.get('locked',old.get('actor')=='admin'):return old
+        if actor=='admin' and 'version' in value and value['version']!=old.get('version',0):
+            raise ValueError('表情档案已变化，请刷新后再保存')
+        profile={k:str(value.get(k,old.get(k,'')))[:400].strip() for k in PROFILE_FIELDS}
         if not profile['meaning']:raise ValueError('请填写表情含义')
-        profile.update(actor=actor,updated=time.time())
+        profile.update(actor=actor,updated=time.time(),version=old.get('version',0)+1,
+                       locked=bool(value.get('locked',True)) if actor=='admin' else False)
         self.profiles[md5]=profile;self.entries[md5]=profile['meaning'][:180]
         private_write(self.profile_path,json.dumps(self.profiles,ensure_ascii=False,indent=2))
         private_write(self.path,json.dumps(self.entries,ensure_ascii=False,indent=2))

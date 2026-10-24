@@ -4,7 +4,10 @@
   const button=(title,fn)=>{const b=el('button','secondary',title);b.type='button';b.onclick=()=>action(b,fn);return b;};
   const panel=el('section','panel span-all');panel.id='affection-panel';
   panel.append(el('h2','','人物好感度'),el('p','muted','同一微信 ID 在所有已授权群和私聊共用好感度。群聊只表达朋友式关心；私聊可更亲近，个人事实与偏好继续按原规则共享。分数仅后台可见。'));
-  const enabled=el('input');enabled.type='checkbox';const enabledLabel=el('label','check-label');enabledLabel.append(enabled,document.createTextNode('启用好感度与个性化回应'));
+  const enabled=el('input');enabled.id='affection-enabled';enabled.type='checkbox';enabled.className='toggle';enabled.setAttribute('aria-label','好感度系统总开关');
+  const enabledLabel=el('div','setting-row'),enabledCopy=el('div');enabledCopy.append(el('strong','','好感度系统总开关'),el('p','','切换后自动保存。关闭后停止自动计分，也不按好感度调整语气和记忆优先级；已有分数与记录保留。'));
+  enabledLabel.append(enabledCopy,enabled);
+  const enabledStatus=el('p','hint');enabledStatus.id='affection-enabled-status';enabledStatus.setAttribute('aria-live','polite');
   const privateStyle=el('select');for(const [v,t] of [['close','熟悉后可更亲近，跟随对方语气'],['warm','始终保持温暖朋友语气']]){const o=el('option','',t);o.value=v;privateStyle.append(o);}
   const privateLabel=el('label','','私聊表达');privateLabel.append(privateStyle);
   const settingsBox=el('details','record');settingsBox.append(el('summary','','增长速度与初始值'));
@@ -15,16 +18,30 @@
     const label=el('label','',title),input=el('input');input.type='number';input.min=min;input.max=max;input.step=1;inputs[name]=input;label.append(input);settingsBox.append(label);
   }
   settingsBox.append(el('p','hint','只累计新发生的有效交流，不按消息条数刷分；离线和久未聊天不扣分。初始值只影响尚未建立记录的人物。'));
-  panel.append(enabledLabel,privateLabel,settingsBox,button('保存好感度规则',async()=>{
-    const values={affection_enabled:enabled.checked,affection_private_style:privateStyle.value};
+  panel.append(enabledLabel,enabledStatus,privateLabel,settingsBox,button('保存好感度规则',async()=>{
+    const values={affection_private_style:privateStyle.value};
     for(const [n,input] of Object.entries(inputs))values[n]=Number(input.value);
     await saveSubset(values);await load();notice('好感度规则已保存');
   }));
   const toolbar=el('div','chat-toolbar'),query=el('input');query.type='search';query.placeholder='搜索昵称或真实微信 ID';query.setAttribute('aria-label','搜索好感度人物');
   toolbar.append(query,button('查询 / 刷新',load));const count=el('p','hint'),list=el('div');panel.append(toolbar,count,list);$('memory-panel').after(panel);
   const nav=el('a','','人物好感度');nav.href='#affection-panel';document.querySelector('nav').append(nav);
-  let loaded=false,loading=false;
-  function populate(){if(!cfg)return;enabled.checked=cfg.affection_enabled;privateStyle.value=cfg.affection_private_style;for(const [n,input] of Object.entries(inputs))input.value=cfg[n];}
+  let loaded=false,loading=false,toggling=false;
+  function syncEnabled(){
+    if(!cfg)return;enabled.checked=!!cfg.affection_enabled;
+    const quick=$('quick-affection-enabled');if(quick)quick.checked=enabled.checked;
+    enabledStatus.textContent=enabled.checked?'当前：已启用 · 自动计分及好感度个性化生效':'当前：已关闭 · 不自动计分或使用好感度权重；普通聊天与记忆继续工作，重新开启可沿用原有分数';
+  }
+  async function toggle(control){
+    if(toggling)return;toggling=true;
+    const value=control.checked,controls=[enabled,$('quick-affection-enabled')].filter(Boolean);
+    for(const input of controls)input.disabled=true;
+    try{await saveSubset({affection_enabled:value});syncEnabled();notice(value?'好感度系统已开启':'好感度系统已关闭，已有分数和记录保留');}
+    catch(error){syncEnabled();notice(error.message,true);}
+    finally{toggling=false;for(const input of controls)input.disabled=false;}
+  }
+  enabled.onchange=()=>toggle(enabled);
+  function populate(){if(!cfg)return;syncEnabled();privateStyle.value=cfg.affection_private_style;for(const [n,input] of Object.entries(inputs))input.value=cfg[n];}
   async function history(person,box){
     const r=await api('affection/revisions?subject='+encodeURIComponent(person.subject));box.replaceChildren();
     if(!r.revisions.length)box.append(el('p','hint','还没有变化记录'));
@@ -50,6 +67,6 @@
     }finally{loading=false;}
   }
   nav.addEventListener('click',()=>load().catch(e=>notice(e.message,true)));
-  window.affection={populate,stateUpdated(){if(!loaded&&cfg&&location.hash==='#affection-panel')load().catch(e=>notice(e.message,true));}};
+  window.affection={populate,toggle,stateUpdated(){if(!loaded&&cfg&&location.hash==='#affection-panel')load().catch(e=>notice(e.message,true));}};
   if(cfg)populate();
 })();

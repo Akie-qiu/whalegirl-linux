@@ -46,7 +46,7 @@ class DeepSeekSearch:
         self.last={}
 
     async def run(self, engine, query, settings):
-        started=time.monotonic();query=public_query(query)
+        started=time.monotonic();created=time.time();attempted=False;raw_usage=None;outcome='error';query=public_query(query)
         result={'ok':False,'text':'','requests':0,'error':''}
         try:
             if not settings.web_search_enabled:
@@ -57,8 +57,10 @@ class DeepSeekSearch:
                 result['error']='当前接口不是 DeepSeek 官方联网搜索接口';return result
             payload={'query':query,'count':settings.web_search_result_count,'need_content':True}
             client=await engine._get_client()
+            attempted=True
             response=await client.post('https://api.deepseek.com/v1/tools/search',json=payload,timeout=httpx.Timeout(settings.web_search_timeout))
             response.raise_for_status();data=response.json()
+            raw_usage=data.get('usage');outcome='success'
             rows=data.get('results')
             if not isinstance(rows,list):raise ValueError('Missing search results')
             result['requests']=1
@@ -84,13 +86,15 @@ class DeepSeekSearch:
         except httpx.HTTPError:
             result['error']='联网接口暂时无法连接'
         finally:
+            if attempted and hasattr(engine,'record_usage'):
+                engine.record_usage(raw_usage,started=started,created=created,status=outcome,operation='search')
             result['seconds']=round(time.monotonic()-started,3)
             result['checked_at']=time.time()
             self.last={k:v for k,v in result.items() if k not in ('text','documents')}
         return result
 
     async def fetch(self,engine,url,settings):
-        started=time.monotonic();result={'ok':False,'text':'','requests':0,'error':'','operation':'fetch'}
+        started=time.monotonic();created=time.time();attempted=False;raw_usage=None;outcome='error';result={'ok':False,'text':'','requests':0,'error':'','operation':'fetch'}
         try:
             parsed=urlsplit(str(url or ''))
             host=parsed.hostname or ''
@@ -105,9 +109,11 @@ class DeepSeekSearch:
             if engine.api_style!='openai' or urlsplit(engine.api_url).hostname!='api.deepseek.com':
                 result['error']='当前接口不是 DeepSeek 官方网页抓取接口';return result
             client=await engine._get_client()
+            attempted=True
             response=await client.post('https://api.deepseek.com/v1/tools/fetch',json={'url':url,'max_content_tokens':5000},
                                        timeout=httpx.Timeout(settings.web_search_timeout))
             response.raise_for_status();data=response.json();result['requests']=1
+            raw_usage=data.get('usage');outcome='success'
             text=str(data.get('content') or '')
             if text:result.update(ok=True,text=text[:20000],title=str(data.get('title') or '')[:250])
             else:result['error']='网页未返回可读正文'
@@ -116,6 +122,8 @@ class DeepSeekSearch:
         except httpx.HTTPError:result['error']='网页抓取接口暂时无法连接'
         except (ValueError,TypeError):result['error']='网页抓取结果暂不可用'
         finally:
+            if attempted and hasattr(engine,'record_usage'):
+                engine.record_usage(raw_usage,started=started,created=created,status=outcome,operation='fetch')
             result['seconds']=round(time.monotonic()-started,3);result['checked_at']=time.time()
             self.last={k:v for k,v in result.items() if k!='text'}
         return result

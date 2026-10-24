@@ -2,11 +2,14 @@
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass, field
 from typing import AsyncIterator
+from urllib.parse import urlsplit
 
 import httpx
 from loguru import logger
+from ..token_usage import normalize_usage
 
 
 @dataclass
@@ -56,6 +59,7 @@ class AIEngine:
         self.timeout = timeout
         self.max_retries = max_retries
         self.usage = TokenUsage()
+        self.usage_callback = None
         self._clients: dict[int, httpx.AsyncClient] = {}
         self._available = True
         self.last_error = ""
@@ -212,6 +216,8 @@ class AIEngine:
         # 重试循环
         last_error = None
         for attempt in range(self.max_retries):
+            started,created=time.monotonic(),time.time()
+            raw_usage=None;outcome='error'
             try:
                 client = await self._get_client()
                 logger.debug(f"AI 请求: url={self.api_url}, model={self.model}, attempt={attempt + 1}")
@@ -219,25 +225,16 @@ class AIEngine:
                 response.raise_for_status()
 
                 data = response.json()
+                raw_usage=data.get('usage')
                 if self.api_style == "anthropic":
                     content = "\n".join(
                         block.get("text", "")
                         for block in data.get("content", [])
                         if block.get("type") == "text"
                     ).strip()
-                    usage = data.get("usage", {})
-                    self.usage.add(
-                        prompt=usage.get("input_tokens", 0),
-                        completion=usage.get("output_tokens", 0),
-                    )
                 else:
                     content = data["choices"][0]["message"]["content"].strip()
-                    usage = data.get("usage", {})
-                    self.usage.add(
-                        prompt=usage.get("prompt_tokens", 0),
-                        completion=usage.get("completion_tokens", 0),
-                    )
-
+                outcome='success'
                 logger.debug(f"AI 回复成功 (attempt {attempt + 1})")
                 return content
 
@@ -254,6 +251,8 @@ class AIEngine:
             except Exception as e:
                 last_error = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
                 logger.warning(f"AI 请求异常: {last_error} (attempt {attempt + 1}/{self.max_retries})")
+            finally:
+                self.record_usage(raw_usage,started=started,created=created,status=outcome)
 
             # 指数退避
             if attempt < self.max_retries - 1:
@@ -263,6 +262,19 @@ class AIEngine:
         logger.error(f"AI 请求最终失败: {last_error}")
         self.last_error = last_error or "模型返回空内容"
         return ""
+
+    def record_usage(self,raw_usage=None, *, started,created,status='success',operation='chat'):
+        """Accounting must never turn a completed model call into a retry."""
+        try:
+            normalized=normalize_usage(raw_usage,self.api_style)
+            if operation=='chat':
+                self.usage.add(normalized['input_tokens'] or 0,normalized['output_tokens'] or 0)
+            if self.usage_callback:
+                self.usage_callback({'created':created,'provider':urlsplit(self.api_url).hostname or '',
+                    'model':self.model,'operation':operation,'status':status,
+                    'elapsed_ms':round((time.monotonic()-started)*1000),**normalized})
+        except Exception as exc:
+            logger.warning('Token统计记录失败: '+type(exc).__name__)
 
     async def chat_stream(
         self,
@@ -280,6 +292,7 @@ class AIEngine:
             max_tokens=max_tokens,
         )
 
+        started,created=time.monotonic(),time.time();raw_usage={};outcome='error'
         try:
             client = await self._get_client()
             async with client.stream("POST", self.api_url, json=payload) as response:
@@ -292,7 +305,9 @@ class AIEngine:
                         break
                     try:
                         data = json.loads(data_str)
+                        if isinstance(data.get('usage'),dict):raw_usage.update(data['usage'])
                         if self.api_style == "anthropic":
+                            if isinstance(data.get('message',{}).get('usage'),dict):raw_usage.update(data['message']['usage'])
                             delta = data.get("delta", {})
                             content = (
                                 delta.get("text", "")
@@ -306,8 +321,11 @@ class AIEngine:
                             yield content
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
+                outcome='success'
         except Exception as e:
             logger.error(f"流式请求失败: {e}")
+        finally:
+            self.record_usage(raw_usage,started=started,created=created,status=outcome)
 
     async def test_connection(self) -> tuple[bool, str]:
         """测试 API 连接"""

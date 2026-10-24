@@ -22,6 +22,8 @@ class Receipt:
     definite_failure: bool = False
     quoted: bool = False
     quote_error: str = ""
+    mentioned_ids: tuple[str, ...] = ()
+    mention_error: str = ""
 
 
 class UIJobError(ValueError):
@@ -33,6 +35,16 @@ class UIJobError(ValueError):
 def message_id(message):
     # Local IDs can restart for another account; the caller scopes by account and chat.
     return str(message.get("serverId") or f"local:{message.get('localId')}")
+
+
+def server_acknowledged(message):
+    value=str(message.get('serverId') or '')
+    return value.isdigit() and int(value)>0 and message.get('nativeStatus')!=5
+
+
+def outbound_identity(message):
+    # serverId changes from zero to its final value after network acceptance.
+    return ('local:'+str(message['localId'])) if message.get('localId') else message_id(message)
 
 
 class AgentGateway:
@@ -51,6 +63,10 @@ class AgentGateway:
         self.ui_jobs_directory=Path(job_path) if job_path else None
         self.native_reader = None
         self.native_reader_endpoint = None
+        self._status_task = None
+        self._status_cache = None
+        self._status_at = 0.0
+        self._members_cache = {}
 
     async def ui_job(self,operation,chat,**values):
         if not self.ui_jobs_directory:return {}
@@ -64,7 +80,26 @@ class AgentGateway:
             raise UIJobError(str(saved.get('error') or value.get('error') or 'Native UI job failed')[:200],saved.get('state',''))
         return json.loads(path.read_text())
 
-    async def status(self):
+    def warm_send_status(self):
+        # One account observation overlaps model generation. Polling and the
+        # send path share it instead of taking simultaneous full UI snapshots.
+        if self._status_cache is not None and time.monotonic()-self._status_at < 1:
+            return
+        if self._status_task is None or self._status_task.done():
+            self._status_task = asyncio.create_task(self._read_status())
+            self._status_task.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+
+    async def status(self, *, max_age=0):
+        if max_age > 0 and self._status_cache is not None and time.monotonic()-self._status_at < max_age:
+            return dict(self._status_cache)
+        if self._status_task is None or self._status_task.done():
+            self._status_task = asyncio.create_task(self._read_status())
+        return dict(await asyncio.shield(self._status_task))
+
+    async def status_for_send(self):
+        return await self.status(max_age=2)
+
+    async def _read_status(self):
         response = await self.client.get("/api/status/auth")
         response.raise_for_status()
         value = response.json()
@@ -80,7 +115,18 @@ class AgentGateway:
                     self.login.update(state="attention", message=popup, qrDataUrl="")
             except (httpx.HTTPError, ValueError):
                 pass
+        self._status_cache = value
+        self._status_at = time.monotonic()
         return value
+
+    async def moments(self, operation, account, **values):
+        if not self.ui_jobs_directory:
+            raise ValueError('此网关尚未配置原生朋友圈适配')
+        async with self.ui_lock:
+            status = await self.status()
+            if status.get('status') != 'logged_in' or status.get('loggedInUser') != account:
+                raise UIJobError('朋友圈账号当前未登录', 'failed_before_send')
+            return await self.ui_job(operation, account, **values)
 
     async def chats(self):
         result = []
@@ -100,7 +146,9 @@ class AgentGateway:
             try:
                 return (await self.native_request('/messages',chat=chat,limit=limit,offset=offset,**cursor))['messages']
             except (httpx.HTTPError,OSError,ValueError,KeyError):
-                pass
+                # The UI only exposes a partial window. Falling back silently
+                # would let its newest row advance the complete native cursor.
+                raise
         response = await self.client.get(f"/api/messages/{quote(chat, safe='')}", params={"limit": limit, "offset": offset})
         response.raise_for_status()
         value = response.json()
@@ -124,6 +172,15 @@ class AgentGateway:
         rows=await self.messages(chat,limit=1,server_id=str(server_id))
         return next((m for m in rows if str(m.get('serverId'))==str(server_id)),None)
 
+    async def group_members(self,chat):
+        if not chat.endswith('@chatroom') or not self.ui_jobs_directory:return []
+        cached = self._members_cache.get(chat)
+        if cached and time.monotonic()-cached[0]<60:return cached[1]
+        value = await self.native_request('/members',chat=chat)
+        rows = value.get('members',[])
+        self._members_cache[chat] = (time.monotonic(),rows)
+        return rows
+
     async def native_request(self, route, **params):
         if not self.ui_jobs_directory:return {}
         name=(self.ui_jobs_directory/'native-read.endpoint').read_text().strip()
@@ -144,10 +201,10 @@ class AgentGateway:
                 moved=False
                 try:
                     result=await self.ui_job('read_image',chat,local_id=int(local_id),server_id=str(server_id))
-                    for _ in range(3):
+                    for attempt in range(4):
                         if result.get('data') or result.get('quality') not in ('not_visible','partly_visible'):break
                         moved=True
-                        await self.ui_job('open_chat',chat,scroll='up')
+                        await self.ui_job('open_chat',chat,scroll='latest' if attempt==0 else 'up')
                         result=await self.ui_job('read_image',chat,local_id=int(local_id),server_id=str(server_id))
                 finally:
                     if moved:
@@ -155,7 +212,7 @@ class AgentGateway:
                         except (httpx.HTTPError,OSError,ValueError):pass
             if result.get('data'):
                 return {'type':'image','format':'png','data':result['data'],'quality':'native_clipboard_fast','partial':False}
-            return {'type':'image','data':'','quality':result.get('quality') or 'not_visible'}
+            return {'type':'image','data':'','quality':result.get('quality') or 'clipboard_unavailable'}
         if kind==47 and self.ui_jobs_directory:
             try:
                 value=await self.native_request('/media',chat=chat,local_id=int(local_id))
@@ -183,7 +240,7 @@ class AgentGateway:
             return await self.ui_job('collect_sticker',chat,local_id=int(local_id),server_id=str(server_id),md5=md5)
 
     async def send_sticker(self, chat, md5):
-        before={message_id(m) for m in await self.messages(chat)}
+        before={outbound_identity(m) for m in await self.messages(chat)}
         async def post_once():
             async with self.ui_lock:
                 try:
@@ -197,23 +254,65 @@ class AgentGateway:
         request.add_done_callback(self.inflight_sends.discard)
         deadline=time.monotonic()+20
         while time.monotonic()<deadline:
-            for item in await self.messages(chat):
+            try:
+                rows=await self.messages(chat)
+            except (httpx.HTTPError,ValueError,OSError):
+                rows=[]
+            for item in rows:
                 if (item.get('isSelf') is True and item.get('type')==47 and
-                        (item.get('sticker') or {}).get('md5')==md5 and message_id(item) not in before):
-                    return Receipt(True,message_id(item))
+                        (item.get('sticker') or {}).get('md5')==md5 and outbound_identity(item) not in before):
+                    if server_acknowledged(item):return Receipt(True,message_id(item))
+                    if item.get('nativeStatus')==5:
+                        return Receipt(False,error='微信报告表情发送失败，未获得服务器回执',definite_failure=True)
             if request.done() and request.result():
                 return request.result()
             await asyncio.sleep(.15)
         return Receipt(False,error='Native sticker was not read back; do not resend automatically')
 
-    async def send(self, chat, text, *, quote_to=None):
-        before = {message_id(m) for m in await self.messages(chat)}
+    async def send_image(self, chat, asset_id):
+        if not self.ui_jobs_directory or not re.fullmatch('[0-9a-f]{64}',str(asset_id)):
+            return Receipt(False,error='原生图片发送尚未配置',definite_failure=True)
+        async with self.ui_lock:
+            before={outbound_identity(m) for m in await self.messages(chat)}
+            try:
+                result=await self.ui_job('send_image',chat,asset_id=asset_id)
+            except UIJobError as exc:
+                return Receipt(False,error=str(exc),definite_failure=exc.state=='failed_before_send')
+            except (httpx.HTTPError, ValueError, OSError):
+                return Receipt(False,error='图片发送提交结果待核实，不自动重发')
+            if result.get('state')!='submitted':
+                return Receipt(False,error='原生图片未确认提交')
+            deadline=time.monotonic()+25
+            while time.monotonic()<deadline:
+                try:
+                    rows=await self.messages(chat)
+                except (httpx.HTTPError,ValueError,OSError):
+                    rows=[]
+                fresh=[m for m in rows if m.get('isSelf') is True and m.get('type')==3
+                       and outbound_identity(m) not in before]
+                if len(fresh)==1:
+                    item=fresh[0]
+                    if item.get('nativeStatus')==5:
+                        return Receipt(False,error='微信报告图片发送失败',definite_failure=True)
+                    if server_acknowledged(item):
+                        return Receipt(True,message_id(item))
+                elif len(fresh)>1:
+                    return Receipt(False,error='出现多条新图片，无法唯一确认，请人工核对')
+                await asyncio.sleep(.2)
+            return Receipt(False,error='未读到微信图片服务器回执，不自动重发')
+
+    async def send(self, chat, text, *, quote_to=None, mentions=None):
+        mentions = list(mentions or [])[:3] if chat.endswith('@chatroom') else []
+        if mentions and not self.ui_jobs_directory:
+            return Receipt(False,error='当前网关不支持原生@成员',definite_failure=True)
+        before = {outbound_identity(m) for m in await self.messages(chat)}
         submission = {}
         async def post_once():
             async with self.ui_lock:
                 try:
                     if self.ui_jobs_directory:
-                        result=await self.ui_job('send_text',chat,text=text,**({'quote_to':quote_to} if quote_to else {}))
+                        result=await self.ui_job('send_text',chat,text=text,**({'quote_to':quote_to} if quote_to else {}),
+                                                **({'mentions':mentions} if mentions else {}))
                         submission.update(result)
                         return None if result.get('state')=='submitted' else Receipt(False,error='UI job did not submit text')
                     response = await self.client.post("/api/messages/send", json={"chatId": chat, "text": text}, timeout=45)
@@ -234,13 +333,24 @@ class AgentGateway:
             try:
                 for item in await self.messages(chat):
                     mid = message_id(item)
-                    if item.get("isSelf") is True and item.get("content", "").strip() == text.strip() and mid not in before:
+                    content = item.get('content','').strip()
+                    mentioned = tuple(item.get('mentionedUserIds') or ())
+                    expected_mentions = {m['id'] for m in mentions}
+                    matches_text = content == text.strip() or bool(mentions and content.endswith(text.strip()) and
+                        expected_mentions.issubset(mentioned))
+                    if item.get("isSelf") is True and matches_text and outbound_identity(item) not in before:
+                        if item.get('nativeStatus')==5:
+                            return Receipt(False,error='微信报告文字发送失败，未获得服务器回执',definite_failure=True)
+                        if not server_acknowledged(item):continue
                         reference = item.get('reply') or {}
                         if quote_to and reference.get('serverId'):
                             if str(reference['serverId']) != str(quote_to['server_id']):
                                 return Receipt(False,error='Quoted reply was sent to a different source message; do not resend')
-                            return Receipt(True,mid,quoted=True)
-                        return Receipt(True,mid,quote_error=(submission.get('quote_fallback') or 'Native quote was not applied') if quote_to else '')
+                            return Receipt(True,mid,quoted=True,mentioned_ids=mentioned,
+                                mention_error=submission.get('mention_fallback',''))
+                        return Receipt(True,mid,quote_error=(submission.get('quote_fallback') or 'Native quote was not applied') if quote_to else '',
+                            mentioned_ids=mentioned,mention_error=submission.get('mention_fallback','') or
+                            ('已发送文字，但微信未确认@提醒；不自动重发' if mentions and not expected_mentions.issubset(mentioned) else ''))
             except (httpx.HTTPError, ValueError):
                 pass
             if request.done() and request.result() is not None:
@@ -374,6 +484,8 @@ class AgentGateway:
             await asyncio.gather(self.login_task, return_exceptions=True)
         if self.inflight_sends:
             await asyncio.gather(*self.inflight_sends,return_exceptions=True)
+        if self._status_task:
+            await asyncio.gather(self._status_task, return_exceptions=True)
         if self.native_reader:
             await self.native_reader.aclose()
         await self.client.aclose()

@@ -2,9 +2,16 @@
 const $ = id => document.getElementById(id);
 let token = sessionStorage.getItem('whalegirl-access') || '';
 let cfg = null, chats = [], selected = new Set(), modes = new Map();
-let promptInfo = null, savedPrompt = '', state = null, pollTimer = null, updating = false;
+let state = null, pollTimer = null, updating = false;
 let qrShownAt = 0, lastQr = '', recordsSignature = '', noticeTimer;
 let lastStabilityFetch = 0;
+if ($('records-scope')) {
+  $('records-scope').value = localStorage.getItem('whalegirl-records-scope') || 'all';
+  $('records-scope').addEventListener('change', () => {
+    localStorage.setItem('whalegirl-records-scope', $('records-scope').value);
+    recordsSignature = ''; update();
+  });
+}
 const fragment = new URLSearchParams(location.hash.slice(1));
 if (fragment.has('access')) {
   token = fragment.get('access');
@@ -43,6 +50,7 @@ async function action(button, fn) {
   finally { button.disabled = false; }
 }
 function populateSettings() {
+  if($('quick-affection-enabled'))$('quick-affection-enabled').checked=!!cfg.affection_enabled;
   selected = new Set(cfg.allowed_chat_ids);
   const ids = new Set([...cfg.allowed_chat_ids, ...(cfg.trigger_only_chat_ids || []), ...chats.filter(c => c.isGroup).map(c => c.id)]);
   modes = new Map([...ids].map(id => [id, (cfg.trigger_only_chat_ids || []).includes(id) || (!cfg.natural_group_replies && cfg.require_mention_or_keyword) ? 'trigger' : 'natural']));
@@ -51,10 +59,12 @@ function populateSettings() {
   $('sticker-aggressiveness').value = cfg.sticker_aggressiveness || 'normal';
   $('sticker-aggressiveness').disabled = !cfg.stickers_enabled;
   $('quotes-enabled').checked = cfg.quote_replies_enabled;
+  $('group-mentions-enabled').checked = cfg.group_mentions_enabled ?? true;
   $('global-memory').checked = cfg.global_memory;
   $('vision-enabled').checked = cfg.vision_enabled;
   $('context-count').value = cfg.context_messages;
   $('api-url').value = cfg.api_url; $('model').value = cfg.model;
+  syncModelPreset();
   $('max-tokens').value = cfg.max_tokens;
   $('cooldown').value = cfg.chat_cooldown; $('send-interval').value = cfg.min_send_interval;
   $('quick-enabled').checked = cfg.enabled;
@@ -71,7 +81,36 @@ function populateSettings() {
   window.improvements?.populate();
   window.affection?.populate();
   window.stickerLibrary?.populate();
+  window.moments?.populate();
+  window.pictureLibrary?.populate();
+  window.tieba?.populate();
+  window.tokenUsage?.refresh();
 }
+const MODEL_PRESETS = {
+  flash: { url: 'https://api.deepseek.com/chat/completions', model: 'deepseek-flash' },
+  pro: { url: 'https://api.deepseek.com/chat/completions', model: 'deepseek-v4-pro' }
+};
+function syncModelPreset(force = '') {
+  const url=$('api-url').value.trim().replace(/\/$/,'');
+  const model=$('model').value.trim();
+  const match=Object.entries(MODEL_PRESETS).find(([,preset])=>preset.url===url&&preset.model===model);
+  const active=force||match?.[0]||'custom';
+  for(const button of document.querySelectorAll('[data-model-preset]'))
+    button.setAttribute('aria-pressed',String(button.dataset.modelPreset===active));
+}
+for (const button of document.querySelectorAll('[data-model-preset]')) {
+  button.addEventListener('click', () => {
+    const name=button.dataset.modelPreset,preset=MODEL_PRESETS[name];
+    if(preset){$('api-url').value=preset.url;$('model').value=preset.model;}
+    syncModelPreset(name);
+    text('test-result','有未保存的模型修改，点击“保存模型”后生效');
+    if(name==='custom')$('model').focus();
+  });
+}
+for (const id of ['api-url','model']) $(id).addEventListener('input', () => {
+  syncModelPreset();
+  text('test-result','有未保存的模型修改，点击“保存模型”后生效');
+});
 function chatName(id) { const c = chats.find(c => c.id === id); return c ? c.remark || c.name || id : id; }
 function renderChats() {
   const query = $('chat-search').value.trim().toLocaleLowerCase();
@@ -113,23 +152,20 @@ async function refreshChats(silent = false) {
     sessionStorage.setItem('whalegirl-chat-labels', JSON.stringify(chats.map(c => ({ id: c.id, name: c.name, remark: c.remark, isGroup: c.isGroup }))));
     renderChats();
     if (window.habits) window.habits.chatLabels();
+    window.stickerLibrary?.refreshChatLabels();
+    window.moments?.refreshChatLabels();
+    window.pictureLibrary?.refreshChats();
+      window.tieba?.refreshChatLabels();
     if (!silent) notice('会话列表已更新。');
   } catch (error) { renderChats(); if (!silent) throw error; }
 }
 async function saveSubset(values, apiKey = '') {
-  const current = await api('config'); delete current.api_key_configured;
+  const current = await api('config'); delete current.api_key_configured; delete current.image_api_key_configured;
   cfg = await api('config', 'POST', { settings: { ...current, ...values }, api_key: apiKey });
   await update();
   return cfg;
 }
-function promptChanged() {
-  const value = $('system-prompt').value;
-  text('prompt-count', value.length + ' / 16000');
-  const dirty = value !== savedPrompt;
-  text('prompt-state', dirty ? '尚未保存' : promptInfo.customized ? '自定义人设' : '内置人设');
-  $('prompt-state').className = dirty ? 'pill warning' : 'pill';
-}
-const recordLabels = { queued: '等待处理', generating: '生成中', merged: '已合并', sending: '发送确认中', sent: '发送成功', failed: '未发送', uncertain: '需要核对', skipped: '已跳过', blocked: '本地保护拦截', ignored: '安静旁观', baseline: '历史基线' };
+const recordLabels = { queued: '等待处理', generating: '生成中', merged: '已合并', handled: '图片任务已受理，发送结果见图片任务', sending: '等待微信服务器回执', sent: '已获微信服务器回执', partial: '部分已发送，其余失败或被拦截', failed: '未发送', uncertain: '需要核对', skipped: '已跳过', blocked: '本地保护拦截', ignored: '安静旁观', baseline: '历史基线' };
 function renderRecords(rows) {
   const signature = JSON.stringify(rows);
   if (signature === recordsSignature) return;
@@ -143,9 +179,19 @@ function renderRecords(rows) {
     top.append(who, status); article.append(top);
     for (const [content, isReply] of [[row.content, false], [row.reply, true]]) {
       if (!content) continue;
+      if(isReply){
+        const hint=document.createElement('p');hint.className='hint';
+        hint.textContent=['sent','partial'].includes(row.state)?'已确认发送的内容':row.state==='uncertain'?'发送结果待核对的内容':'生成内容（请以发送状态为准）';
+        article.append(hint);
+      }
       const message = document.createElement('div'); message.className = 'message' + (isReply ? ' reply' : ''); message.textContent = content; article.append(message);
     }
-    if (row.error) { const error = document.createElement('p'); error.className = 'error-text'; error.textContent = row.error; article.append(error); }
+    for(const item of row.actions || []){
+      const detail=document.createElement('p');detail.className=item.state==='sent'?'hint':'error-text';
+      detail.textContent=(item.kind==='sticker'?'表情包':'文字')+'：'+(recordLabels[item.state] || item.state)+(item.error?' · '+item.error:'');
+      article.append(detail);
+    }
+    if (row.error) { const error = document.createElement('p'); error.className = ['ignored','baseline'].includes(row.state) ? 'hint' : 'error-text'; error.textContent = row.error; article.append(error); }
     if (row.state === 'uncertain') {
       const actions = document.createElement('div'); actions.className = 'row';
       for (const [label, received] of [['微信已收到', true], ['确认未发送', false]]) {
@@ -181,13 +227,15 @@ function renderState(s) {
   text('memory-detail', (memory.archived_chats || 0) + ' 个会话归档 · ' + (memory.image_descriptions || 0) + ' 条图片描述');
   const timing = s.last_reply_timing || {};
   text('reply-timing', timing.total_seconds == null ? '—' : timing.total_seconds.toFixed(1) + ' 秒');
-  text('timing-detail', timing.total_seconds == null ? '等待下一次实际回复，文字和表情的耗时会分别统计。' : '发现 ' + (timing.detected_after_seconds || 0).toFixed(1) + 's · 上下文 ' + (timing.context_seconds || 0).toFixed(1) + 's · 模型 ' + (timing.model_seconds || 0).toFixed(1) + 's · 发送确认 ' + (timing.send_readback_seconds || 0).toFixed(1) + 's');
+  const memoryRecall = timing.long_term_memory;
+  const memoryNote = memoryRecall ? ' · 长期记忆 ' + memoryRecall.count + ' 条' + (memoryRecall.ids.length ? '（#' + memoryRecall.ids.join('、#') + '）' : '') : '';
+  text('timing-detail', timing.total_seconds == null ? '等待下一次实际回复，文字和表情的耗时会分别统计。' : '发现 ' + (timing.detected_after_seconds || 0).toFixed(1) + 's · 上下文 ' + (timing.context_seconds || 0).toFixed(1) + 's · 模型 ' + (timing.model_seconds || 0).toFixed(1) + 's · 发送确认 ' + (timing.send_readback_seconds || 0).toFixed(1) + 's' + memoryNote);
   if(timing.first_reply_seconds!=null)$('timing-detail').append(document.createTextNode(' · 首条确认 '+timing.first_reply_seconds.toFixed(1)+'s'));
   const stickers = s.stickers || {};
   if (timing.quoted) $('timing-detail').append(document.createTextNode(' · 原生引用回复'));
   else if (timing.quote_fallback) $('timing-detail').append(document.createTextNode(' · 引用不可用，已直接回复'));
   text('sticker-status', (stickers.known || 0) + ' 个已标注 / ' + (stickers.available || 0) + ' 个可调用');
-  text('usage', '本次服务启动：模型调用 ' + (s.model_usage.request_count || 0) + ' 次 · ' + Number(s.model_usage.total_tokens || 0).toLocaleString('zh-CN') + ' tokens');
+  text('usage', '累计模型请求 ' + (s.model_usage.model_requests || 0) + ' 次 · ' + Number(s.model_usage.total_tokens || 0).toLocaleString('zh-CN') + ' tokens');
   text('login-badge', online ? '连接正常' : login.state === 'starting' ? '正在获取' : '需要登录');
   $('login-badge').className = 'pill' + (online ? ' online' : ' warning');
   text('login-title', online ? '微信已连接，随时待命' : login.state === 'attention' ? '请查看微信提示' : login.state === 'phone_confirmation' ? '请在手机确认登录' : '扫码恢复微信连接');
@@ -253,7 +301,7 @@ async function update() {
   if (updating || !cfg) return;
   updating = true;
   try {
-    const [snapshot, records] = await Promise.all([api('state'), api('recent')]);
+    const [snapshot, records] = await Promise.all([api('state'), api('recent?include_ignored=' + ($('records-scope')?.value !== 'actions'))]);
     renderState(snapshot); renderRecords(records);
     if (Date.now() - lastStabilityFetch > 15000) {
       await refreshStability().catch(error => { text('stability-detail', '日志暂时读取失败：' + error.message); });
@@ -266,11 +314,12 @@ async function update() {
   } finally { updating = false; }
 }
 async function connect() {
-  cfg = await api('config'); promptInfo = await api('prompt');
+  cfg = await api('config');
   try { chats = JSON.parse(sessionStorage.getItem('whalegirl-chat-labels') || '[]'); } catch { chats = []; }
-  populateSettings(); $('system-prompt').value = promptInfo.effective; savedPrompt = promptInfo.effective; promptChanged();
+  populateSettings();
   sessionStorage.setItem('whalegirl-access', token);
   $('auth').hidden = true; $('dashboard').hidden = false;
+  if (window.personas) await window.personas.refresh();
   await update();
   if (!pollTimer) pollTimer = setInterval(() => update().catch(() => {}), 3000);
   if (window.habits) window.habits.refresh().catch(error => notice(error.message,true));
@@ -297,15 +346,6 @@ $('export-stability').onclick = () => action($('export-stability'), async () => 
 $('refresh-chats').onclick = () => action($('refresh-chats'), () => refreshChats());
 $('chat-search').oninput = renderChats;
 $('stickers-enabled').onchange = () => { $('sticker-aggressiveness').disabled=!$('stickers-enabled').checked;text('chat-save-note','有未保存的修改'); };
-$('system-prompt').oninput = promptChanged;
-$('restore-prompt').onclick = () => { $('system-prompt').value = promptInfo.default; promptChanged(); text('prompt-save-note', '已填入内置人设，点击保存后生效。'); };
-$('save-prompt').onclick = () => action($('save-prompt'), async () => {
-  const value = $('system-prompt').value.trim();
-  if (!value) throw new Error('提示词不能为空；可以点击“填入内置人设”恢复默认内容。');
-  promptInfo = await api('prompt', 'POST', { system_prompt: value === promptInfo.default.trim() ? '' : value });
-  $('system-prompt').value = promptInfo.effective; savedPrompt = promptInfo.effective; cfg.system_prompt_override = promptInfo.customized ? promptInfo.effective : '';
-  promptChanged(); text('prompt-save-note', '已保存到服务器 · ' + new Date().toLocaleTimeString('zh-CN') + ' · 下一次回复生效'); notice('提示词已保存，无需重启微信。');
-});
 $('save-chats').onclick = () => action($('save-chats'), async () => {
   if (!selected.size && $('quick-enabled').checked) throw new Error('启用自动回复时，请至少选择一个会话。');
   const keywords = $('keywords').value.split('\n').map(x => x.trim()).filter(Boolean);
@@ -313,6 +353,7 @@ $('save-chats').onclick = () => action($('save-chats'), async () => {
   await saveSubset({ allowed_chat_ids: [...selected], trigger_only_chat_ids: restricted,
     natural_group_replies: true, require_mention_or_keyword: true, keywords,
     stickers_enabled: $('stickers-enabled').checked, quote_replies_enabled: $('quotes-enabled').checked,
+    group_mentions_enabled: $('group-mentions-enabled').checked,
     sticker_aggressiveness: $('sticker-aggressiveness').value,
     global_memory: $('global-memory').checked,
     vision_enabled: $('vision-enabled').checked, context_messages: Number($('context-count').value) });
@@ -320,6 +361,7 @@ $('save-chats').onclick = () => action($('save-chats'), async () => {
 });
 $('save-model').onclick = () => action($('save-model'), async () => {
   await saveSubset({ api_url: $('api-url').value.trim(), model: $('model').value.trim(), max_tokens: Number($('max-tokens').value) }, $('api-key').value.trim());
+  syncModelPreset();text('test-result','模型设置已保存');
   $('api-key').value = ''; text('key-status', cfg.api_key_configured ? '服务器已保存 API Key；留空不会覆盖。' : '尚未配置 API Key。'); notice('模型设置已保存。');
 });
 $('save-timing').onclick = () => action($('save-timing'), async () => { await saveSubset({ chat_cooldown: Number($('cooldown').value), min_send_interval: Number($('send-interval').value) }); notice('回复节奏已保存。'); });
@@ -336,7 +378,65 @@ $('save-limits').onclick = () => action($('save-limits'), async () => {
 $('safety-check').onclick = () => action($('safety-check'), async () => { const result=await api('safety/check','POST');await update();notice(result.check_error || (result.hold_reason?'检测到需要人工处理的提示，已停止发送。':'客户端提示检查完成；结果不代表平台风控安全。'),!!result.check_error || !!result.hold_reason); });
 $('safety-resume').onclick = () => action($('safety-resume'), async () => { await api('safety/resume','POST');await update();notice('已恢复发送；历史跳过消息不会补发，现有发送限额继续生效。'); });
 $('quick-enabled').onchange = () => action($('quick-enabled'), async () => { try { await saveSubset({ enabled: $('quick-enabled').checked }); notice(cfg.enabled ? '自动回复已开启。' : '自动回复已关闭。'); } catch (error) { $('quick-enabled').checked = cfg.enabled; throw error; } });
+$('quick-affection-enabled')?.addEventListener('change',event=>window.affection?.toggle(event.currentTarget));
 $('test-model').onclick = () => action($('test-model'), async () => { text('test-result', '正在测试已保存的模型…'); const result = await api('model/test', 'POST'); text('test-result', result.message); if (!result.ok) throw new Error(result.message); });
 $('login').onclick = () => action($('login'), async () => { text('login-message', '正在请求微信二维码，请稍候…'); await api('gateway/login', 'POST'); await update(); notice('登录请求已提交，请按页面提示在手机确认。'); });
 for (const link of document.querySelectorAll('nav a')) link.onclick = () => { for (const item of document.querySelectorAll('nav a')) item.classList.toggle('active', item === link); };
 if (token) connect().catch(error => { text('auth-error', error.message); $('auth').hidden = false; $('dashboard').hidden = true; });
+
+// Run after the feature scripts have appended their navigation links. Move the
+// existing anchors so feature-specific click handlers and deep links survive.
+document.addEventListener('DOMContentLoaded', () => {
+  const sidebar=document.querySelector('.sidebar'),nav=sidebar.querySelector('nav');
+  const groups=[
+    ['connection','连接与会话',['#login-panel','#chats','#send-limits-panel','#safety-panel']],
+    ['persona','角色与记忆',['#persona','#habits-panel','#category-limits-panel','#memory-panel','#affection-panel']],
+    ['interaction','互动与内容',['#sticker-library-panel','#images-panel','#moments-panel','#tieba-panel']],
+    ['model','模型与用量',['#model-panel','#web-search-panel','#token-usage-panel']],
+    ['activity','日志与记录',['#stability-panel','#records-panel','#inbox-panel']]
+  ];
+  const links=[...nav.querySelectorAll('a[href^="#"]')],byHref=new Map(links.map(a=>[a.getAttribute('href'),a]));
+  for(const a of links){const label=a.querySelector('span');if(label)a.textContent=label.textContent.trim();a.classList.add('nav-page');}
+  nav.id='console-nav';nav.classList.add('console-nav');nav.setAttribute('aria-label','功能导航');
+  const overview=byHref.get('#overview');if(overview){overview.classList.add('nav-overview');nav.append(overview);}
+  const sections=[];let updating=false;
+  function group(key,title,hrefs){
+    const items=hrefs.map(h=>byHref.get(h)).filter(Boolean);if(!items.length)return;
+    const details=document.createElement('details');details.className='nav-group';details.dataset.navGroup=key;
+    const summary=document.createElement('summary'),name=document.createElement('span'),count=document.createElement('span');
+    name.textContent=title;count.className='nav-count';count.textContent=items.length;count.setAttribute('aria-hidden','true');
+    summary.append(name,count);const children=document.createElement('div');children.className='nav-submenu';
+    for(const a of items){children.append(a);byHref.delete(a.getAttribute('href'));}
+    details.append(summary,children);nav.append(details);sections.push(details);
+    details.addEventListener('toggle',()=>{
+      if(updating)return;
+      if(details.open)for(const other of sections)if(other!==details)other.open=false;
+      try{localStorage.setItem('whalegirl-nav-group',sections.find(d=>d.open)?.dataset.navGroup||'');}catch{}
+    });
+  }
+  if(overview)byHref.delete('#overview');
+  for(const [key,title,hrefs] of groups)group(key,title,hrefs);
+  if(byHref.size)group('more','更多功能',[...byHref.keys()]);
+  const toggle=document.createElement('button');toggle.type='button';toggle.className='nav-toggle';
+  toggle.setAttribute('aria-controls',nav.id);toggle.setAttribute('aria-expanded','false');
+  const toggleTitle=document.createElement('span'),current=document.createElement('span');toggleTitle.textContent='功能导航';current.className='nav-current';toggle.append(toggleTitle,current);sidebar.insertBefore(toggle,nav);
+  const mobile=window.matchMedia('(max-width:680px)');
+  function closeMenu(){sidebar.classList.remove('nav-expanded');toggle.setAttribute('aria-expanded','false');toggle.setAttribute('aria-label','展开功能导航');}
+  toggle.onclick=()=>{const open=sidebar.classList.toggle('nav-expanded');toggle.setAttribute('aria-expanded',String(open));toggle.setAttribute('aria-label',open?'收起功能导航':'展开功能导航');};
+  function active(href){
+    const target=links.find(a=>a.getAttribute('href')===href)||overview;
+    updating=true;
+    for(const a of links){a.classList.toggle('active',a===target);if(a===target)a.setAttribute('aria-current','location');else a.removeAttribute('aria-current');}
+    const selected=target?.closest('.nav-group');
+    for(const section of sections){section.classList.toggle('contains-active',section===selected);if(selected)section.open=section===selected;}
+    if(selected)try{localStorage.setItem('whalegirl-nav-group',selected.dataset.navGroup);}catch{}
+    current.textContent=target?.textContent.trim()||'运行概览';updating=false;
+  }
+  let remembered=null;try{remembered=localStorage.getItem('whalegirl-nav-group');}catch{}
+  updating=true;for(const section of sections)section.open=section.dataset.navGroup===(remembered??'connection');updating=false;
+  nav.addEventListener('click',event=>{const link=event.target.closest('a[href^="#"]');if(!link)return;active(link.getAttribute('href'));if(mobile.matches)closeMenu();});
+  window.addEventListener('hashchange',()=>active(location.hash||'#overview'));
+  document.addEventListener('click',event=>{if(mobile.matches&&!sidebar.contains(event.target))closeMenu();});
+  document.addEventListener('keydown',event=>{if(event.key==='Escape'&&sidebar.classList.contains('nav-expanded')){closeMenu();toggle.focus();}});
+  mobile.addEventListener('change',closeMenu);sidebar.classList.add('navigation-ready');active(location.hash||'#overview');
+});

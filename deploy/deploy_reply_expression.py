@@ -1,5 +1,6 @@
 """Deploy warmth and paired-sticker controls, restarting only the Python core."""
 import hashlib
+import argparse
 import json
 import os
 from pathlib import Path
@@ -45,12 +46,13 @@ def idle(seconds):
         time.sleep(.25)
 
 
-def deploy():
+def deploy(profile='reply-expression'):
+    changes=CHANGES if profile=='reply-expression' else {'sticker_pair_probability':90,'sticker_candidate_limit':12}
     stamp=time.strftime('%Y%m%d-%H%M%S')
     current=BASE/'current';previous=current.resolve()
-    stage=BASE/'releases'/('reply-expression-'+stamp)
-    backup=ASSETS/('reply-expression-before-'+stamp);backup.mkdir(mode=0o700)
-    with tarfile.open(ASSETS/'reply-expression-20261022.tar') as archive:
+    stage=BASE/'releases'/(profile+'-'+stamp)
+    backup=ASSETS/(profile+'-before-'+stamp);backup.mkdir(mode=0o700)
+    with tarfile.open(ASSETS/(profile+'-20261022.tar')) as archive:
         members=archive.getmembers()
         if {m.name for m in members}!=FILES or not all(m.isfile() for m in members):
             raise RuntimeError('Unexpected archive contents')
@@ -78,7 +80,7 @@ def deploy():
     try:
         api('config',{'settings':{'enabled':False}});idle(40)
         command('systemctl','stop','whalegirl-linux');stopped=True
-        pending=BASE/('current.reply-expression-'+stamp);pending.symlink_to(stage,target_is_directory=True);os.replace(pending,current)
+        pending=BASE/('current.'+profile+'-'+stamp);pending.symlink_to(stage,target_is_directory=True);os.replace(pending,current)
         command('systemctl','start','whalegirl-linux')
         for _ in range(100):
             try:
@@ -87,36 +89,38 @@ def deploy():
             except (OSError,ValueError):pass
             time.sleep(.2)
         else:raise RuntimeError('Updated core did not become ready')
-        api('config',{'settings':CHANGES})
+        api('config',{'settings':changes})
         live=config()
-        if any(live.get(k)!=v for k,v in original.items() if k not in {*CHANGES,'enabled'}):
+        if any(live.get(k)!=v for k,v in original.items() if k not in {*changes,'enabled'}):
             raise RuntimeError('An unrelated configuration value changed')
-        if any(live.get(k)!=v for k,v in CHANGES.items()):raise RuntimeError('Expression controls did not persist')
+        if any(live.get(k)!=v for k,v in changes.items()):raise RuntimeError('Expression controls did not persist')
         native_after=command('docker','exec','whalegirl-wechat-candidate-4118','pgrep','-x','wechat')
         if native_before!=native_after:raise RuntimeError('Native WeChat process changed')
         assets={}
-        for route,needle in (('/','improvements.js?v=20261022-warmth'),('/improvements.js?v=20261022-warmth','文字后配表情')):
+        for route,needle in (('/','improvements.js?v=20261022-sticker-pairing'),('/improvements.js?v=20261022-sticker-pairing','自动搭配概率')):
             with opener.open('http://127.0.0.1:8092'+route,timeout=10) as response:
                 text=response.read().decode();assets[route]=response.status
                 if needle not in text:raise RuntimeError('Expected console asset missing')
         api('config',{'settings':{'enabled':original['enabled']}});state=api('state')
-        report={'release':str(stage),'backup':str(backup),'checks':'3 expression + 8 existing checks passed',
-            'settings':CHANGES,'sticker_aggressiveness':live['sticker_aggressiveness'],
+        report={'release':str(stage),'backup':str(backup),'checks':'4 expression + 8 existing checks passed',
+            'settings':changes,'sticker_aggressiveness':live['sticker_aggressiveness'],'reply_warmth':live['reply_warmth'],
             'reply_max_parts':live['reply_max_parts'],'context_messages':live['context_messages'],
             'authorized_chats':len(live['allowed_chat_ids']),'trigger_only_chats':len(live['trigger_only_chat_ids']),
             'gateway_status':state['gateway']['status'],'enabled':state['enabled'],'paused':state.get('paused_reason'),
             'last_error':state.get('last_error'),'native_pid_unchanged':True,'native_pid':native_after,'console_assets':assets,
             'hashes':{n:hashlib.sha256(c).hexdigest() for n,c in contents.items()}}
-        (ASSETS/'reply-expression-deployment.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
+        (ASSETS/(profile+'-deployment.json')).write_text(json.dumps(report,ensure_ascii=False,indent=2))
         print(json.dumps({k:v for k,v in report.items() if k!='hashes'},ensure_ascii=False),flush=True)
     except BaseException:
         if stopped:
             command('systemctl','stop','whalegirl-linux')
-            pending=BASE/('current.reply-expression-rollback-'+stamp);pending.symlink_to(previous,target_is_directory=True);os.replace(pending,current)
-            temporary=DATA/'settings.expression-rollback';temporary.write_text(json.dumps(original,ensure_ascii=False,indent=2));temporary.chmod(0o600);os.replace(temporary,DATA/'settings.json')
+            pending=BASE/('current.'+profile+'-rollback-'+stamp);pending.symlink_to(previous,target_is_directory=True);os.replace(pending,current)
+            temporary=DATA/('settings.'+profile+'-rollback');temporary.write_text(json.dumps(original,ensure_ascii=False,indent=2));temporary.chmod(0o600);os.replace(temporary,DATA/'settings.json')
             command('systemctl','start','whalegirl-linux')
         else:api('config',{'settings':original})
         raise
 
 
-if __name__=='__main__':deploy()
+if __name__=='__main__':
+    parser=argparse.ArgumentParser();parser.add_argument('--profile',choices=['reply-expression','sticker-pairing'],default='reply-expression')
+    deploy(parser.parse_args().profile)
