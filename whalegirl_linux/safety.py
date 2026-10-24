@@ -164,8 +164,8 @@ class SafetyGuard:
             return True
         count = self.store.db.execute("SELECT count(*) FROM safety_events WHERE account=? AND code='login_request' AND created>?",
                                       (account,time.time()-600)).fetchone()[0]
-        if count >= 3:
-            self.record(account,'login_rate_limit','本地保护：10分钟内已请求3次登录，暂停继续刷新二维码')
+        if count >= 7:
+            self.record(account,'login_rate_limit','本地保护：10分钟内已请求7次登录，暂停继续刷新二维码')
             return False
         self.record(account,'login_request','用户请求重新登录微信',level='info')
         return True

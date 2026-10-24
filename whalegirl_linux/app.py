@@ -741,7 +741,7 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
         if status.get("status") == "logged_in" and status.get("loggedInUser"):
             return transport.login
         if not runtime.safety.login_request(config.settings.account_id,config.settings):
-            raise HTTPException(429,'本地登录保护：10分钟内最多请求3次登录，请稍后再试')
+            raise HTTPException(429,'本地登录保护：10分钟内最多请求7次登录，请稍后再试')
         return await transport.start_login()
 
     @app.get('/api/safety')
