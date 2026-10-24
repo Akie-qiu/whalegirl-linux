@@ -225,7 +225,12 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "version": "0.1.0", "wechat_version": config.settings.expected_wechat_version}
+        failed_tasks = sum(task.done() for task in runtime.tasks)
+        return {"status": "degraded" if failed_tasks else "ok",
+                "background_tasks": len(runtime.tasks),
+                "failed_background_tasks": failed_tasks,
+                "version": "0.1.0",
+                "wechat_version": config.settings.expected_wechat_version}
 
     @app.get("/")
     async def index():

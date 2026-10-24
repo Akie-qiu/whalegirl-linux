@@ -238,7 +238,10 @@ class ApiTests(unittest.TestCase):
         self.client.__exit__(None, None, None)
 
     def test_auth_and_origin_boundaries(self):
-        self.assertEqual(self.client.get("/health").status_code, 200)
+        health = self.client.get("/health")
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(health.json()["status"], "ok")
+        self.assertEqual(health.json()["failed_background_tasks"], 0)
         self.assertEqual(self.client.get("/api/config").status_code, 401)
         self.assertEqual(self.client.get("/api/config", headers=self.headers).status_code, 200)
         self.assertEqual(self.client.post("/api/model/test", headers={**self.headers, "Origin": "https://evil.example"}).status_code, 403)

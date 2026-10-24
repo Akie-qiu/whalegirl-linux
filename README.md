@@ -41,6 +41,10 @@ git clone --recurse-submodules https://github.com/Akie-qiu/whalegirl-linux.git
 
 `whalegirl-stability.timer` 每分钟记录登录状态、微信主进程身份、容器重启、内存与任务上限事件，不记录聊天内容。记录位于 `/var/lib/whalegirl-linux/stability/observations.jsonl`，最新采样为 `latest.json`，连续在线观察起点为 `observation-start.json`。日志和服务均在服务器常驻，本地电脑关闭不影响采样。部署及备份位于 `/opt/whalegirl-linux-assets/candidate-4.1.1.8/stability-20261021/`。
 
+回复核心的资源阈值为 `MemoryHigh=384M`、`MemoryMax=512M`、`MemorySwapMax=512M`，并将 Uvicorn 并发限制为 32、连接 backlog 限制为 128。`whalegirl-core-watchdog.timer` 每分钟检查本机 `/health`；连续三次失败后最多每 15 分钟重启一次 Python 回复核心，微信容器不由此重启。健康状态同时检查后台轮询/处理任务是否退出；watchdog 状态文件每分钟记录核心的 cgroup 用量、高水位、交换区、任务数和 OOM 事件。
+
+该自愈机制降低回复核心卡死后持续无响应的风险，不能保证微信账号、网络或第三方服务永不掉线。
+
 管理网页新增“运行日志”：显示截至最近采样的连续在线时长、掉线事件、内存、僵尸与读取进程数量，列出登录恢复、掉线、进程变化、OOM、任务上限和采样中断。原生微信状态与机器人管理服务可用性分别采集；采样中断超过三分钟或微信进程变化会重算连续在线时长，不把未知状态直接认定为掉线。首次发现掉线时间的精度约一分钟。
 
 人类可读事件日志按北京时间分日保存为 `/var/lib/whalegirl-linux/stability/runtime-YYYY-MM-DD.log`，另有持久 `events.jsonl` 和 `tracking.json`，不自动删除历史。只读、脱敏投影位于核心数据的 `stability/` 子目录，root 写入，管理服务所属组读取。`GET /api/stability` 与 `GET /api/stability/export` 均需管理认证；网页“导出运行日志”提供最近24小时已保存采样及最近1000条事件。日志不含聊天内容、密码、账号标识或 API Key。日志采集和状态计算在 Linux 服务器上独立完成，不依赖 Codex、本机电脑、浏览器或 SSH 隧道持续运行。

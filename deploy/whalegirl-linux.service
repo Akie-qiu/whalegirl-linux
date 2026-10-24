@@ -22,9 +22,9 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/whalegirl-linux/core
-MemoryHigh=128M
-MemoryMax=192M
-MemorySwapMax=256M
+MemoryHigh=384M
+MemoryMax=512M
+MemorySwapMax=512M
 CPUQuota=35%
 
 [Install]

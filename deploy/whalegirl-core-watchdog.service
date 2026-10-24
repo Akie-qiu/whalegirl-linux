@@ -1,0 +1,15 @@
+[Unit]
+Description=Recover the WhaleGirl Python core after consecutive health failures
+After=network-online.target whalegirl-linux.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/whalegirl-linux/venv/bin/python /opt/whalegirl-linux/core_watchdog.py
+Nice=10
+MemoryMax=48M
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/whalegirl-linux/stability

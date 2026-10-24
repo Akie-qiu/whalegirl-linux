@@ -1,0 +1,11 @@
+[Unit]
+Description=Check the WhaleGirl Python core once per minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=whalegirl-core-watchdog.service
+
+[Install]
+WantedBy=timers.target
