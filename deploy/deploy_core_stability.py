@@ -107,6 +107,11 @@ def validate_container():
 def replace_exact(path, old, new):
     content = path.read_text(encoding='utf-8')
     if new in content:
+        # A previous interrupted deployment may already have written the patch
+        # while leaving it unreadable to the unprivileged service account.
+        if not path.stat().st_mode & 0o004:
+            atomic_text(path, content, mode=0o644)
+            return 'readability_fixed'
         return 'already_applied'
     if content.count(old) != 1:
         raise SystemExit('Live source did not match the reviewed patch; no replacement made: ' + path.name)
