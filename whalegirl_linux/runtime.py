@@ -77,6 +77,7 @@ class Runtime:
         self.moments = MomentsService(self)
         self.images = ImageService(self)
         self.tieba = TiebaService(self)
+        self.ensure_authority_files()
         if self.store.stats().get("uncertain"):
             self.paused_reason = "有发送状态不确定的记录，请在记录中人工核对"
 
@@ -781,6 +782,19 @@ class Runtime:
             self.safety.check_error = '客户端提示检查暂不可用：'+type(exc).__name__
         return self.safety.snapshot(settings.account_id,settings)
 
+    def ensure_authority_files(self):
+        """Self-heal the native authority files consumed by in-container UI tools."""
+        jobs_dir = getattr(self.gateway, 'ui_jobs_directory', None)
+        if not jobs_dir or not jobs_dir.is_dir():
+            return
+        try:
+            if not (jobs_dir / 'authorized-chats.json').is_file():
+                self.config.sync_authority()
+            if not (jobs_dir / 'image-assets.json').is_file():
+                self.images.sync_authority()
+        except Exception:
+            pass
+
     def trim_memory(self):
         import ctypes
         import gc
@@ -792,13 +806,18 @@ class Runtime:
             self.chat_labels.clear()
         jobs_dir = getattr(self.gateway, 'ui_jobs_directory', None)
         if jobs_dir and jobs_dir.is_dir():
+            # Only transient UI job files (<uuid4 hex>.json). Never touch persistent
+            # authority files such as authorized-chats.json / image-assets.json.
             cutoff = time.time() - 600
             for item in jobs_dir.glob('*.json'):
+                if not re.fullmatch(r'[0-9a-f]{32}\.json', item.name):
+                    continue
                 try:
                     if item.stat().st_mtime < cutoff:
                         item.unlink(missing_ok=True)
                 except OSError:
                     pass
+            self.ensure_authority_files()
         try:
             with self.store.lock:
                 self.store.db.execute('PRAGMA shrink_memory')

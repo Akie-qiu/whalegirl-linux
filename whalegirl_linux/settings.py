@@ -285,6 +285,13 @@ class Config:
         if api_key.strip():
             private_write(self.directory / "api-key.enc", self.fernet.encrypt(api_key.strip().encode()).decode())
         private_write(self.path, settings.model_dump_json(indent=2))
+        self.sync_authority(settings)
+        self.settings = settings
+        self.generation += 1
+
+    def sync_authority(self, settings: Settings | None = None):
+        """Write the native-side authority file read by in-container UI tools."""
+        settings = settings or self.settings
         jobs = os.environ.get("WHALEGIRL_UI_JOBS_DIR")
         if jobs and Path(jobs).is_dir():
             private_write(Path(jobs) / "authorized-chats.json", json.dumps({
@@ -299,8 +306,6 @@ class Config:
                 "moments_comment_friends_enabled": settings.moments_comment_friends_enabled,
                 "moments_friend_ids": settings.moments_friend_ids,
                 "moments_asset_ids": settings.moments_asset_ids}))
-        self.settings = settings
-        self.generation += 1
 
     def public(self):
         return {**self.settings.model_dump(), "api_key_configured": bool(self.api_key()),

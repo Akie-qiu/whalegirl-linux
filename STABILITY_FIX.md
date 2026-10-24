@@ -57,3 +57,8 @@
 - 系统 1 分钟 `load average` 由 `80.65` 回落至 **`0.89`**；
 - `whalegirl-linux.service` 常驻内存 `MemoryCurrent` 降至 **`72.7 MiB`**（`MemorySwapCurrent=0`，`memory.pressure=0.00`）；
 - `core-watchdog.json` 中 `appex_stub_mounted=true`，`tests/test_core_watchdog.py` 6 项测试全部通过。
+
+### 18:56 更正：第三层清理误删权限文件导致图库发送失败
+- `7875449` 中 `trim_memory()` 会删除 UI 任务目录下所有超过 10 分钟的 `*.json`，误删了常驻授权文件 `authorized-chats.json`。容器内 `native_image_send.py` 校验授权时报 `No such file or directory: '/data/whalegirl-jobs/authorized-chats.json'`，18:56 起图库发送与生图后发送失败；原生消息读取、群成员和朋友圈同样依赖该文件。
+- 修复：清理范围收窄为仅匹配 `^[0-9a-f]{32}\.json$` 的临时任务文件；授权写入抽取为 `Config.sync_authority()`，`Runtime.ensure_authority_files()` 在启动与每轮清理后自愈重建 `authorized-chats.json` / `image-assets.json`。
+- 新增回归测试 `test_trim_memory_keeps_authority_files_and_self_heals`；远端 52 项测试通过，重启后容器内授权文件可读（`chat_enabled=True`、`images_chat_enabled=True`、8 个授权会话）。

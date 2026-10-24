@@ -280,4 +280,29 @@ class ImageTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('本次相关图片尚未取得有效图像', msgs[0]['content'], text)
 
 
+    def test_trim_memory_keeps_authority_files_and_self_heals(self):
+        import os
+        from whalegirl_linux.runtime import Runtime
+        jobs = self.runtime.gateway.ui_jobs_directory
+        with patch.dict(os.environ, {'WHALEGIRL_UI_JOBS_DIR': str(jobs)}):
+            self.config.sync_authority()
+            self.service.sync_authority()
+            nonce = jobs / ('a' * 32 + '.json')
+            nonce.write_text('{}')
+            old = time.time() - 3600
+            for p in (jobs / 'authorized-chats.json', jobs / 'image-assets.json', nonce):
+                os.utime(p, (old, old))
+            fake = SimpleNamespace(gateway=SimpleNamespace(ui_jobs_directory=jobs, _members_cache={}),
+                                   chat_labels={}, store=self.store, config=self.config, images=self.service)
+            fake.ensure_authority_files = lambda: Runtime.ensure_authority_files(fake)
+            Runtime.trim_memory(fake)
+            self.assertFalse(nonce.exists())
+            self.assertTrue((jobs / 'authorized-chats.json').is_file())
+            self.assertTrue((jobs / 'image-assets.json').is_file())
+            (jobs / 'authorized-chats.json').unlink()
+            Runtime.trim_memory(fake)
+            authority = json.loads((jobs / 'authorized-chats.json').read_text())
+            self.assertEqual(authority['allowed_chat_ids'], ['allowed'])
+
+
 if __name__=='__main__':unittest.main()
