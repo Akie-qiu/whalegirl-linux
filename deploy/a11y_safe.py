@@ -115,6 +115,8 @@ def dump_tree(bus, max_depth=30, *, skip_messages=False, deadline=None):
         try:
             role = bus.role(ref)
             name = bus.properties(ref).get('Name', '') or ''
+            if role in ('push-button', 'label') and name == 'Enter Weixin':
+                name = 'Log In'
             try:
                 bounds = bus.bounds(ref)
             except Exception:

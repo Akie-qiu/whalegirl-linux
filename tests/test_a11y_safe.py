@@ -51,6 +51,30 @@ class StableReferencesTests(unittest.TestCase):
         self.assertEqual(bus.children(('test', '/list')), [('test', '/one'), ('test', '/two')])
         self.assertEqual(calls, ['GetChildren'])
 
+    def test_enter_weixin_button_and_label_normalize_to_log_in(self):
+        root = safe.DESKTOP
+        btn, lbl = ('test', '/btn'), ('test', '/lbl')
+
+        class Bus:
+            def role(self, ref):
+                return 'desktop-frame' if ref == root else ('push-button' if ref == btn else 'label')
+
+            def properties(self, ref):
+                return {'Name': 'main' if ref == root else 'Enter Weixin'}
+
+            def bounds(self, ref):
+                return {'x': 549, 'y': 469, 'width': 180, 'height': 36}
+
+            def states(self, ref, role):
+                return []
+
+            def children(self, ref):
+                return [btn] if ref == root else ([lbl] if ref == btn else [])
+
+        tree, _ = safe.dump_tree(Bus())
+        self.assertEqual(tree['children'][0]['name'], 'Log In')
+        self.assertEqual(tree['children'][0]['children'][0]['name'], 'Log In')
+
 
 if __name__ == '__main__':
     unittest.main()

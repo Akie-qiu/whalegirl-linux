@@ -17,6 +17,31 @@ def walk(node):
     for child in node.get("children") or []:
         yield from walk(child)
 
+
+def signout_popup_ok(tree):
+    """Return the OK button of a benign sign-out notice, never a security warning."""
+    candidates = []
+    for node in walk(tree or {}):
+        if node.get("role") not in ("frame", "dialog", "alert", "filler", "layered-pane", "panel", "window"):
+            continue
+        children = list(walk(node))
+        ok_buttons = [c for c in children if c.get("role") == "push-button"
+                      and re.fullmatch(r"OK|Confirm|确定|确认", c.get("name", ""), re.I)]
+        if len(ok_buttons) != 1:
+            continue
+        labels = [c.get("name", "").strip() for c in children
+                  if c.get("role") in ("label", "static") and c.get("name", "").strip()
+                  and not re.fullmatch(r"Tip|OK|Confirm|确定|确认", c.get("name", "").strip(), re.I)]
+        if labels:
+            candidates.append((len(children), "\n".join(dict.fromkeys(labels)).strip(), ok_buttons[0]))
+    if not candidates:
+        return None
+    _, text, button = min(candidates, key=lambda item: item[0])
+    if re.fullmatch(r"You have signed out of Weixin\.?|已退出微信\.?|你已退出微信\.?", text, re.I):
+        return button
+    return None
+
+
 def refresh():
     container = os.environ.get("WHALEGIRL_QR_CONTAINER", "whalegirl-wechat-old-01")
     if container not in {"whalegirl-wechat-old-01", "whalegirl-wechat-candidate-4118"}:
@@ -32,12 +57,28 @@ def refresh():
 
     tree = api("debug/a11y").get("tree") or {}
     nodes = list(walk(tree))
+    ok_buttons = [n for n in nodes if n.get("role") == "push-button" and re.fullmatch(r"OK|Confirm|确定|确认", n.get("name", ""), re.I)]
+    signout_ok = signout_popup_ok(tree) if len(ok_buttons) == 1 else None
+    if signout_ok is not None:
+        bounds = signout_ok.get("bounds") or {}
+        x, y, w, h = [bounds.get(k, -1) for k in ("x", "y", "width", "height")]
+        if not (350 <= x <= 800 and 250 <= y <= 650 and 40 <= w <= 220 and 20 <= h <= 70):
+            raise RuntimeError("退出提示框按钮位置异常，未点击")
+        subprocess.run(["docker", "exec", "--env", "DISPLAY=:99", "--user", "wechat", container,
+                        "/opt/tools/click", str(round(x + w / 2)), str(round(y + h / 2))],
+                       capture_output=True, check=True, timeout=8)
+        for _ in range(6):
+            time.sleep(0.3)
+            tree = api("debug/a11y").get("tree") or {}
+            nodes = list(walk(tree))
+            if not any(n.get("role") == "push-button" and re.fullmatch(r"OK|Confirm|确定|确认", n.get("name", ""), re.I) for n in nodes):
+                break
     names = {n.get("name", "") for n in nodes}
     if any(n.get("role") == "push-button" and re.fullmatch(r"OK|Confirm|确定|确认", n.get("name", ""), re.I) for n in nodes):
         raise RuntimeError("客户端有提示框，已保留，不能自动确认或刷新")
-    if any(n.get('role') == 'label' and re.search(r'confirm on phone|comfirm on phone|手机确认',n.get('name',''),re.I) for n in nodes):
+    if any(n.get('role') == 'label' and re.search(r'confirm.*phone|comfirm.*phone|手机确认',n.get('name',''),re.I) for n in nodes):
         return {'ok':True,'refreshed':False,'mode':'phone_confirmation','message':'请在手机微信确认这次 Linux 登录'}
-    login_buttons=[n for n in nodes if n.get('role')=='push-button' and n.get('name')=='Log In']
+    login_buttons=[n for n in nodes if n.get('role')=='push-button' and n.get('name') in ('Log In', 'Enter Weixin')]
     current_user=any(n.get('role')=='label' and n.get('name','').startswith('Current User') for n in nodes)
     if len(login_buttons)==1 and current_user:
         bounds=login_buttons[0].get('bounds') or {}
@@ -47,11 +88,15 @@ def refresh():
         subprocess.run(['docker','exec','--env','DISPLAY=:99','--user','wechat',container,
                         '/opt/tools/click',str(round(x+w/2)),str(round(y+h/2))],
                        capture_output=True,check=True,timeout=8)
-        for _ in range(8):
-            time.sleep(.3)
+        for _ in range(12):
+            time.sleep(.35)
             after=list(walk(api('debug/a11y').get('tree') or {}))
-            if any(n.get('role')=='label' and re.search(r'confirm on phone|comfirm on phone|手机确认',n.get('name',''),re.I) for n in after):
+            if any(n.get('role')=='label' and re.search(r'confirm.*phone|comfirm.*phone|手机确认',n.get('name',''),re.I) for n in after):
                 return {'ok':True,'refreshed':True,'mode':'phone_confirmation','message':'请在手机微信确认这次 Linux 登录'}
+            if {n.get('name','') for n in after}.intersection({'Scan to log in', '扫码登录', '扫描二维码登录'}):
+                current = api('status/login', True).get('qrDataUrl', '')
+                if current:
+                    return {'ok':True,'refreshed':True,'qrDataUrl':current,'message':'已切换到二维码页面，请扫码并在手机确认'}
         raise RuntimeError('已点击微信登录，但未读到手机确认提示；请检查客户端')
     if not names.intersection({"Scan to log in", "扫码登录", "扫描二维码登录"}):
         if api("status/auth").get("status") == "logged_in":

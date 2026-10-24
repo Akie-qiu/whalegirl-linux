@@ -420,7 +420,7 @@ class AgentGateway:
                     for child in item.get('children') or []:
                         yield from nodes(child)
                 return any(n.get('role')=='label' and
-                           re.search(r'confirm on phone|comfirm on phone|手机确认',n.get('name',''),re.I)
+                           re.search(r'confirm.*phone|comfirm.*phone|手机确认',n.get('name',''),re.I)
                            for n in nodes(tree or {}))
             if phone_confirmation(native.json().get('tree')):
                 self.login.update(state='phone_confirmation',qrDataUrl='',message='请在手机微信确认这次 Linux 登录')
