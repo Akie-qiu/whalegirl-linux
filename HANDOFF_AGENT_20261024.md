@@ -1,17 +1,17 @@
 # 鲸鱼娘 Linux 微信机器人交接文档
 
-**交接时间：** 2026-10-24 17:48（北京时间，含下午完整迭代更新）  
+**交接时间：** 2026-10-24 18:48（北京时间，含下午完整迭代与四层内存清理机制）  
 **目的：** 让接手的 agent 能从当前代码、Git 和服务器状态继续工作，避免重复部署、重复登录或误判已验收范围。  
 **项目范围：** 仅 `D:\appData\qqbot\wechat-linux` 里的全 Linux 微信机器人。
 
-> 这份文档包含 2026-10-24 上午的稳定性修复与 2026-10-24 下午（12:45–17:48）完成的五项功能/智能度迭代更新，最新生产状态快照核对于 2026-10-24 17:48（北京时间）。服务可能在之后发生变化，接手时应先短暂复核服务器，不要把快照当作实时状态。  
+> 这份文档包含 2026-10-24 上午的稳定性修复与 2026-10-24 下午（12:45–18:48）完成的六项功能/智能度/内存守护迭代更新，最新生产状态快照核对于 2026-10-24 18:48（北京时间）。服务可能在之后发生变化，接手时应先短暂复核服务器，不要把快照当作实时状态。  
 > 本文不含 API Key、管理密码、SSH 私钥、微信登录数据或私人聊天原文。
 
 ## 1. 交接摘要
 
 - 微信固定使用 **4.1.1.8**，运行在 Linux Docker 容器中；回复核心、原生读取辅助服务和管理入口也在 Linux 服务器常驻。
-- 私有 GitHub 仓库为 `Akie-qiu/whalegirl-linux`，当前工作分支是 `backup/local-snapshot-20261024`；最新功能基线为 `85a91e6`，本交接文档更新作为后续提交 `更新-10/24` 保存。
-- **2026-10-24 下午会话完成的五项核心更新**（均已部署至远端并推送到 GitHub）：
+- GitHub 仓库为 `Akie-qiu/whalegirl-linux`（已按用户要求设为 **Public 公开仓库**，全库已完成凭据扫描无敏感信息），`main` 分支与 `backup/local-snapshot-20261024` 分支保持同步；最新代码基线为 `7875449`。
+- **2026-10-24 下午会话完成的六项核心更新**（均已部署至远端并推送到 GitHub）：
   1. **Prefix Cache（前缀缓存）拼贴顺序重构（`7b05faa`、`4776344`）**：在**零改动用户人设提示词原文**的前提下，将所有静态规则提示词与基础图库列表前置到 `static_system`，将单轮变化的候选差集、群成员 `@` 花名册、检索记忆、贴吧召回、表情候选及好感度移至 `【本轮动态上下文】` 尾部，并引入历史对话窗口步进锚定（stride anchoring）。多轮对话 Prefix Cache 命中率由 ~18% 提升至 **78%–93%**。
   2. **微信 `4.1.1.8` 退出后无法恢复重登故障修复（`8b6ed1a`）**：修复网关 `wechat.js` 中英文界面 `"Enter Weixin"` 按钮未归一化为 `"进入微信"` 导致快捷复登点击失效的问题；修复微信退出后残留“你已退出微信”良性提示弹窗被误判为风控拦截从而阻断 `getLoginQr()` 刷新二维码的问题；修复宿主机 `wechat-home` 目录属主（`1000:1000`）。
   3. **本地登录频次保护调整（`a8c1f3c`）**：将本地 10 分钟内允许发起的登录/重登请求上限从 `3` 次调整为 **`7` 次**（同步更新 `safety.py`、`app.py`、`web.html`）。
@@ -21,8 +21,12 @@
      - 修复 `runtime.py` 中 `image_question` 正则将 `有没有.*图` 误判为看图识别题的问题，并增加被群友否定/追问时禁止原样复读错话的系统约束；
      - 新增“空口发图（文字答应发图但 `image_request` 为 `null`）”服务端拦截与二次跟进补救机制；
      - 升级 `images.py` 与 `image_tools.py`：图库候选容量从 `12` 扩至 `24`，分词升级为重叠二元词（Overlapping Bigrams）+ 关键单字权重 + 同音别称映射（`碗粥/瑞粥/晚粥 -> 挽昼`），且 `send_library_image` 支持 `asset_ids` 单轮连发最多 3 张图片。
+  6. **四层全自动内存清理与 `WeChatAppEx` 命名空间压制机制（`7875449`）**：
+     - 解决群内收到网页链接触发 11 个 `WeChatAppEx` Chromium 子进程吞噬 `400+ MiB` 内存并阻塞 AT-SPI 总线导致 `a11y-dump` 8 秒超时的问题；
+     - `core_watchdog.py` 每分钟自动在容器挂载命名空间将轻量休眠桩绑定至 `/opt/wechat/RadiumWMPF/runtime/WeChatAppEx`（不删原文件），自动收割超时 `a11y-dump` / `xclip` / `unittest` 孤儿进程，并在宿主机 `MemAvailable < 320 MiB` 时自动回收干净页缓存；
+     - `runtime.py` 每 30 秒空闲周期执行 `PRAGMA shrink_memory` + `gc.collect()` + `libc.malloc_trim(0)`，将宿主机可用物理内存稳定恢复至 **`597 MiB`**，负载回落至 **`0.89`**。
 - **2026-10-24 上午完成的稳定性优化**：回复核心有效限制为 `MemoryHigh=384M`、`MemoryMax=512M`、`MemorySwapMax=512M`；Uvicorn 有界并发；每分钟独立检查核心健康。
-- 最近检查（17:48）时核心与网页健康接口均返回 200（`status=ok`，13 个后台协程全部正常，失败任务 0），微信已扫码登录在线。
+- 最近检查（18:48）时核心与网页健康接口均返回 200（`status=ok`，13 个后台协程全部正常，失败任务 0，`MemoryCurrent=72.7 MiB`），微信已扫码登录在线。
 
 ## 2. 首要操作规则
 
@@ -52,11 +56,13 @@
 - `D:\appData\qqbot` 是工作区父目录，**不是 Git 根目录**。
 - 本机的临时部署归档位于父目录 `D:\appData\qqbot\artifacts\`，该目录被忽略，不属于源码仓库。
 
-### 私有 GitHub
+### GitHub 仓库状态
 
-- 仓库：`Akie-qiu/whalegirl-linux`（私有）
-- 当前分支：`backup/local-snapshot-20261024`
+- 仓库：`Akie-qiu/whalegirl-linux`（Public 公开仓库，`https://github.com/Akie-qiu/whalegirl-linux`）
+- 当前同步分支：`main`（默认分支）与 `backup/local-snapshot-20261024`
 - 2026-10-24 提交演进记录（由新到旧）：
+  - `7875449` — `feat(stability): add 4-layer automatic memory cleanup and WeChatAppEx bind-mount suppression`（四层自动内存清理、WeChatAppEx 挂载压制与发送前置容错）
+  - `1220d08` — `更新-10/24`（下午阶段性交接文档归档）
   - `85a91e6` — `fix(chat): prevent stale image re-attachment, support homophone/multi-image library send, and guard empty image promises`（群聊防旧图误挂、同音别称与多图连发、空口发图拦截补救）
   - `4b7daa6` — `feat(moments): schedule autonomous posts randomly across evenly divided daily time slots`（朋友圈分时段随机排期与失败重试修复）
   - `a8c1f3c` — `chore(safety): increase local login request limit from 3 to 7 per 10 minutes`（本地登录限制调至 10 分钟 7 次）

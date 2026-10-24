@@ -38,3 +38,22 @@
 - `/health` 同时报告后台任务是否异常退出。新增每分钟 watchdog：连续三次探测失败后重启 Python 回复核心，最短 15 分钟才会再次尝试；不会重启微信容器或发起微信登录。
 - watchdog 状态文件每分钟记录回复核心内存、交换区、任务数、memory.high 与 OOM 数据。
 - 这些保护能降低“核心被内存节流后长期无响应”的概率，不能承诺微信服务端、网络或其他外部故障永不发生。
+
+## 2026-10-24 18:15 群聊网页链接触发 `WeChatAppEx` 内存枯竭与四层自动内存清理机制
+
+### 现场证据与根因
+- 18:12:51 群内收到网页链接后，微信 `4.1.1.8` 在容器内自动拉起 11 个 `/opt/wechat/RadiumWMPF/runtime/WeChatAppEx`（内置 Chromium 浏览器/小程序渲染进程），合计占用约 `350~400 MiB` 内存并接入容器内 AT-SPI 无障碍总线（`bus_99`）。
+- 叠加宿主机上残留的一个挂起测试进程（占用 `303.5 MiB`），宿主机 `1775 MiB` 物理内存的 `MemAvailable` 跌至 `24 MiB`，触发内核全局直接内存回收（Direct Reclaim），1 分钟平均负载升至 `80.65`，导致 18:15:26 与 18:16:19 两条消息在执行 `/opt/tools/a11y-dump` 时触发 8 秒超时。
+- 若仅对 `WeChatAppEx` 执行 `SIGKILL`，微信主进程 `/usr/bin/wechat` 检测到子进程退出会立即重新拉起 6～11 个 Chromium 进程，造成循环重拉风暴。
+
+### 已部署的四层自动内存清理与守护机制（提交 `7875449`）
+1. **第一层（`WeChatAppEx` 挂载命名空间休眠桩永久压制）**：`deploy/core_watchdog.py` 每分钟检查容器挂载命名空间 `/proc/<cpid>/mountinfo`，若未挂载则通过 `nsenter -t <cpid> -m mount -n --bind` 将轻量休眠桩（`#!/bin/sh` + `exec sleep 2147483647`）绑定至只读镜像中的 `/opt/wechat/RadiumWMPF/runtime/WeChatAppEx`（原文件完整保留未删除）。微信拉起该路径时仅驻留单个 `400 KB`、0% CPU、不接入 AT-SPI 总线的 `sleep` 进程，且不会触发微信主进程重拉。
+2. **第二层（超时挂起辅助/测试进程自动收割）**：`deploy/core_watchdog.py` 每分钟扫描进程表，精准清理运行超 `20s` 的 `/opt/tools/a11y-dump`、超 `90s` 的 `xclip -selection clipboard`、超 `300s` 的残留 `unittest/pytest`、以及任何 `crashpad_handler` 或带 `--type=` 的 `WeChatAppEx` 渲染子进程。
+3. **第三层（Python 核心进程内 glibc 堆内存与缓存归还）**：`whalegirl_linux/runtime.py` 新增 `trim_memory()`，每 30 秒空闲周期自动清理过期群成员缓存与超 10 分钟的临时 UI 任务 JSON 文件，执行 SQLite `PRAGMA shrink_memory`、`gc.collect()` 及 `libc.so.6` 的 `malloc_trim(0)` 强制向内核归还空闲堆页；同时将已登录状态下的 `safety_notice()` 全树探测降频至每 5 分钟一次。
+4. **第四层（宿主机低内存水位回收与发送前置容错）**：`deploy/core_watchdog.py` 将 `vm.swappiness` 控制在 `20`，当宿主机 `MemAvailable < 320 MiB`（冷却 10 分钟）时自动执行 `sync` 与 `drop_caches=1` 回收干净页缓存；`whalegirl_linux/gateway.py` 将 `status_for_send` 缓存窗口扩至 30 秒，并在前置状态探测偶发超时时回退使用 180 秒内已知的 `logged_in` 状态。
+
+### 修复后实测指标（18:42 北京时间）
+- 宿主机 `MemAvailable` 由 `24 MiB` 恢复至 **`597 MiB`**；
+- 系统 1 分钟 `load average` 由 `80.65` 回落至 **`0.89`**；
+- `whalegirl-linux.service` 常驻内存 `MemoryCurrent` 降至 **`72.7 MiB`**（`MemorySwapCurrent=0`，`memory.pressure=0.00`）；
+- `core-watchdog.json` 中 `appex_stub_mounted=true`，`tests/test_core_watchdog.py` 6 项测试全部通过。
