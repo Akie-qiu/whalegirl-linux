@@ -1,22 +1,28 @@
 # 鲸鱼娘 Linux 微信机器人交接文档
 
-**交接时间：** 2026-10-24（北京时间）  
+**交接时间：** 2026-10-24 17:48（北京时间，含下午完整迭代更新）  
 **目的：** 让接手的 agent 能从当前代码、Git 和服务器状态继续工作，避免重复部署、重复登录或误判已验收范围。  
 **项目范围：** 仅 `D:\appData\qqbot\wechat-linux` 里的全 Linux 微信机器人。
 
-> 这份文档的生产状态快照来自 2026-10-24 12:41（北京时间）附近的只读检查。服务可能在之后发生变化，接手时应先短暂复核服务器，不要把快照当作实时状态。  
+> 这份文档包含 2026-10-24 上午的稳定性修复与 2026-10-24 下午（12:45–17:48）完成的五项功能/智能度迭代更新，最新生产状态快照核对于 2026-10-24 17:48（北京时间）。服务可能在之后发生变化，接手时应先短暂复核服务器，不要把快照当作实时状态。  
 > 本文不含 API Key、管理密码、SSH 私钥、微信登录数据或私人聊天原文。
 
 ## 1. 交接摘要
 
 - 微信固定使用 **4.1.1.8**，运行在 Linux Docker 容器中；回复核心、原生读取辅助服务和管理入口也在 Linux 服务器常驻。
-- 私有 GitHub 仓库为 `Akie-qiu/whalegirl-linux`，当前工作分支是 `backup/local-snapshot-20261024`；本次稳定性代码基线为 `d0e2bac`，交接文档会作为后续提交保存。
-- 2026-10-24 故障的第一原因是回复核心的 cgroup 内存高压阈值低于实际占用，Python 核心因此卡在内存回收路径，健康接口超时。微信容器当时仍正常、仍登录，没有 OOM kill。
-- 稳定性优化已部署：回复核心的有效限制为 `MemoryHigh=384M`、`MemoryMax=512M`、`MemorySwapMax=512M`；Uvicorn 有界并发；每分钟独立检查核心健康。
-- 部署过程中出现过一次由文件权限造成的启动失败：`__main__.py` 被写为服务用户不可读，造成 `PermissionError` 和 systemd 重启。根因已定位、修复并再次部署；部署脚本现保留原子替换目标的所有者，并保证 Python 源文件服务用户可读。
-- 最近检查时核心与网页健康接口都返回 200，微信登录状态为 `logged_in`，机器人启用且未暂停；微信容器 ID 未变、重启计数为 0。
-- **不能宣称长期稳定性已验收。** 24 小时连续观测仍未达到；截至 12:41，当前在线段约 22 小时 36 分。服务器持续采样由 systemd timer 执行，不依赖本机电脑。
-- 微信容器自身仍有较高内存/交换区使用记录，虽然当时 `oom=0`、`oom_kill=0`，后续应继续观察。
+- 私有 GitHub 仓库为 `Akie-qiu/whalegirl-linux`，当前工作分支是 `backup/local-snapshot-20261024`；最新功能基线为 `85a91e6`，本交接文档更新作为后续提交 `更新-10/24` 保存。
+- **2026-10-24 下午会话完成的五项核心更新**（均已部署至远端并推送到 GitHub）：
+  1. **Prefix Cache（前缀缓存）拼贴顺序重构（`7b05faa`、`4776344`）**：在**零改动用户人设提示词原文**的前提下，将所有静态规则提示词与基础图库列表前置到 `static_system`，将单轮变化的候选差集、群成员 `@` 花名册、检索记忆、贴吧召回、表情候选及好感度移至 `【本轮动态上下文】` 尾部，并引入历史对话窗口步进锚定（stride anchoring）。多轮对话 Prefix Cache 命中率由 ~18% 提升至 **78%–93%**。
+  2. **微信 `4.1.1.8` 退出后无法恢复重登故障修复（`8b6ed1a`）**：修复网关 `wechat.js` 中英文界面 `"Enter Weixin"` 按钮未归一化为 `"进入微信"` 导致快捷复登点击失效的问题；修复微信退出后残留“你已退出微信”良性提示弹窗被误判为风控拦截从而阻断 `getLoginQr()` 刷新二维码的问题；修复宿主机 `wechat-home` 目录属主（`1000:1000`）。
+  3. **本地登录频次保护调整（`a8c1f3c`）**：将本地 10 分钟内允许发起的登录/重登请求上限从 `3` 次调整为 **`7` 次**（同步更新 `safety.py`、`app.py`、`web.html`）。
+  4. **朋友圈自主发送分时段随机排期优化（`4b7daa6`）**：将每日活跃窗口（如 `09:00–23:00`）按 `moments_publish_per_day` 均分为等长时段（Slot），在每个时段内部通过确定性随机种子挑选发送时间点，解决“刚进活跃窗口就扎堆连发”问题；修复单次发圈失败后 `moments_actions.source` 唯一键锁死全天重发的问题；增强 `moments.js` 动态文本容错匹配。
+  5. **群聊回复智能度与发图闭环修复（`85a91e6`）**：
+     - 修复 `context.py` 在用户向机器人索图（如 `发几张碗粥角色图` / `有没有收藏好看的图片？发一下` / `发啊`）时误将前几分钟群友发的旧表情包再次挂载为视觉附件、导致模型连续多轮对着旧表情包“看图说话”的缺陷；
+     - 修复 `runtime.py` 中 `image_question` 正则将 `有没有.*图` 误判为看图识别题的问题，并增加被群友否定/追问时禁止原样复读错话的系统约束；
+     - 新增“空口发图（文字答应发图但 `image_request` 为 `null`）”服务端拦截与二次跟进补救机制；
+     - 升级 `images.py` 与 `image_tools.py`：图库候选容量从 `12` 扩至 `24`，分词升级为重叠二元词（Overlapping Bigrams）+ 关键单字权重 + 同音别称映射（`碗粥/瑞粥/晚粥 -> 挽昼`），且 `send_library_image` 支持 `asset_ids` 单轮连发最多 3 张图片。
+- **2026-10-24 上午完成的稳定性优化**：回复核心有效限制为 `MemoryHigh=384M`、`MemoryMax=512M`、`MemorySwapMax=512M`；Uvicorn 有界并发；每分钟独立检查核心健康。
+- 最近检查（17:48）时核心与网页健康接口均返回 200（`status=ok`，13 个后台协程全部正常，失败任务 0），微信已扫码登录在线。
 
 ## 2. 首要操作规则
 
@@ -24,7 +30,7 @@
 
 - [AGENTS.md](AGENTS.md)：命令、删除、服务器、微信版本和数据处理要求。
 - [PROJECT_SUMMARY.md](PROJECT_SUMMARY.md)：项目功能概览与已知边界。
-- 与要修改功能对应的专题文档；本文件第 8 节列出索引。
+- 与要修改功能对应的专题文档；本文件第 11 节列出索引。
 
 必须保留以下约束：
 
@@ -35,7 +41,8 @@
 5. 未指定验收会话前，不向真实群聊、私聊或朋友圈发送测试内容。
 6. 访问在线 SQLite 数据时使用只读连接；不要用会执行迁移或恢复写操作的 Store 对生产库做检查。
 7. 不把密钥、管理凭据、登录令牌、二维码、聊天原文或图片 base64 写入 Git、日志或交接文档。
-8. 不修改 QQ 项目或 QQ 服务器部署；它们不属于本仓库任务范围。
+8. **严禁改动用户的人设提示词原文**（`style.system_prompt` / `system_prompt_override`）。
+9. 不修改 QQ 项目或 QQ 服务器部署；它们不属于本仓库任务范围。
 
 ## 3. 仓库与 Git 状态
 
@@ -49,15 +56,20 @@
 
 - 仓库：`Akie-qiu/whalegirl-linux`（私有）
 - 当前分支：`backup/local-snapshot-20261024`
-- 当前 HEAD / origin HEAD：`d0e2bac` — `Repair readability on interrupted stability deploy`
-- 前序优化提交：
-  - `9aa7b74` — 核心资源限制、健康检查和 watchdog 初版
-  - `8c10aa2` — 修正登录状态校验地址
+- 2026-10-24 提交演进记录（由新到旧）：
+  - `85a91e6` — `fix(chat): prevent stale image re-attachment, support homophone/multi-image library send, and guard empty image promises`（群聊防旧图误挂、同音别称与多图连发、空口发图拦截补救）
+  - `4b7daa6` — `feat(moments): schedule autonomous posts randomly across evenly divided daily time slots`（朋友圈分时段随机排期与失败重试修复）
+  - `a8c1f3c` — `chore(safety): increase local login request limit from 3 to 7 per 10 minutes`（本地登录限制调至 10 分钟 7 次）
+  - `8b6ed1a` — `fix(login): normalize Enter Weixin button for 4.1.1.8 and dismiss benign sign-out popup on QR refresh`（修复微信 4.1.1.8 复登按钮识别与退出弹窗阻塞）
+  - `4776344` — `perf(cache): move base library image catalog into static system prefix`（基础图库并入静态前缀）
+  - `7b05faa` — `perf(cache): reorder static and dynamic prompt blocks for prefix cache stability`（Prefix Cache 静态/动态提示词拼贴顺序重构）
+  - `706a4c7` — `Add detailed agent handoff for current deployment`
+  - `d0e2bac` — `Repair readability on interrupted stability deploy`
   - `604e5bf` — 原子部署时保留目标所有权和可读性
-  - `d0e2bac` — 修复中断部署后已打补丁文件不可读的恢复路径
-- `2ee9de5` 是 2026-10-24 的源码快照基线。它和后续稳定性提交都保留在当前备份分支。
-- `main` 分支停留在较早的项目归档快照；继续当前工作应从备份分支开始，不要把较旧 `main` 当成生产现状，也不要改写快照提交。
-- 当前文档尚未提交；提交前检查 `git status`、差异和敏感文件，随后推送到这个私有备份分支。
+  - `8c10aa2` — 修正登录状态校验地址
+  - `9aa7b74` — 核心资源限制、健康检查和 watchdog 初版
+  - `2ee9de5` — 2026-10-24 源码快照基线
+- `main` 分支停留在较早的项目归档快照；继续当前工作应从 `backup/local-snapshot-20261024` 分支开始，不要把较旧 `main` 当成生产现状，也不要改写快照提交。
 
 克隆并包含上游网关子模块：
 
@@ -175,6 +187,27 @@ systemd 的历史 `NRestarts=89` 包含上述部署权限错误期间的自动�
 - 部署文件暂存：`/opt/whalegirl-linux-assets/core-stability-deploy-20261024-r3/`
 
 全部保留；没有删除旧发布或备份。遇到回滚需求时，先比较备份内容、权限和当前 unit 的生效值，再制定恢复操作；不要直接恢复过低的旧内存阈值，也不要用删除 drop-in 的方式盲目回退。
+
+### 5.6 2026-10-24 下午功能与智能度更新详情（`7b05faa` ~ `85a91e6`）
+
+1. **Prefix Cache 提示词拼贴顺序重构（`7b05faa`、`4776344`）**
+   - 涉及文件：`whalegirl_linux/runtime.py`、`whalegirl_linux/image_tools.py`、`whalegirl_linux/conversation.py`、`whalegirl_linux/mentions.py`、`whalegirl_linux/memory.py`、`whalegirl_linux/search.py`、`whalegirl_linux/sticker_library.py`、`whalegirl_linux/affection.py`、`whalegirl_linux/context.py`。
+   - 核心改动：保持用户人设提示词原文一字不改，将工具固定说明与基础图库列表（`base_candidates`）聚合至 `static_system` 前缀，将每轮动态变化的图库差集、群成员 `@` 列表、当轮记忆检索、贴吧召回、表情候选及好感度实时值移至 `【本轮动态上下文】` 尾部；`context.py` 对会话历史窗口引入步进锚定（stride anchoring），减少窗口滑动引起的缓存失效。
+2. **微信 `4.1.1.8` 退出后无法恢复重登修复（`8b6ed1a`）**
+   - 涉及文件：`references/agent-wechat-source/packages/agent-wechat/src/wechat.js`（及容器内 `/opt/agent-wechat/dist/wechat.js`）。
+   - 核心改动：`normalizeText` 将英文版快捷登录按钮 `"Enter Weixin"` 归一化为 `"进入微信"`；`getLoginQr()` 与 `pressQuickLoginButton()` 遇到“你已退出微信 / 已退出登录”良性弹窗时自动点击 `确定 / OK` 关闭弹窗并继续切换二维码，不再被 `detectLoginWarning` 误判为风控拦截；修正宿主机 `/var/lib/whalegirl-linux/candidate-4.1.1.8/wechat-home` 属主为 `1000:1000`。
+3. **本地登录限制调整为 10 分钟 7 次（`a8c1f3c`）**
+   - 涉及文件：`whalegirl_linux/safety.py`、`whalegirl_linux/app.py`、`whalegirl_linux/web.html`。
+   - 核心改动：`SafetyGuard.allow_login_action` 的 600 秒滚动窗口上限由 `3` 提升为 `7`，前后端提示同步更新。
+4. **朋友圈自主发送分时段随机排期优化（`4b7daa6`）**
+   - 涉及文件：`whalegirl_linux/moments.py`、`whalegirl_linux/moments.js`、`tests/test_moments.py`。
+   - 核心改动：将每日活跃窗口（`moments_active_start_hour` 至 `moments_active_end_hour`）按 `moments_publish_per_day` 均分为等长时段，在各时段内按确定性随机种子挑选触发时刻，避免扎堆连发；单次发圈失败后自动为 `source` 追加 `#retryN`，防止唯一索引锁死当日后续重试；`moments.js` 动态校验升级为最长公共子序列 / 字符覆盖度容错匹配。
+5. **群聊回复智能度与发图闭环修复（`85a91e6`）**
+   - 涉及文件：`whalegirl_linux/context.py`、`whalegirl_linux/images.py`、`whalegirl_linux/image_tools.py`、`whalegirl_linux/runtime.py`、`tests/test_images.py`。
+   - 核心改动：
+     - `context.py` 新增 `asking_bot_image` 判定，群友索图或催促 `发啊/发一下/图呢` 时绝不回溯挂载前几分钟的群聊旧表情包；收紧 `caption`（45 秒内且在机器人上次回复之后）与 `visual_reference`（180 秒内且不再因单个“图”字触发）。
+     - `runtime.py` 修正 `image_question` 正则（将 `有没有.*图` 改为 `图.{0,4}有没有`），区分看图问答与普通带图聊天；新增“空口发图（回复声称发图但 `image_request` 为 `null`）”服务端拦截与二次跟进补救；补充被群友指出“错误的/不对/你不懂”时禁止原样复读错话的系统约束。
+     - `images.py` 与 `image_tools.py` 将候选图库容量扩至 `24`，支持中文重叠二元词（Overlapping Bigrams）+ 单字权重 + 同音别称扩展（`碗粥/瑞粥/晚粥 -> 挽昼`），`send_library_image` 支持 `asset_ids` 单轮连发最多 3 张图。
 
 ## 6. 故障检查和安全发布流程
 
@@ -307,14 +340,13 @@ ssh -o BatchMode=yes root@120.46.186.50 "journalctl -u whalegirl-linux.service -
 
 ## 10. 测试现状
 
-稳定性改动已执行：
+稳定性与下午功能迭代改动均已执行验证：
 
 - `tests/test_core_watchdog.py`：5 项通过，覆盖连续失败阈值、15 分钟冷却、健康后清零、连续运行和采样间隔过长。
-- Python 编译检查通过。
-- `git diff --check` 通过。
-- 实际服务器核心健康接口、公开手机入口 health、登录状态及 watchdog 定时器核对通过。
-- 更新前确认没有 `inbox` 或 `outbound_actions` 处于 `sending`。
-- 部署后的约 45 秒二次观测显示 PID 和重启计数稳定、核心返回正常。
+- `tests/test_images.py` 与 `tests/test_moments.py`：共 **45 项单元测试全部通过**（含新增的分时段随机排期、失败槽位重试、重叠分词+同音别称“碗粥->挽昼”召回、`send_library_image` 多图 `asset_ids` 入队、索图指令不回溯绑定历史旧表情包测试）。
+- Prefix Cache 真实线上验证：多轮对话 `prompt_cache_hit_tokens / prompt_tokens` 命中率达 **78%–93%**。
+- Python 编译检查通过，`git diff --check` 通过。
+- 实际服务器核心健康接口（`127.0.0.1:8092/health` 返回 `status=ok, background_tasks=13, failed_background_tasks=0`）、公开手机入口 health、微信登录状态（`logged_in`）及 watchdog 定时器核对通过。
 
 没有进行高负载压测、没有向微信发送真实测试消息、没有重启微信容器，也没有做新的 24 小时稳定性验收。
 
