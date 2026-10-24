@@ -174,15 +174,51 @@ class AIEngine:
         if self.api_style != "anthropic" and self.model in ("deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"):
             payload["thinking"] = {"type": "disabled"}
 
+        dynamic_marker = "\n【本轮动态上下文】"
+        reply_marker = "\n【本次需要回复的消息】\n"
+        effective_system = system_prompt
+        effective_messages = messages
+        if (
+            dynamic_marker in system_prompt
+            and messages
+            and messages[0].get("role") == "user"
+        ):
+            static_part, dynamic_part = system_prompt.split(dynamic_marker, 1)
+            dynamic_block = dynamic_marker + dynamic_part
+            first_msg = messages[0]
+            content = first_msg.get("content")
+            if isinstance(content, str) and reply_marker in content:
+                before_reply, after_reply = content.split(reply_marker, 1)
+                new_content = before_reply + dynamic_block + reply_marker + after_reply
+                effective_system = static_part
+                effective_messages = [{"role": "user", "content": new_content}, *messages[1:]]
+            elif (
+                isinstance(content, list)
+                and content
+                and isinstance(content[0], dict)
+                and content[0].get("type") == "text"
+                and reply_marker in str(content[0].get("text") or "")
+            ):
+                before_reply, after_reply = content[0]["text"].split(reply_marker, 1)
+                new_first_block = {
+                    **content[0],
+                    "text": before_reply + dynamic_block + reply_marker + after_reply,
+                }
+                effective_system = static_part
+                effective_messages = [
+                    {"role": "user", "content": [new_first_block, *content[1:]]},
+                    *messages[1:],
+                ]
+
         if self.api_style == "anthropic":
-            payload["messages"] = messages
-            if system_prompt:
-                payload["system"] = system_prompt
+            payload["messages"] = effective_messages
+            if effective_system:
+                payload["system"] = effective_system
         else:
             full_messages = []
-            if system_prompt:
-                full_messages.append({"role": "system", "content": system_prompt})
-            full_messages.extend(messages)
+            if effective_system:
+                full_messages.append({"role": "system", "content": effective_system})
+            full_messages.extend(effective_messages)
             payload["messages"] = full_messages
 
         if stream:

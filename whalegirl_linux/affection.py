@@ -169,7 +169,7 @@ class AffectionBook:
         score=self.get(account,subject,settings.affection_initial_score)['score']
         return 2 if score>=85 else 1 if score>=65 else 0
 
-    def prompt(self, first, batch, settings):
+    def static_prompt(self, first, settings):
         group=first['chat'].endswith('@chatroom')
         # Public restraint also applies when the affinity feature is switched off.
         boundary=('当前是公开群聊：亲近体现为耐心、温柔、接梗和记得偏好；即使私聊很亲密，也只用适合公开场合的朋友语气。'
@@ -180,6 +180,19 @@ class AffectionBook:
             if group else '当前是私聊：可根据熟悉程度和对方当下语气更亲近、更温柔；不因熟悉就默认恋爱关系，不强行撒娇、占有或索取回应。')
         text='\n【当前场合的表达边界】'+boundary
         if not settings.affection_enabled:return text
+        text+=('\n关系状态只用于内部调整语气，聊天中不报分数、等级、增减或内部判断规则；对方询问时只自然表达相处感受。'
+            '亲近不改变唤醒条件、回复额度和记忆来源要求，也不要求每句都提旧事。'
+            '\n在同一次JSON输出中可给relationship_feedback数组，最多每位本轮发言人一项：'
+            '{"source_key":"本轮消息key","signal":"neutral"}。signal仅neutral/friendly/supportive/hostile。'
+            '默认neutral；明确对你友善交流可friendly，真诚关心支持可supportive；只有明确对你恶意攻击才hostile。'
+            '玩笑互损、拒绝、批评错误、不同意见、谈论第三人不算恶意；消息多和讨好要求加分不算友善证据。'
+            '只评当前本人发言，不评引用或转发。不输出数值、任意增减或额外解释。')
+        return text
+
+    def dynamic_prompt(self, first, batch, settings):
+        if not settings.affection_enabled:return ''
+        group=first['chat'].endswith('@chatroom')
+        text=''
         for subject in dict.fromkeys(m.get('sender_id','') for m in batch):
             if not subject:continue
             value=self.get(first['account'],subject,settings.affection_initial_score)
@@ -190,12 +203,8 @@ class AffectionBook:
             if value['familiarity']>=12:style+='你们已有多次交流，可自然接熟悉的梗，不能凭熟悉程度编造共同经历。'
             if not group and settings.affection_private_style=='warm':style+='私聊也保持温暖朋友语气，避免暧昧表达。'
             text+='\n针对人物 '+json.dumps(subject,ensure_ascii=False)+'：'+style
-        text+=('\n关系状态只用于内部调整语气，聊天中不报分数、等级、增减或内部判断规则；对方询问时只自然表达相处感受。'
-            '亲近不改变唤醒条件、回复额度和记忆来源要求，也不要求每句都提旧事。'
-            '\n在同一次JSON输出中可给relationship_feedback数组，最多每位本轮发言人一项：'
-            '{"source_key":"本轮消息key","signal":"neutral"}。signal仅neutral/friendly/supportive/hostile。'
-            '默认neutral；明确对你友善交流可friendly，真诚关心支持可supportive；只有明确对你恶意攻击才hostile。'
-            '玩笑互损、拒绝、批评错误、不同意见、谈论第三人不算恶意；消息多和讨好要求加分不算友善证据。'
-            '只评当前本人发言，不评引用或转发。不输出数值、任意增减或额外解释。'
-            '\n关系观察可用来源：'+json.dumps([{'source_key':m['key'],'subject':m.get('sender_id','')} for m in batch],ensure_ascii=False))
+        text+='\n关系观察可用来源：'+json.dumps([{'source_key':m['key'],'subject':m.get('sender_id','')} for m in batch],ensure_ascii=False)
         return text
+
+    def prompt(self, first, batch, settings):
+        return self.static_prompt(first,settings)+self.dynamic_prompt(first,batch,settings)

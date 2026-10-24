@@ -29,16 +29,25 @@ def public_query(value):
     return query
 
 
-def search_prompt(settings):
+def search_static_prompt(settings):
     if not settings.web_search_enabled:return '\n联网搜索当前关闭，不要声称刚刚查过网上资料。'
-    date=datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M')
-    return ('\n【按需联网】当前北京时间 '+date+'。普通闲聊、接梗和群友记忆不需要联网。'
+    return ('\n【按需联网】普通闲聊、接梗和群友记忆不需要联网。'
         '用户明确要求联网/搜索/查最新时，必须先在search_query填写最短公共检索词，actions暂留空，收到工具结果后再回答；不要只说我去搜一下。'
         '回答确实依赖近期事实、天气或时效信息时，也可主动检索。需要读取用户给出的公开网页时填写fetch_url；两者每轮只选一个。'
         '问题可直接可靠回答时search_query留空，不要为了闲聊强行搜索；不确定但确有查证价值时可以用。'
         '搜索词只含公共信息，不发送群友姓名、微信ID、私聊原文、密码或整段聊天。群内旧事用记忆工具，不用网页。'
         '检索结果回传后再回答；没有成功结果不能声称已联网或把猜测当成最新事实。'
         '联网后的回复仍是普通口语聊天，不展示引用编号、%cite%标记、来源列表或Markdown链接，也不要写检索过程；只在用户明确索要网址时给网址。')
+
+
+def search_dynamic_prompt(settings):
+    if not settings.web_search_enabled:return ''
+    date=datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M')
+    return '\n当前北京时间 '+date+'。'
+
+
+def search_prompt(settings):
+    return search_static_prompt(settings)+search_dynamic_prompt(settings)
 
 
 class DeepSeekSearch:

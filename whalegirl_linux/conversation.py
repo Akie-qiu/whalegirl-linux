@@ -89,7 +89,7 @@ def repeat_candidate(rows, now):
     return latest[-1] if len({canonical(r['content']) for r in latest})==1 else None
 
 
-def habit_prompt(settings, notes):
+def habit_static_prompt(settings):
     if not settings.chat_habits_enabled:
         return ''
     controls={
@@ -116,8 +116,19 @@ def habit_prompt(settings, notes):
         '\n群友：你怎么天天摸鱼\n你：物种优势\n群友：工资扣了\n你：突然觉得进化一下也行'
         '\n群友：连跪五把\n你：对面晋级名单里得有你的名字\n群友：刚赢了\n你：好 现在轮到他们记住你了'
         '\n对方：今天累死了\n你：今天这是被折腾够了\n对方：不想说\n你：好 先歇会儿'
-        '\n认真求助时直接给有用答案；对方换话题就跟着换，不把每轮收尾都变成追问。'
-        '\n当前节奏信息：'+json.dumps(notes,ensure_ascii=False))
+        '\n认真求助时直接给有用答案；对方换话题就跟着换，不把每轮收尾都变成追问。')
+
+
+def habit_dynamic_prompt(settings, notes):
+    if not settings.chat_habits_enabled:
+        return ''
+    return '\n当前节奏信息：'+json.dumps(notes,ensure_ascii=False)
+
+
+def habit_prompt(settings, notes):
+    if not settings.chat_habits_enabled:
+        return ''
+    return habit_static_prompt(settings) + habit_dynamic_prompt(settings, notes)
 
 
 def warmth_prompt(settings):
@@ -132,8 +143,9 @@ def warmth_prompt(settings):
         '称呼、口癖和反应跟随当前角色与具体关系，不每轮重复同一种开场。')
 
 
-def sticker_prompt(settings, choices, details):
-    if not choices:return ''
+def sticker_static_prompt(settings):
+    if not settings.stickers_enabled:
+        return ''
     preference={
         'low':'克制：通常优先文字，明确要求表情或表情特别贴切时使用。',
         'normal':'适中：自然表达情绪，文字与表情可以搭配，不必二选一。',
@@ -153,12 +165,22 @@ def sticker_prompt(settings, choices, details):
         '不能因为严肃场景强行找表情，不用随机或情绪相反的候选；群聊仍不选亲吻、情侣示爱或性暗示。'
         '若已有sticker动作则不另加；打算给搭配候选时文字动作最多 '+str(max(0,capacity-1))+' 个，为一个表情保留名额。'
         if settings.sticker_after_text!='off' and capacity>=2 and settings.sticker_pair_probability>0 else '')
-    return ('\n可调用的微信原生收藏表情（ID:含义）：'+json.dumps(choices,ensure_ascii=False)+
-        '\n相关表情的详细语义档案：'+json.dumps(details,ensure_ascii=False)+
-        '\n每轮最多一个原生表情，actions可按文字→表情→补一句排列；表情单独占一个动作，不写成文字描述，ID只能来自目录。明确要表情时优先合适表情。'
+    return ('\n每轮最多一个原生表情，actions可按文字→表情→补一句排列；表情单独占一个动作，不写成文字描述，ID只能来自目录。明确要表情时优先合适表情。'
         '按情绪、画面和对方语气选，不贴切就不硬发；开心微笑不能代替安慰，尴尬不是害羞，反讽不是赞同，严肃求助先给有用回答，不塞卖萌表情。'
         '\n原生表情积极性：'+preference+'\n文字后配表情：'+pairing+
         '这只调节搭配意愿，不增加消息条数上限，不绕过重复冷却、发送额度或群聊表达边界。'+suggestion)
+
+
+def sticker_dynamic_prompt(choices, details):
+    if not choices:
+        return ''
+    return ('\n可调用的微信原生收藏表情（ID:含义）：'+json.dumps(choices,ensure_ascii=False)+
+        '\n相关表情的详细语义档案：'+json.dumps(details,ensure_ascii=False))
+
+
+def sticker_prompt(settings, choices, details):
+    if not choices:return ''
+    return sticker_static_prompt(settings.model_copy(update={'stickers_enabled':True})) + sticker_dynamic_prompt(choices, details)
 
 
 def pair_sticker(decision, actions, choices, settings, *, draw=None):

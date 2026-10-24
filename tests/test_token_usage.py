@@ -95,6 +95,55 @@ class EngineAccountingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(events),1);self.assertEqual(events[0]['total_tokens'],120)
         finally:await client.aclose()
 
+    async def test_prefix_cache_layout_keeps_system_and_history_prefix_stable(self):
+        from whalegirl_linux.runtime import Runtime
+        from whalegirl_linux.settings import Config, Settings
+        from whalegirl_linux.upstream.ai_engine import AIEngine
+        from test_chat_habits import Engine, Gateway
+        runs=ROOT/'test-runs';runs.mkdir(exist_ok=True)
+        folder=Path(tempfile.mkdtemp(prefix='cache-prefix-',dir=runs))
+        config=Config(folder)
+        config.save(Settings(enabled=True,account_id='account',allowed_chat_ids=['group@chatroom'],
+            context_messages=12,safety_enabled=False,debounce_single_seconds=0,debounce_burst_seconds=0,debounce_max_seconds=0),'test-key')
+        store=Store(folder/'state.sqlite3');gateway=Gateway()
+        runtime=Runtime(config,store,gateway,ROOT/'styles',engine_factory=Engine)
+        try:
+            base_ts=time.time()-300
+            for idx in range(1,16):
+                row=Runtime.event('account','group@chatroom',{'serverId':idx,'localId':idx,'sender':f'u{idx%3}',
+                    'senderName':f'群友{idx%3}','type':1,'content':f'历史发言第{idx}句','isSelf':False,'timestamp':base_ts+idx})
+                store.observe([row])
+            engine=await runtime.model();payloads=[]
+            real_builder=AIEngine('https://api.deepseek.com/chat/completions','test',model='deepseek-flash')
+            async def capture_chat(messages,**kwargs):
+                engine.calls+=1
+                payloads.append(real_builder._build_payload(messages,kwargs.get('system_prompt',''),None))
+                return json.dumps({'should_reply':True,'actions':[{'type':'text','text':'收到啦'}]},ensure_ascii=False)
+            engine.chat=capture_chat
+            for turn,(mid,sender,trigger,text) in enumerate([(16,'alice','direct','鲸鱼娘 帮我想个晚饭'),(17,'bob','natural','我也想吃夜宵了')]):
+                event=Runtime.event('account','group@chatroom',{'serverId':mid,'localId':mid,'sender':sender,
+                    'senderName':sender,'type':1,'content':text,'isSelf':False,'timestamp':time.time()+turn})
+                event['trigger']=trigger;store.observe([event]);store.insert(event)
+                await runtime.process_next()
+            self.assertEqual(len(payloads),2)
+            sys_0=payloads[0]['messages'][0]['content']
+            sys_1=payloads[1]['messages'][0]['content']
+            self.assertEqual(sys_0,sys_1)
+            self.assertNotIn('【本轮动态上下文】',sys_0)
+            self.assertNotIn('当前北京时间',sys_0)
+            user_0=payloads[0]['messages'][1]['content']
+            user_1=payloads[1]['messages'][1]['content']
+            self.assertIn('【本轮动态上下文】',user_0)
+            self.assertLess(user_0.index('【当前会话近期完整消息（含未@内容）】'),user_0.index('【本轮动态上下文】'))
+            self.assertLess(user_0.index('【本轮动态上下文】'),user_0.index('【本次需要回复的消息】'))
+            hist_0=user_0.split('【当前会话近期完整消息（含未@内容）】\n',1)[1].split('\n【本群/本私聊历史检索',1)[0].splitlines()
+            hist_1=user_1.split('【当前会话近期完整消息（含未@内容）】\n',1)[1].split('\n【本群/本私聊历史检索',1)[0].splitlines()
+            self.assertEqual(hist_0[0],hist_1[0])
+            self.assertEqual(hist_0,hist_1[:len(hist_0)])
+        finally:
+            await real_builder.close()
+            await runtime.close()
+
 
 class UsageApiTests(unittest.TestCase):
     def test_authentication_and_period_validation(self):
