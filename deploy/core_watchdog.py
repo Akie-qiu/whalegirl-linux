@@ -115,9 +115,103 @@ def _probe():
         return False
 
 
+def _mem_available_mb():
+    try:
+        for line in Path('/proc/meminfo').read_text().splitlines():
+            if line.startswith('MemAvailable:'):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def should_reap_process(elapsed_seconds, cmdline):
+    """Return True if a helper/test/webview process is hung or non-essential."""
+    if '/opt/tools/a11y-dump' in cmdline and elapsed_seconds > 20:
+        return True
+    if 'xclip -selection clipboard' in cmdline and elapsed_seconds > 90:
+        return True
+    if (' -m unittest' in cmdline or 'pytest' in cmdline) and elapsed_seconds > 300:
+        return True
+    if '/opt/wechat/RadiumWMPF/runtime/crashpad_handler' in cmdline:
+        return True
+    if '/opt/wechat/RadiumWMPF/runtime/WeChatAppEx' in cmdline and '--type=' in cmdline:
+        return True
+    return False
+
+
+def maintain_memory_hygiene(state, now):
+    """Keep host and container free of WeChatAppEx bloat, hung helpers, and low-RAM stalls."""
+    reaped = []
+    stub_mounted = False
+    dropped = False
+    try:
+        cpid_raw = subprocess.check_output(
+            ['docker', 'inspect', '--format', '{{.State.Pid}}', 'whalegirl-wechat-candidate-4118'],
+            text=True, timeout=4).strip()
+        cpid = int(cpid_raw) if cpid_raw.isdigit() else 0
+        if cpid > 0:
+            mountinfo = Path(f'/proc/{cpid}/mountinfo').read_text()
+            if '/opt/wechat/RadiumWMPF/runtime/WeChatAppEx' not in mountinfo:
+                subprocess.run(
+                    ['nsenter', '-t', str(cpid), '-m', 'sh', '-c',
+                     'printf "#!/bin/sh\\nexec sleep 2147483647\\n" > /tmp/wechat_appex_stub && '
+                     'chmod 0755 /tmp/wechat_appex_stub && '
+                     'mount -n --bind /tmp/wechat_appex_stub /opt/wechat/RadiumWMPF/runtime/WeChatAppEx'],
+                    timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(['pkill', '-9', '-f', '/opt/wechat/RadiumWMPF/runtime/WeChatAppEx'],
+                               timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stub_mounted = '/opt/wechat/RadiumWMPF/runtime/WeChatAppEx' in Path(f'/proc/{cpid}/mountinfo').read_text()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+
+    try:
+        ps_out = subprocess.check_output(['ps', '-eo', 'pid=,etimes=,args='], text=True, timeout=4)
+        for line in ps_out.splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit():
+                continue
+            pid, elapsed, cmd = int(parts[0]), int(parts[1]), parts[2]
+            if should_reap_process(elapsed, cmd):
+                try:
+                    os.kill(pid, 9)
+                    reaped.append(pid)
+                except OSError:
+                    pass
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    try:
+        swappiness = Path('/proc/sys/vm/swappiness')
+        if swappiness.is_file() and int(swappiness.read_text().strip()) > 20:
+            swappiness.write_text('20\n')
+    except (OSError, ValueError):
+        pass
+
+    avail_before = _mem_available_mb()
+    if avail_before is not None and avail_before < 320 and now - float(state.get('last_cache_drop_at', 0)) >= 600:
+        try:
+            subprocess.run(['sync'], timeout=5)
+            Path('/proc/sys/vm/drop_caches').write_text('1\n')
+            state['last_cache_drop_at'] = now
+            dropped = True
+        except (OSError, subprocess.SubprocessError):
+            pass
+    avail_after = _mem_available_mb()
+    return {
+        'mem_available_mb': avail_after if avail_after is not None else avail_before,
+        'reaped_pids': reaped[:20],
+        'appex_stub_mounted': stub_mounted,
+        'cache_dropped': dropped,
+    }
+
+
 def main():
     now = time.time()
-    state, action = transition(load_state(), now, _probe())
+    prior = load_state()
+    hygiene = maintain_memory_hygiene(prior, now)
+    state, action = transition(prior, now, _probe())
+    state['hygiene'] = hygiene
     state['resources'] = resource_snapshot()
     if action in ('healthy', 'recovered'):
         save_state(state)

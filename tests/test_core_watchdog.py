@@ -1,6 +1,6 @@
 import unittest
 
-from deploy.core_watchdog import FAILURE_THRESHOLD, RESTART_COOLDOWN, transition
+from deploy.core_watchdog import FAILURE_THRESHOLD, RESTART_COOLDOWN, should_reap_process, transition
 
 
 class CoreWatchdogTests(unittest.TestCase):
@@ -50,6 +50,17 @@ class CoreWatchdogTests(unittest.TestCase):
         state, action = transition(state, 1000 + 181, False)
         self.assertEqual(action, 'waiting')
         self.assertEqual(state['consecutive_failures'], 1)
+
+    def test_should_reap_hung_helpers_and_webview_children_only(self):
+        self.assertFalse(should_reap_process(5, 'python3 /opt/tools/a11y-dump --format json'))
+        self.assertTrue(should_reap_process(25, 'python3 /opt/tools/a11y-dump --format json'))
+        self.assertFalse(should_reap_process(10, 'xclip -selection clipboard -t image/png -i /tmp/a.png'))
+        self.assertTrue(should_reap_process(120, 'xclip -selection clipboard -t image/png -i /tmp/a.png'))
+        self.assertFalse(should_reap_process(60, '/opt/whalegirl-linux/venv/bin/python -m unittest discover'))
+        self.assertTrue(should_reap_process(360, '/opt/whalegirl-linux/venv/bin/python -m unittest discover'))
+        self.assertTrue(should_reap_process(2, '/opt/wechat/RadiumWMPF/runtime/WeChatAppEx --type=renderer'))
+        self.assertFalse(should_reap_process(3600, '/usr/bin/wechat'))
+        self.assertFalse(should_reap_process(3600, '/opt/whalegirl-linux/venv/bin/python -m whalegirl_linux'))
 
 
 if __name__ == '__main__':

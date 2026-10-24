@@ -208,6 +208,13 @@ systemd 的历史 `NRestarts=89` 包含上述部署权限错误期间的自动�
      - `context.py` 新增 `asking_bot_image` 判定，群友索图或催促 `发啊/发一下/图呢` 时绝不回溯挂载前几分钟的群聊旧表情包；收紧 `caption`（45 秒内且在机器人上次回复之后）与 `visual_reference`（180 秒内且不再因单个“图”字触发）。
      - `runtime.py` 修正 `image_question` 正则（将 `有没有.*图` 改为 `图.{0,4}有没有`），区分看图问答与普通带图聊天；新增“空口发图（回复声称发图但 `image_request` 为 `null`）”服务端拦截与二次跟进补救；补充被群友指出“错误的/不对/你不懂”时禁止原样复读错话的系统约束。
      - `images.py` 与 `image_tools.py` 将候选图库容量扩至 `24`，支持中文重叠二元词（Overlapping Bigrams）+ 单字权重 + 同音别称扩展（`碗粥/瑞粥/晚粥 -> 挽昼`），`send_library_image` 支持 `asset_ids` 单轮连发最多 3 张图。
+6. **四层自动内存清理与消息发送容错机制**
+   - 涉及文件：`whalegirl_linux/gateway.py`、`whalegirl_linux/runtime.py`、`deploy/core_watchdog.py`、`tests/test_core_watchdog.py`。
+   - 核心改动：
+     - **第一层（微信内置浏览器 `WeChatAppEx` 永久压制）**：`core_watchdog.py` 每分钟检查容器挂载命名空间（`/proc/<cpid>/mountinfo`），自动通过 `nsenter ... mount -n --bind` 将轻量休眠桩绑定至 `/opt/wechat/RadiumWMPF/runtime/WeChatAppEx`，防止群内收到网页链接/小程序时拉起 6～11 个 Chromium 进程吞噬 `400+ MB` 内存并阻塞 AT-SPI 无障碍总线（`bus_99`）。
+     - **第二层（超时挂起子进程自动收割）**：`core_watchdog.py` 每分钟自动清理超时卡死的 `a11y-dump`（>20s）、`xclip`（>90s）、残留 `unittest/pytest`（>300s）与 `crashpad_handler`。
+     - **第三层（Python 核心进程内堆内存与缓存回收）**：`runtime.py` 新增 `trim_memory()`，每 30 秒空闲周期自动清理过期群成员缓存、过期 UI 任务 JSON 文件，并执行 SQLite `PRAGMA shrink_memory`、`gc.collect()` 及 `libc.malloc_trim(0)` 强制归还 glibc 堆页给操作系统；同时将 `safety_notice()` 全树探测降频至每 5 分钟一次。
+     - **第四层（宿主机低内存水位回收与发送状态容错）**：`core_watchdog.py` 将 `vm.swappiness` 控制在 `20`，当宿主机 `MemAvailable < 320 MB` 时自动触发 `sync` + `drop_caches=1` 释放干净页缓存；`gateway.py` 将 `status_for_send` 缓存有效期扩至 30 秒并支持在瞬时超时时回退使用 180 秒内已知的 `logged_in` 状态。
 
 ## 6. 故障检查和安全发布流程
 

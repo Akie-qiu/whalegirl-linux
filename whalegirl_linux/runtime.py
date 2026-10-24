@@ -549,6 +549,7 @@ class Runtime:
         settings=self.config.settings
         key=first['key']
         reply='\n'.join(a['display'] for a in actions)
+        self.store.update(key, "generating", reply=reply)
         due = max(self.last_send + settings.min_send_interval,
                   self.store.latest_sent(first["account"], first["chat"]) + settings.chat_cooldown)
         interval_started = time.monotonic()
@@ -758,13 +759,16 @@ class Runtime:
         self.safety.last_check = time.time()
         self.safety.last_notice = ''
         try:
-            auth = await self.gateway.status()
+            auth = await self.gateway.status(max_age=10)
             self.gateway_state = auth
             self.last_auth_check = time.monotonic()
             account = auth.get('loggedInUser') or ''
             if auth.get('status') == 'logged_in' and account and account != settings.account_id:
                 self.safety.hold(settings.account_id,'account_changed','微信登录账号与授权账号不同，已停止发送')
-            notice = await self.gateway.safety_notice()
+            notice = ''
+            if auth.get('status') != 'logged_in' or time.monotonic() - getattr(self, '_last_notice_probe', 0.0) >= 300:
+                self._last_notice_probe = time.monotonic()
+                notice = await self.gateway.safety_notice()
             if client_warning(notice):
                 self.safety.last_notice = notice[:400]
                 self.safety.hold(settings.account_id,'client_warning','微信客户端提示：'+notice[:300])
@@ -777,11 +781,41 @@ class Runtime:
             self.safety.check_error = '客户端提示检查暂不可用：'+type(exc).__name__
         return self.safety.snapshot(settings.account_id,settings)
 
+    def trim_memory(self):
+        import ctypes
+        import gc
+        now_mono = time.monotonic()
+        if hasattr(self.gateway, '_members_cache') and isinstance(self.gateway._members_cache, dict):
+            for k in [k for k, v in self.gateway._members_cache.items() if now_mono - v[0] > 180]:
+                self.gateway._members_cache.pop(k, None)
+        if len(self.chat_labels) > 500:
+            self.chat_labels.clear()
+        jobs_dir = getattr(self.gateway, 'ui_jobs_directory', None)
+        if jobs_dir and jobs_dir.is_dir():
+            cutoff = time.time() - 600
+            for item in jobs_dir.glob('*.json'):
+                try:
+                    if item.stat().st_mtime < cutoff:
+                        item.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        try:
+            with self.store.lock:
+                self.store.db.execute('PRAGMA shrink_memory')
+        except Exception:
+            pass
+        gc.collect()
+        try:
+            ctypes.CDLL('libc.so.6').malloc_trim(0)
+        except Exception:
+            pass
+
     async def _safety_loop(self):
         while True:
             try:
-                if self.config.settings.safety_enabled and self.config.settings.account_id:
-                    if not self.processing and not self.store.queue():
+                if not self.processing and not self.store.queue():
+                    self.trim_memory()
+                    if self.config.settings.safety_enabled and self.config.settings.account_id:
                         await self.check_safety()
             except asyncio.CancelledError:
                 raise

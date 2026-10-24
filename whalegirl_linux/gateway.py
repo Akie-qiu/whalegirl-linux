@@ -83,7 +83,7 @@ class AgentGateway:
     def warm_send_status(self):
         # One account observation overlaps model generation. Polling and the
         # send path share it instead of taking simultaneous full UI snapshots.
-        if self._status_cache is not None and time.monotonic()-self._status_at < 1:
+        if self._status_cache is not None and time.monotonic()-self._status_at < 15:
             return
         if self._status_task is None or self._status_task.done():
             self._status_task = asyncio.create_task(self._read_status())
@@ -97,7 +97,14 @@ class AgentGateway:
         return dict(await asyncio.shield(self._status_task))
 
     async def status_for_send(self):
-        return await self.status(max_age=2)
+        try:
+            return await self.status(max_age=30)
+        except (httpx.HTTPError, ValueError):
+            if (self._status_cache is not None
+                    and self._status_cache.get("status") == "logged_in"
+                    and time.monotonic() - self._status_at < 180):
+                return dict(self._status_cache)
+            raise
 
     async def _read_status(self):
         response = await self.client.get("/api/status/auth")
