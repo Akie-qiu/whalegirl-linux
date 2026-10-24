@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -50,17 +51,25 @@ def run(args, *, timeout=30, capture=True):
 def atomic_text(path, content, *, mode=0o644):
     path.parent.mkdir(parents=True, exist_ok=True)
     pending = path.with_name(path.name + '.pending-' + STAMP)
+    previous = path.stat() if path.exists() else None
     pending.write_text(content, encoding='utf-8')
-    os.chmod(pending, mode)
+    if previous is not None:
+        os.chown(pending, previous.st_uid, previous.st_gid)
+    os.chmod(pending, mode if mode is not None else
+             (stat.S_IMODE(previous.st_mode) if previous is not None else 0o644))
     os.replace(pending, path)
 
 
 def atomic_copy(source, target, *, mode=None):
     target.parent.mkdir(parents=True, exist_ok=True)
     pending = target.with_name(target.name + '.pending-' + STAMP)
+    previous = target.stat() if target.exists() else None
     shutil.copy2(source, pending)
-    if mode is not None:
-        os.chmod(pending, mode)
+    if previous is not None:
+        os.chown(pending, previous.st_uid, previous.st_gid)
+    os.chmod(pending, mode if mode is not None else
+             (stat.S_IMODE(source.stat().st_mode) if previous is None else
+              stat.S_IMODE(previous.st_mode)))
     os.replace(pending, target)
 
 
@@ -101,7 +110,9 @@ def replace_exact(path, old, new):
         return 'already_applied'
     if content.count(old) != 1:
         raise SystemExit('Live source did not match the reviewed patch; no replacement made: ' + path.name)
-    atomic_text(path, content.replace(old, new, 1), mode=path.stat().st_mode & 0o777)
+    # Python source files in a release must remain readable by whalegirl-ai even
+    # if the previous release used restrictive group permissions.
+    atomic_text(path, content.replace(old, new, 1), mode=0o644)
     return 'patched'
 
 
