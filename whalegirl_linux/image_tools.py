@@ -107,12 +107,14 @@ class ImageTools:
             '服务端不再按发图/画图关键词判断意图，也不要求摘录授权原文；照片、插画和自然换装说法都按实际意思理解。'
             '普通聊天仍以文字和表情为主，合适时可发已有图片；需要新画面或编辑时再生图，不为寒暄频繁下单。'
             '对方说不要、取消或只是在讨论时遵守其意思，群里注意对话对象，不把别人互聊当成给你的要求。每轮最多一个工具。'
-            '\n两个独立工具：send_library_image选下方上传图库或生成图库中的确切asset_id，已有生成图可反复发送，发送次数不限且不占生图额度；'
+            '\n两个独立工具：send_library_image选下方上传图库或生成图库中的确切asset_id（或用asset_ids一次选1～3个候选ID连发多张），已有生成图可反复发送，发送次数不限且不占生图额度；'
             'generate_image创建或编辑新图，只有它计入每日生图额度。希望复用旧图时优先选图库，不重复生成。'
+            '检索图库时注意群友常用的角色谐音/同音别称（如“碗粥/瑞粥/晚粥”即图库中的“挽昼”）。'
+            '若文字回复中答应发图或说“给你看这张/这几张”，必须同时填写image_request；若图库无匹配且不生图，文字必须如实说图库里没有，严禁空口说“这张凑合看”却让image_request为null。'
             '画自己时subject_type=self，服务端绑定角色参考图。问长相用外观设定自然回答；不要把海报或别的角色当成自己。'
             '那你画一张需结合当前请求者相关上下文补完整主体，subject_resolved=false时只问画什么。'
             'scene_prompt必须是独立完整画面描述，不能仅填那你画一张，也不要把整段聊天当提示词。'
-            '\nimage_request格式：{"tool":"send_library_image或generate_image","asset_id":"候选ID",'
+            '\nimage_request格式：{"tool":"send_library_image或generate_image","asset_id":"候选ID","asset_ids":["多张时可选1至3个候选ID"],'
             '"subject_type":"self或other","subject_resolved":true,"scene_prompt":"完整画面要求",'
             '"operation":"create/amend/cancel",'
             '"task_id":"修改或取消已有任务的确切ID","reference_keys":[],"mode":"auto/edit/remix"}。'
@@ -206,15 +208,36 @@ class ImageTools:
             if tool == 'send_library_image':
                 if operation != 'create':
                     raise ValueError('invalid_operation')
-                identity = request.get('asset_id', '')
-                if identity not in {a['id'] for a in context['candidates']}:
+                raw_ids = []
+                if isinstance(request.get('asset_ids'), list):
+                    raw_ids.extend(str(x).strip() for x in request['asset_ids'] if str(x).strip())
+                if request.get('asset_id'):
+                    aid = str(request.get('asset_id')).strip()
+                    if aid and aid not in raw_ids:
+                        raw_ids.insert(0, aid)
+                identities = raw_ids[:3]
+                if not identities:
                     raise ValueError('no_match')
-                asset = self.images.asset(identity)
-                if not self.allowed(asset, first['chat']):
-                    raise ValueError('asset_scope_denied')
-                if subject == 'self' and asset['character_id'] != CHARACTER:
-                    raise ValueError('not_character_asset')
-                job_id = self.images.enqueue(kind='send', asset_id=identity, chat=first['chat'], destination='chat', source_key=first['key'])
+                valid_candidates = {a['id'] for a in context['candidates']}
+                for identity in identities:
+                    if identity not in valid_candidates:
+                        raise ValueError('no_match')
+                    asset = self.images.asset(identity)
+                    if not self.allowed(asset, first['chat']):
+                        raise ValueError('asset_scope_denied')
+                    if subject == 'self' and asset['character_id'] != CHARACTER:
+                        raise ValueError('not_character_asset')
+                job_ids = [
+                    self.images.enqueue(
+                        kind='send',
+                        asset_id=identity,
+                        chat=first['chat'],
+                        destination='chat',
+                        source_key=first['key'] if idx == 0 else f"{first['key']}#{idx}",
+                    )
+                    for idx, identity in enumerate(identities)
+                ]
+                job_id = job_ids[0]
             else:
                 if operation not in ('create', 'amend'):
                     raise ValueError('invalid_operation')
@@ -252,10 +275,14 @@ class ImageTools:
                         raise ValueError('reference_not_available')
                     job_id = self.images.enqueue(kind='generate', prompt=prompt, chat=first['chat'], destination='chat',
                         source_key=first['key'], character=subject == 'self', mode=request.get('mode', 'auto'), chat_reference_plan=plan)
+                job_ids = [job_id]
             tool_data = {'subject_type': subject, 'operation': operation, 'tool': tool}
+            if len(job_ids) > 1:
+                tool_data['job_ids'] = job_ids
             with self.store.lock:
-                self.store.db.execute('UPDATE picture_jobs SET requester_id=?,tool_json=? WHERE id=?',
-                    (first.get('sender_id') or first.get('sender', ''), json.dumps(tool_data), job_id))
+                for jid in job_ids:
+                    self.store.db.execute('UPDATE picture_jobs SET requester_id=?,tool_json=? WHERE id=?',
+                        (first.get('sender_id') or first.get('sender', ''), json.dumps(tool_data), jid))
                 self.store.db.executemany('INSERT OR IGNORE INTO picture_sources VALUES(?,?)', [(m['key'], job_id) for m in own])
                 self.store.db.commit()
             job = self.images.get(job_id)

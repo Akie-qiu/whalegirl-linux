@@ -78,23 +78,48 @@ async def build_context(store, gateway, settings, first, batch, labels):
                 except Exception:pass
             if source and source['kind']==ref['type']:references.append(source)
             else:unresolved=True
-        # Plain text must not reopen a previous image on every reply.
-        visual_reference=bool(re.search(r'图|表情|看一下|看看|看得到|看到|这张|这一张', question))
+        # Plain text must not reopen a previous image on every reply, nor when asking the bot to send/draw images.
+        asking_bot_image = bool(
+            re.search(
+                r'(?:有没有|有啥|来|发|给|找|挑|选|求|整|分享|收藏)(?:一|几|两|三|张|点|些|个|一下|下)?.{0,12}(?:图|美图|角色图|立绘|照片|壁纸|插画|头像|表情)|'
+                r'(?:图|美图|角色图|立绘|图片|照片|壁纸|插画).{0,8}(?:发一下|发来|发我|发群里|有吗|有没有)|'
+                r'^\s*(?:@[^\s\u2005]+[\s\u2005]*)*(?:发啊|发呀|发一下|快发|图呢|哪呢)\s*[？?！!。.~～]*$|'
+                r'(?:帮我|给我|请|重新|再)?.{0,6}(?:画|绘制|生成)(?:一|几|张|幅|个)',
+                question
+            )
+            and not re.search(r'这张|这一张|那张|我发|刚发|上面|楼上|改成|换成|重画|参考|是什么|写的什么|图里|图中', question)
+        )
+        visual_reference = (
+            not asking_bot_image
+            and bool(re.search(
+                r'这张|这一张|那张|上面.{0,4}图|刚.{0,4}图|我发.{0,4}图|图里|图中|图上|'
+                r'看.{0,4}(?:图|表情)|(?:图|表情).{0,4}(?:看|是什么|写|意思)|识别|看得到|看到',
+                question
+            ))
+        )
         images=(references+current_images)[-2:]
         # A short caption often arrives as a separate message (e.g. 她好看吧).
-        # Bind it only to that person's immediately preceding incoming image.
-        prior=[r for r in recent if r['key'] not in batch_keys and r['is_self']==0 and
+        # Bind it only to that person's immediately preceding undescribed image before the bot has replied.
+        non_batch=[r for r in recent if r['key'] not in batch_keys]
+        last_bot_time=max((r['timestamp'] for r in non_batch if r['is_self']==1),default=0.0)
+        prior=[r for r in non_batch if r['is_self']==0 and r['timestamp']>last_bot_time and
                r.get('sender_id') in {m.get('sender_id') for m in batch}]
-        caption=bool(prior and needs_image(prior[-1]) and len(question)<100 and
-                     0<=first['timestamp']-prior[-1]['timestamp']<90)
-        if not images and not unresolved and (visual_reference or caption):
-            senders={m.get('sender_id') for m in batch}
-            candidates=[r for r in recent if needs_image(r) and r['is_self']==0 and 0<=time.time()-r['timestamp']<600]
-            same_sender=[r for r in candidates if r['sender_id'] in senders]
-            if same_sender:images=same_sender[-2:]
-            elif len(candidates)==1:images=candidates
-            elif candidates:
-                blocks[0]['text']+='\n群里多人发图，当前没有确切引用关系；先确认对方指哪一张，不能随意选最近图片。'
+        caption=bool(not asking_bot_image and prior and needs_image(prior[-1]) and
+                     not prior[-1].get('description') and len(question)<100 and
+                     0<=first['timestamp']-prior[-1]['timestamp']<45)
+        if not images and not unresolved:
+            if caption and not visual_reference:
+                images=[prior[-1]]
+            elif visual_reference:
+                senders={m.get('sender_id') for m in batch}
+                candidates=[r for r in non_batch if needs_image(r) and r['is_self']==0 and
+                            0<=time.time()-r['timestamp']<180 and
+                            (not r.get('description') or r['timestamp']>last_bot_time)]
+                same_sender=[r for r in candidates if r['sender_id'] in senders]
+                if same_sender:images=same_sender[-1:]
+                elif len(candidates)==1:images=candidates
+                elif candidates:
+                    blocks[0]['text']+='\n群里多人发图，当前没有确切引用关系；先确认对方指哪一张，不能随意选最近图片。'
         if unresolved:blocks[0]['text']+='\n引用指向的原图尚未同步或已不可用，不能拿其他图片代替。'
         for row in images:
             image_started=time.monotonic()

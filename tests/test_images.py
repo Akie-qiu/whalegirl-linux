@@ -239,4 +239,45 @@ class ImageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.get(gallery)['state'],'sent')
 
 
+    def test_candidates_homophone_and_overlapping_bigram_and_multi_send(self):
+        def make_png(color):
+            buf = io.BytesIO()
+            Image.new('RGB', (80, 60), color).save(buf, format='PNG')
+            return buf.getvalue()
+        other = self.service.save_asset(make_png('red'), scope='global')
+        self.service.edit_asset(other['id'], dict(name='普通风景', description='树林', scenes='日常', enabled=True))
+        w1 = self.service.save_asset(make_png('green'), scope='global')
+        self.service.edit_asset(w1['id'], dict(name='挽昼三形态立绘', description='绝区零角色挽昼', scenes='游戏展示', enabled=True))
+        w2 = self.service.save_asset(make_png('yellow'), scope='global')
+        self.service.edit_asset(w2['id'], dict(name='黑蓝系三女角色立绘', description='绝区零角色挽昼的三种形态', scenes='发喜欢的角色时', enabled=True))
+        for q in ('发几张碗粥角色图', '有没有瑞粥的美图', '晚粥立绘'):
+            cands = self.service.candidates(q, chat='allowed')
+            self.assertEqual({cands[0]['id'], cands[1]['id']}, {w1['id'], w2['id']}, q)
+        first = self.message('10', kind=1, stamp=200, content='发几张碗粥角色图')
+        _, ctx = self.service.tools.context(first, [first])
+        res = self.service.tools.execute(
+            {'tool': 'send_library_image', 'asset_ids': [w1['id'], w2['id']], 'subject_type': 'other', 'operation': 'create'},
+            first, [first], ctx
+        )
+        self.assertTrue(res['ok'])
+        jobs = self.store.db.execute("SELECT asset_id FROM picture_jobs WHERE kind='send' ORDER BY created ASC").fetchall()
+        self.assertEqual([r[0] for r in jobs], [w1['id'], w2['id']])
+
+    async def test_asking_bot_for_image_does_not_rebind_prior_chat_sticker(self):
+        from whalegirl_linux.context import build_context
+        old_sticker = self.message('20', sender='alice', kind=47, stamp=time.time() - 20, content='[动画表情]')
+        bot_reply = dict(key='account/allowed/21', account='account', chat='allowed', sender='bot', sender_id='bot',
+                         kind=1, is_self=1, local_id=21, content='这张凑合看吧', timestamp=time.time() - 15, payload_json='{}')
+        self.store.observe([old_sticker, bot_reply])
+        for idx, text in enumerate(['@沃不明白 发啊', '@沃不明白 有没有收藏好看的图片？发一下', '@沃不明白 发几张碗粥角色图'], start=30):
+            req = self.message(str(idx), sender='alice', kind=1, stamp=time.time() - 5 + idx, content=text)
+            self.store.observe([req])
+            msgs, image_keys, counts = await build_context(
+                self.store, self.runtime.gateway, self.config.settings, req, [req], {}
+            )
+            self.assertEqual(image_keys, [], text)
+            self.assertEqual(counts['images'], 0, text)
+            self.assertNotIn('本次相关图片尚未取得有效图像', msgs[0]['content'], text)
+
+
 if __name__=='__main__':unittest.main()

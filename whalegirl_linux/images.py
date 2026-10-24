@@ -222,10 +222,22 @@ class ImageService:
             self.store.db.commit()
         self.sync_authority()
 
-    def candidates(self, query='', limit=12, *, chat='', character=False):
-        words = set(re.findall(r'[a-z0-9]+|[\u4e00-\u9fff]{2}', query.lower()))
+    def candidates(self, query='', limit=24, *, chat='', character=False):
+        q = query.lower()
+        for src, dst in (('碗粥', '挽昼'), ('瑞粥', '挽昼'), ('晚粥', '挽昼'), ('挽粥', '挽昼'), ('绝区', '绝区零')):
+            if src in q:
+                q += ' ' + dst
+        words = set(re.findall(r'[a-z0-9]+', q))
+        for seg in re.findall(r'[\u4e00-\u9fff]+', q):
+            for i in range(len(seg) - 1):
+                words.add(seg[i:i + 2])
+        stop_chars = set('的了呢啊呀吗吧有没在是发来给几张个图看片帮我你能把这那什怎么照相美脚色角')
+        chars = {c for c in re.findall(r'[\u4e00-\u9fff]', q) if c not in stop_chars}
         rows = [a for a in self.assets() if self.tools.allowed(a, chat) and (not character or a['character_id']==CHARACTER)]
-        rows.sort(key=lambda a: sum(w in (a['name']+a['description']+a['scenes']+a['prompt']).lower() for w in words), reverse=True)
+        def _score(a):
+            text = (a['name'] + a['description'] + a['scenes'] + a['prompt']).lower()
+            return sum(3 for w in words if w in text) + sum(1 for c in chars if c in text)
+        rows.sort(key=_score, reverse=True)
         return [{**{k:a[k] for k in ('id','source','name','character_id','character_variant')},
                  'description':a['description'][:180],'scenes':a['scenes'][:80]} for a in rows[:limit]]
 
