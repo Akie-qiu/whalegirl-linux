@@ -5,6 +5,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 import json
+import random
 import re
 import time
 import uuid
@@ -172,15 +173,216 @@ class MomentsService:
                     saved['active_' + kind] = time.time()
                 else:
                     saved.pop('active_' + kind, None)
+        if (previous.moments_publish_enabled != current.moments_publish_enabled or
+                previous.moments_publish_per_day != current.moments_publish_per_day or
+                previous.moments_start_hour != current.moments_start_hour or
+                previous.moments_end_hour != current.moments_end_hour):
+            saved.pop('publish_plan', None)
+            changed = True
         if changed or previous.moments_enabled != current.moments_enabled:
             saved['last_poll'] = 0
             self.book.save_state(current.account_id, saved)
 
+    def _active_intervals(self, s):
+        start, end = int(s.moments_start_hour), int(s.moments_end_hour)
+        if start == end:
+            return [(0.0, 86400.0)]
+        if start < end:
+            return [(start * 3600.0, end * 3600.0)]
+        intervals = []
+        if end > 0:
+            intervals.append((0.0, end * 3600.0))
+        if start < 24:
+            intervals.append((start * 3600.0, 86400.0))
+        return intervals or [(0.0, 86400.0)]
+
+    def _build_publish_plan(self, s, now=None):
+        now = time.time() if now is None else now
+        dt = datetime.fromtimestamp(now, TZ)
+        day = dt.strftime('%Y-%m-%d')
+        day_start = dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        per_day = max(0, int(s.moments_publish_per_day))
+        intervals = self._active_intervals(s)
+        total_active = sum(b - a for a, b in intervals)
+
+        def to_ts(offset):
+            rem = max(0.0, min(total_active, offset))
+            for a, b in intervals:
+                span = b - a
+                if rem <= span:
+                    return day_start + a + rem
+                rem -= span
+            return day_start + intervals[-1][1]
+
+        slots = []
+        if per_day > 0 and total_active > 0:
+            seg_len = total_active / per_day
+            split = intervals[0][1] - intervals[0][0] if len(intervals) > 1 else None
+            for i in range(per_day):
+                sub_start = i * seg_len
+                sub_end = (i + 1) * seg_len
+                if split is not None and sub_start < split < sub_end:
+                    if split - sub_start >= sub_end - split:
+                        sub_end = split
+                    else:
+                        sub_start = split
+                span = sub_end - sub_start
+                pad = span * 0.15
+                low_ts = to_ts(sub_start + pad)
+                high_ts = to_ts(sub_end - pad)
+                start_ts = to_ts(sub_start)
+                end_ts = to_ts(sub_end)
+                done = now >= end_ts
+                if not done and now > low_ts:
+                    tail_limit = end_ts - min(900.0, span * 0.15)
+                    if now + 60.0 < high_ts:
+                        low_ts = now + 60.0
+                    elif now + 60.0 < tail_limit:
+                        low_ts = now + 60.0
+                        high_ts = tail_limit
+                    else:
+                        done = True
+                target_ts = random.uniform(low_ts, max(low_ts, high_ts)) if not done else high_ts
+                slots.append({
+                    'index': i,
+                    'start': round(start_ts, 1),
+                    'end': round(end_ts, 1),
+                    'target': round(target_ts, 1),
+                    'attempts': 0,
+                    'done': done,
+                })
+        return {
+            'day': day,
+            'per_day': per_day,
+            'start_hour': int(s.moments_start_hour),
+            'end_hour': int(s.moments_end_hour),
+            'slots': slots,
+        }
+
+    def ensure_publish_plan(self, s, saved, now=None):
+        now = time.time() if now is None else now
+        dt = datetime.fromtimestamp(now, TZ)
+        day = dt.strftime('%Y-%m-%d')
+        since = dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        plan = saved.get('publish_plan')
+        per_day = max(0, int(s.moments_publish_per_day))
+        if (not isinstance(plan, dict) or plan.get('day') != day or
+                plan.get('per_day') != per_day or
+                plan.get('start_hour') != int(s.moments_start_hour) or
+                plan.get('end_hour') != int(s.moments_end_hour) or
+                not isinstance(plan.get('slots'), list) or len(plan['slots']) != per_day):
+            plan = self._build_publish_plan(s, now)
+            saved['publish_plan'] = plan
+
+        rows = self.runtime.store.db.execute('''SELECT source, state, created, updated, error FROM moments_actions
+            WHERE account=? AND kind='publish' AND (created>=? OR updated>=?)''',
+            (s.account_id, since, since)).fetchall() if s.account_id else []
+        occupied_states = ('sent', 'sending', 'uncertain', 'draft', 'generating', 'awaiting_image', 'image_failed')
+        active_times = [max(r['created'], r['updated']) for r in rows if r['state'] in occupied_states]
+        last_active_ts = max(active_times, default=0.0)
+
+        for slot in plan.get('slots', []):
+            if slot.get('done'):
+                continue
+            prefix = f"{day}/{slot['index']}"
+            for r in rows:
+                src = r['source'] or ''
+                is_slot_src = (src == prefix or src.startswith(prefix + '/'))
+                if r['state'] in occupied_states and (is_slot_src or slot['start'] <= r['created'] < slot['end']):
+                    slot['done'] = True
+                    break
+                if is_slot_src and r['state'] == 'skipped' and '无需发言' in (r['error'] or ''):
+                    slot['done'] = True
+                    break
+        return plan, last_active_ts
+
+    def due_publish_slot(self, s, saved, now=None):
+        now = time.time() if now is None else now
+        if not s.moments_enabled or not s.moments_publish_enabled or s.moments_publish_per_day <= 0:
+            return None
+        if self.book.count(s.account_id, 'publish', pending=True) >= s.moments_publish_per_day:
+            return None
+        plan, last_active_ts = self.ensure_publish_plan(s, saved, now)
+        slots = plan.get('slots', [])
+        for i, slot in enumerate(slots):
+            if slot.get('done'):
+                continue
+            next_start = slots[i + 1]['start'] if i + 1 < len(slots) else slot['end'] + 900.0
+            expiry = min(next_start, max(slot['end'], slot['target'] + 900.0))
+            if now >= expiry:
+                slot['done'] = True
+                continue
+            seg_len = max(1.0, slot['end'] - slot['start'])
+            min_gap = min(3600.0, seg_len * 0.35) if s.moments_publish_per_day > 1 else 0.0
+            effective_target = max(slot['target'], last_active_ts + min_gap if last_active_ts > 0 else 0.0)
+            if effective_target >= expiry:
+                slot['done'] = True
+                continue
+            if now >= effective_target:
+                return slot
+        return None
+
+    def next_publish_time(self, s, saved, now=None):
+        now = time.time() if now is None else now
+        if not s.moments_enabled or not s.moments_publish_enabled or s.moments_publish_per_day <= 0:
+            return None
+        if self.book.count(s.account_id, 'publish', pending=True) >= s.moments_publish_per_day:
+            return None
+        before = json.dumps(saved.get('publish_plan'), sort_keys=True) if 'publish_plan' in saved else ''
+        plan, last_active_ts = self.ensure_publish_plan(s, saved, now)
+        after = json.dumps(saved.get('publish_plan'), sort_keys=True)
+        if s.account_id and before != after:
+            self.book.save_state(s.account_id, saved)
+        slots = plan.get('slots', [])
+        for i, slot in enumerate(slots):
+            if slot.get('done'):
+                continue
+            next_start = slots[i + 1]['start'] if i + 1 < len(slots) else slot['end'] + 900.0
+            expiry = min(next_start, max(slot['end'], slot['target'] + 900.0))
+            if now >= expiry:
+                continue
+            seg_len = max(1.0, slot['end'] - slot['start'])
+            min_gap = min(3600.0, seg_len * 0.35) if s.moments_publish_per_day > 1 else 0.0
+            effective_target = max(slot['target'], last_active_ts + min_gap if last_active_ts > 0 else 0.0)
+            if effective_target < expiry:
+                return round(max(now, effective_target), 1)
+        return None
+
+    async def run_publish_slot(self, s, saved, slot, now=None):
+        now = time.time() if now is None else now
+        day = saved.get('publish_plan', {}).get('day') or datetime.fromtimestamp(now, TZ).strftime('%Y-%m-%d')
+        slot['attempts'] = int(slot.get('attempts', 0)) + 1
+        idx = slot['index']
+        source = f"{day}/{idx}" if slot['attempts'] == 1 else f"{day}/{idx}/r{slot['attempts']}"
+        row = None
+        try:
+            row = await self.generate('publish', source=source, auto_publish=s.moments_mode == 'auto')
+        finally:
+            occupied = ('sent', 'sending', 'uncertain', 'draft', 'generating', 'awaiting_image', 'image_failed')
+            if row and (row['state'] in occupied or (row['state'] == 'skipped' and '无需发言' in (row.get('error') or ''))):
+                slot['done'] = True
+            elif slot['attempts'] < 2:
+                retry_at = now + max(300.0, s.moments_poll_minutes * 60.0)
+                if retry_at < slot['end']:
+                    slot['target'] = round(retry_at, 1)
+                else:
+                    slot['done'] = True
+            else:
+                slot['done'] = True
+            if self.runtime.config.generation == getattr(self.runtime.config, 'generation', 0):
+                self.book.save_state(s.account_id, saved)
+        if row and row['state'] == 'draft' and s.moments_mode == 'auto' and not self.busy():
+            await self.send(row['id'])
+        return row
+
     def snapshot(self):
         s = self.runtime.config.settings
         account = s.account_id
+        saved = self.book.state(account) if account else {}
+        next_publish = self.next_publish_time(s, saved) if account else None
         return {'enabled': s.moments_enabled, 'mode': s.moments_mode, 'last_scan': self.last_scan,
                 'last_cache_scan': self.last_cache_scan, 'comment_poll_seconds': 30,
+                'next_publish_at': next_publish,
                 'error': self.error, 'capabilities': self.capabilities,
                 'uncertain': bool(self.runtime.store.db.execute(
                     "SELECT 1 FROM moments_actions WHERE account=? AND state='uncertain' LIMIT 1", (account,)).fetchone()),
@@ -463,7 +665,9 @@ class MomentsService:
         saved = self.book.state(s.account_id)
         generation = r.config.generation
         now = time.time()
+        due_slot = self.due_publish_slot(s, saved, now)
         refresh_due = now - saved.get('last_poll', 0) >= s.moments_poll_minutes * 60
+        result = {}
         if refresh_due:
             # Only the slower timeline refresh opens the native UI.
             saved['last_poll'] = now
@@ -472,7 +676,9 @@ class MomentsService:
             result = await self.scan()
         elif s.moments_reply_own_enabled:
             result = await self.scan_comments()
-        else:
+        elif due_slot is None:
+            if r.config.generation == generation:
+                self.book.save_state(s.account_id, saved)
             return
         events = []
         for post in result.get('posts', []):
@@ -511,12 +717,8 @@ class MomentsService:
                 attempted += 1
                 if row and row['state'] == 'draft' and s.moments_mode == 'auto' and not self.busy():
                     await self.send(row['id'])
-        if refresh_due and s.moments_publish_enabled and not self.busy() and self.book.count(s.account_id, 'publish', pending=True) < s.moments_publish_per_day:
-            day = datetime.now(TZ).strftime('%Y-%m-%d')
-            slot = self.book.count(s.account_id, 'publish', pending=True)
-            row = await self.generate('publish', source=day + '/' + str(slot), auto_publish=s.moments_mode == 'auto')
-            if row and row['state'] == 'draft' and s.moments_mode == 'auto' and not self.busy():
-                await self.send(row['id'])
+        if due_slot is not None and not self.busy():
+            await self.run_publish_slot(s, saved, due_slot, now)
         if r.config.generation == generation:
             self.book.save_state(s.account_id, saved)
 

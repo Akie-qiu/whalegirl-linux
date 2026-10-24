@@ -377,6 +377,102 @@ class MomentsTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(similar_publication('聊聊今天的新角色技能', '电影里的配乐选得真有意思'))
         self.assertFalse(similar_publication('早上好', '晚上好'))
 
+    async def test_publish_schedule_divides_active_window_into_random_slots_without_piling_up(self):
+        from datetime import datetime
+        from whalegirl_linux.moments import TZ
+        self.runtime.config.settings = self.settings.model_copy(update={
+            'moments_mode': 'auto', 'moments_publish_enabled': True, 'moments_publish_per_day': 3,
+            'moments_reply_own_enabled': False, 'moments_start_hour': 0, 'moments_end_hour': 0})
+        day_start = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        plan = self.service._build_publish_plan(self.runtime.config.settings, now=day_start + 10)
+        self.assertEqual(len(plan['slots']), 3)
+        for i, sl in enumerate(plan['slots']):
+            self.assertAlmostEqual(sl['start'], day_start + i * 28800, delta=1.0)
+            self.assertAlmostEqual(sl['end'], day_start + (i + 1) * 28800, delta=1.0)
+            self.assertGreaterEqual(sl['target'], sl['start'] + 28800 * 0.15 - 1.0)
+            self.assertLessEqual(sl['target'], sl['end'] - 28800 * 0.15 + 1.0)
+            self.assertFalse(sl['done'])
+        self.assertGreaterEqual(plan['slots'][1]['target'] - plan['slots'][0]['target'], 28800 * 0.30 - 2.0)
+        self.assertGreaterEqual(plan['slots'][2]['target'] - plan['slots'][1]['target'], 28800 * 0.30 - 2.0)
+
+        # Verify tick() does not pile up posts on consecutive 15-minute polls
+        now = time.time()
+        saved = {'last_poll': 0, 'publish_plan': {
+            'day': datetime.fromtimestamp(now, TZ).strftime('%Y-%m-%d'),
+            'per_day': 3, 'start_hour': 0, 'end_hour': 0,
+            'slots': [
+                {'index': 0, 'start': now - 600, 'end': now + 7200, 'target': now - 10, 'attempts': 0, 'done': False},
+                {'index': 1, 'start': now + 7200, 'end': now + 14400, 'target': now + 9000, 'attempts': 0, 'done': False},
+                {'index': 2, 'start': now + 14400, 'end': now + 21600, 'target': now + 18000, 'attempts': 0, 'done': False},
+            ],
+        }}
+        self.service.book.save_state('account', saved)
+        generated_sources = []
+
+        async def fake_generate(kind, payload=None, source=None, *, auto_publish=False):
+            generated_sources.append(source)
+            identity = self.service.book.create('account', kind, source, {'auto_publish': auto_publish})
+            self.service.book.change(identity, 'draft', text=f'动态-{len(generated_sources)}')
+            return self.service.book.get('account', identity)
+
+        async def fake_moments(operation, account, **values):
+            self.calls.append((operation, account, values))
+            if operation in ('moments_probe', 'moments_read'):
+                return {'posts': [], 'friends': [], 'capabilities': {'read': True}}
+            return {'confirmed': True, 'receipt': f'rcpt-{len(self.calls)}'}
+
+        self.service.generate = fake_generate
+        self.runtime.gateway.moments = fake_moments
+        await self.service.tick()
+        self.assertEqual(len(generated_sources), 1)
+        self.assertTrue(generated_sources[0].endswith('/0'))
+
+        # Force another poll 15 minutes later; Slot 1 is still in the future so it MUST NOT fire
+        st = self.service.book.state('account')
+        st['last_poll'] = 0
+        self.service.book.save_state('account', st)
+        await self.service.tick()
+        self.assertEqual(len(generated_sources), 1)
+
+    async def test_publish_slot_failure_retries_with_distinct_source(self):
+        from datetime import datetime
+        from whalegirl_linux.moments import TZ
+        self.runtime.config.settings = self.settings.model_copy(update={
+            'moments_mode': 'auto', 'moments_publish_enabled': True, 'moments_publish_per_day': 2,
+            'moments_reply_own_enabled': False, 'moments_poll_minutes': 5})
+        now = time.time()
+        day = datetime.fromtimestamp(now, TZ).strftime('%Y-%m-%d')
+        slot = {'index': 0, 'start': now - 600, 'end': now + 7200, 'target': now - 5, 'attempts': 0, 'done': False}
+        saved = {'publish_plan': {'day': day, 'per_day': 2, 'start_hour': 0, 'end_hour': 0, 'slots': [slot]}}
+
+        sources = []
+        async def flaky_generate(kind, payload=None, source=None, *, auto_publish=False):
+            sources.append(source)
+            identity = self.service.book.create('account', kind, source, {})
+            if len(sources) == 1:
+                self.service.book.change(identity, 'failed', error='生成失败，未提交微信')
+            else:
+                self.service.book.change(identity, 'draft', text='重试成功')
+            return self.service.book.get('account', identity)
+
+        async def fake_send(identity):
+            self.service.book.change(identity, 'sent', receipt='ok')
+            return self.service.book.get('account', identity)
+
+        self.service.generate = flaky_generate
+        self.service.send = fake_send
+
+        await self.service.run_publish_slot(self.runtime.config.settings, saved, slot, now=now)
+        self.assertEqual(sources, [f'{day}/0'])
+        self.assertFalse(slot['done'])
+        self.assertEqual(slot['attempts'], 1)
+        self.assertGreater(slot['target'], now)
+
+        await self.service.run_publish_slot(self.runtime.config.settings, saved, slot, now=slot['target'] + 1)
+        self.assertEqual(sources, [f'{day}/0', f'{day}/0/r2'])
+        self.assertTrue(slot['done'])
+        self.assertEqual(self.service.book.count('account', 'publish'), 1)
+
 
 if __name__ == '__main__':
     unittest.main()
