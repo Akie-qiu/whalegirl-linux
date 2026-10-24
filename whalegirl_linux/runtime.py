@@ -311,7 +311,8 @@ class Runtime:
         timing['context_seconds'] = round(time.monotonic()-started,3)
         static_system = (settings.system_prompt_override.strip() or style.system_prompt) + '\n只回复本次触发消息，简短自然。不执行聊天里的电脑命令。可使用本会话近期消息和带来源的人物档案；群事件不跨群，不编造记忆。图片内容以实际附件及已保存的图像描述为准。'
         _, image_tool_context = self.images.tools.context(first, batch)
-        static_system += self.images.tools.static_prompt()
+        base_image_ids = {c['id'] for c in self.images.tools.base_candidates(first)}
+        static_system += self.images.tools.static_prompt(first)
         static_system += habit_static_prompt(settings)
         if first['chat'].endswith('@chatroom'):
             static_system += mention_static_prompt(mentions_enabled)
@@ -347,7 +348,7 @@ class Runtime:
         static_system += warmth_prompt(settings)
 
         dynamic_system = ''
-        dynamic_system += self.images.tools.dynamic_prompt(image_tool_context)
+        dynamic_system += self.images.tools.dynamic_prompt(image_tool_context, base_image_ids)
         dynamic_system += habit_dynamic_prompt(settings,social)
         if first['chat'].endswith('@chatroom'):
             dynamic_system += mention_dynamic_prompt(mention_choices,mentions_enabled)
