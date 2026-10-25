@@ -29,6 +29,12 @@ class TiebaRetention:
     def execute(self, sql, args=()):
         return self.service.execute(sql, args)
 
+    def _invalidate(self, reason, *, source=False, memes=False):
+        """Notify the local tool caches after lifecycle state changes."""
+        tools = getattr(self.service, 'tools', None)
+        if tools is not None:
+            tools.invalidate(reason, source=source, memes=memes)
+
     def add(self, tid, created=None):
         self.execute('INSERT OR IGNORE INTO tieba_lifecycle(account,tid,created) VALUES(?,?,?)',
                      (self.config.settings.account_id, str(tid), time.time() if created is None else created))
@@ -63,6 +69,9 @@ class TiebaRetention:
             raise ValueError('未知收藏操作')
         fields = 'pinned=1,trashed_at=0' if op == 'pin' else 'pinned=0' if op == 'unpin' else 'trashed_at=0,last_used='+str(time.time())
         self.execute('UPDATE tieba_lifecycle SET '+fields+' WHERE account=? AND tid=?', (row['account'], tid))
+        # Pin/unpin/restore changes lifecycle filters, but the source payload is
+        # unchanged; preserve hot source/read entries and refresh filtered views.
+        self._invalidate('retention_edit', memes=True)
         return {'ok': True}
 
     def candidates(self, now=None):
@@ -107,6 +116,10 @@ class TiebaRetention:
                              (now, row['account'], row['tid']))
                 self.execute('INSERT INTO tieba_cleanup_log(created,account,tid,operation) VALUES(?,?,?,?)',
                              (now, row['account'], row['tid'], 'trash'))
+                # A trashed source must not remain reachable through any cached
+                # source/read result. This is infrequent maintenance, so a full
+                # source-side invalidation is preferable to stale data.
+                self._invalidate('retention_trash', source=True, memes=True)
                 continue
             # Review the complete exact file list before deleting any bytes. Unknown files block cleanup.
             try:
@@ -134,6 +147,7 @@ class TiebaRetention:
                 db.execute('INSERT INTO tieba_cleanup_log(created,account,tid,operation,files,bytes) VALUES(?,?,?,?,?,?)',
                            (now, *args, 'purged', len(files), size))
                 db.commit()
+                self._invalidate('retention_purge', source=True, memes=True)
 
     def snapshot(self):
         account = self.config.settings.account_id

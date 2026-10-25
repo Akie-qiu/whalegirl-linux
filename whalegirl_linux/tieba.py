@@ -321,7 +321,25 @@ class TiebaService:
         with self.store.lock:
             cur = self.store.db.execute(sql, args)
             self.store.db.commit()
-            return cur
+        # Keep process-local tool caches correct even when a maintenance path
+        # updates the SQLite tables directly through this service helper.  The
+        # normal mutation methods already invalidate explicitly; this small
+        # table-aware safety net mainly covers admin SQL and recovery scripts.
+        tools = getattr(self, 'tools', None)
+        if tools is not None:
+            statement = sql.lstrip().lower()
+            if statement.startswith(('insert', 'update', 'delete', 'replace')):
+                if 'tieba_memes' in statement or 'tieba_meme_details' in statement:
+                    tools.invalidate('sql_meme_update', memes=True)
+                elif 'tieba_meme_usage' in statement:
+                    tools.invalidate('sql_usage_update', usage=True)
+                elif 'tieba_lifecycle' in statement:
+                    tools.invalidate('sql_lifecycle_update', source=True, memes=True)
+                elif any(name in statement for name in ('tieba_archives', 'tieba_posts', 'tieba_post_quotes')):
+                    tools.invalidate('sql_source_update', source=True)
+                elif 'tieba_search_docs' in statement:
+                    tools.invalidate('sql_search_update', search=True)
+        return cur
 
     def next_at(self):
         row = self.store.db.execute('SELECT next_at FROM tieba_state WHERE account=?',
@@ -519,6 +537,7 @@ class TiebaService:
         if self.store.db.execute('SELECT count(*) FROM tieba_memes WHERE account=? AND enabled=1 AND expires_at>?',
                                  (account, time.time())).fetchone()[0] >= 300:
             return
+        added = False
         for meme in memes[:2]:
             if not isinstance(meme, dict):
                 continue
@@ -532,16 +551,21 @@ class TiebaService:
                     WHERE m.account=? AND m.tid=? AND s.phrase=?''', (account, thread['tid'], phrase)).fetchone():
                 continue  # Re-screening must preserve administrator edits and disabled entries.
             identity = uuid.uuid4().hex
-            self.execute('''INSERT OR IGNORE INTO tieba_memes
+            cur = self.execute('''INSERT OR IGNORE INTO tieba_memes
                          (id,account,tid,phrase,meaning,scene,source_url,created,expires_at,enabled)
                          VALUES(?,?,?,?,?,?,?,?,?,1)''',
                          (identity, account, thread['tid'], phrase, meaning, scene, thread['url'],
                           time.time(), time.time() + self.config.settings.tieba_memes_ttl_days * 86400))
+            if not cur.rowcount:
+                continue
+            added = True
             self.execute('INSERT OR IGNORE INTO tieba_meme_details VALUES(?,?,?,?,?)',
                          (identity, *(str(meme.get(k) or '').strip()[:cap] for k, cap in
                           [('background', 800), ('examples', 600), ('avoid', 400), ('aliases', 300)])))
             self.execute('''INSERT OR IGNORE INTO tieba_meme_sources SELECT id,phrase FROM tieba_memes
                             WHERE account=? AND tid=? AND phrase=?''', (account, thread['tid'], phrase))
+        if added:
+            self.tools.invalidate('learn', memes=True)
 
     async def collect_image(self, account, thread, picture):
         s = self.config.settings
@@ -819,6 +843,7 @@ class TiebaService:
             except sqlite3.IntegrityError:
                 self.store.db.rollback()
                 raise ValueError('同一来源已有这个说法，请编辑已有记录')
+            self.tools.invalidate('meme_edit', memes=True)
         elif kind == 'shares':
             row = self.store.db.execute('SELECT * FROM tieba_shares WHERE id=? AND account=?', (identity, account)).fetchone()
             if not row:
@@ -912,7 +937,8 @@ class TiebaService:
                 'archives': self.archives.summaries(), 'archive_stats': self.archives.stats(),
                 'memes': memes, 'pictures': pictures,
                 'shares': rows('tieba_shares', 'created DESC', 30), 'sent_today': self.share_count(account),
-                'tools': self.tools.events(), 'retention': self.retention.snapshot(),
+                'tools': self.tools.events(), 'tool_cache': self.tools.cache_snapshot(),
+                'retention': self.retention.snapshot(),
                 'memory_pressure': native_pressure(self.config), 'context_busy': self.context_busy}
 
     async def browse_loop(self):

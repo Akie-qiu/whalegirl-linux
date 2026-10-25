@@ -143,8 +143,8 @@ class TiebaArchive:
             path = directory / name
             path.write_bytes(data)
             path.chmod(0o600)
-        self.execute('UPDATE tieba_archives SET payload=?,title=?,text_bytes=? WHERE id=?',
-                     (json.dumps(source, ensure_ascii=False), source['title'], len(raw) + len(text), row['id']))
+        self.execute('UPDATE tieba_archives SET payload=?,title=?,text_bytes=?,updated=? WHERE id=?',
+                     (json.dumps(source, ensure_ascii=False), source['title'], len(raw) + len(text), time.time(), row['id']))
         self.service.tools.index(source)
         for image in source.get('images', []):
             self.execute('''INSERT OR IGNORE INTO tieba_archive_images
