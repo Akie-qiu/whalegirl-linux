@@ -51,8 +51,8 @@ run(['mkswap', str(swap)])
 run(['swapon', str(swap)])
 with Path('/etc/fstab').open('a') as stream:
     stream.write('\n# WhaleGirl dedicated swap, ' + STAMP + '\n' + str(swap) + ' none swap sw 0 0\n')
-run(['docker', 'update', '--memory', '1g', '--memory-swap', '2g', '--pids-limit', '1024', NAME])
-print(json.dumps({'phase': 'resource_headroom_added', 'swap_gib': 2, 'memory_mib': 1024, 'memory_plus_swap_mib': 2048}), flush=True)
+run(['docker', 'update', '--memory', '1280m', '--memory-swap', '2560m', '--pids-limit', '1024', NAME])
+print(json.dumps({'phase': 'resource_headroom_added', 'swap_gib': 2, 'memory_mib': 1280, 'memory_plus_swap_mib': 2560}), flush=True)
 
 previous = NAME + '-before-stability-' + STAMP
 run(['systemctl', 'stop', 'whalegirl-linux.service', 'whalegirl-native-reader.service'])
@@ -69,7 +69,7 @@ run(['docker', 'stop', '--time', '20', NAME])
 run(['docker', 'rename', NAME, previous])
 
 argv = ['docker', 'create', '--name', NAME, '--init', '--restart', 'unless-stopped',
-        '--no-healthcheck', '--memory', '1g', '--memory-swap', '2g', '--cpus', '1',
+        '--no-healthcheck', '--memory', '1280m', '--memory-swap', '2560m', '--cpus', '1',
         '--pids-limit', '1024', '--shm-size', str(info['HostConfig']['ShmSize']),
         '--hostname', info['Config']['Hostname']]
 if info['HostConfig']['ReadonlyRootfs']:
@@ -158,7 +158,7 @@ run(['systemctl', 'start', 'whalegirl-native-reader.service', 'whalegirl-linux.s
 run(['systemctl', 'enable', '--now', 'whalegirl-stability.timer'])
 report = {'at': time.time(), 'container': NAME, 'previous_container': previous,
           'image_id': info['Image'], 'wechat_version': '4.1.1.8', 'init': True,
-          'memory_mib': 1024, 'memory_plus_swap_mib': 2048, 'pids_limit': 1024,
+          'memory_mib': 1280, 'memory_plus_swap_mib': 2560, 'pids_limit': 1024,
           'added_host_swap_gib': 2, 'backup': str(BACKUP), 'observation_path': str(OBSERVE)}
 (OBSERVE / 'deployment.json').write_text(json.dumps(report, indent=2))
 (STAGE / 'deployed.json').write_text(json.dumps(report, indent=2))

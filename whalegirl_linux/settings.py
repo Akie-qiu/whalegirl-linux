@@ -47,6 +47,9 @@ class Settings(BaseModel):
     sticker_after_text: Literal['off','normal','high'] = 'high'
     sticker_pair_probability: int = Field(default=90, ge=0, le=100)
     api_url: str = "https://api.deepseek.com/chat/completions"
+    api_style: Literal['auto', 'openai', 'responses', 'anthropic'] = 'auto'
+    reasoning_effort: Literal['default', 'low', 'medium', 'high'] = 'default'
+    model_stream_enabled: bool = False
     model: str = Field(default="deepseek-chat", min_length=1, max_length=100)
     max_tokens: int = Field(default=220, ge=32, le=1200)
     history_pairs: int = Field(default=5, ge=0, le=15)
@@ -101,6 +104,21 @@ class Settings(BaseModel):
     interest_keywords: list[str] = Field(default_factory=lambda: ['游戏','八卦','表情包'], max_length=30)
     quiet_start_hour: int = Field(default=1, ge=0, le=23)
     quiet_end_hour: int = Field(default=8, ge=0, le=23)
+    proactive_enabled: bool = False
+    proactive_private_enabled: bool = False
+    proactive_chat_ids: list[str] = Field(default_factory=list, max_length=100)
+    proactive_strict_chat_ids: list[str] = Field(default_factory=list, max_length=100)
+    proactive_mentions_enabled: bool = False
+    proactive_level: Literal['quiet', 'balanced', 'active'] = 'balanced'
+    proactive_per_day: int = Field(default=12, ge=0, le=100)
+    proactive_chat_per_day: int = Field(default=0, ge=0, le=100)
+    proactive_cooldown_minutes: int = Field(default=0, ge=0, le=1440)
+    proactive_decision_minutes: int = Field(default=5, ge=3, le=180)
+    proactive_idle_minutes: int = Field(default=0, ge=0, le=180)
+    proactive_start_hour: int = Field(default=9, ge=0, le=23)
+    proactive_end_hour: int = Field(default=23, ge=0, le=23)
+    proactive_continuation_minutes: int = Field(default=10, ge=1, le=30)
+    proactive_pause_hours: int = Field(default=24, ge=1, le=168)
     repeat_probability: float = Field(default=0.4, ge=0, le=1)
     editable_memory_enabled: bool = True
     web_search_enabled: bool = False
@@ -133,6 +151,9 @@ class Settings(BaseModel):
     image_size: str = Field(default='1024x1024', pattern=r'^(auto|[0-9]{3,4}x[0-9]{3,4})$')
     image_timeout: int = Field(default=300, ge=120, le=600)
     image_per_day: int = Field(default=10, ge=0, le=100)
+    image_retention_uploaded_days: int = Field(default=0, ge=0, le=3650)
+    image_retention_generated_days: int = Field(default=0, ge=0, le=3650)
+    image_retention_tieba_days: int = Field(default=0, ge=0, le=3650)
     image_references_enabled: bool = True
     image_character_variant: Literal['chibi', 'girl', 'mature'] = 'girl'
     image_character_identity: str = Field(default='大肥鱼，蓝发蓝眼的鲸鱼主题二次元角色，蓝色长发带浅蓝渐变、呆毛和鲸尾。三套外观是同一个自己，人格沿用当前人设。蓝发、蓝眼和鲸鱼特征是身份特征；服装、表情、动作和场景可按本次要求变化。', max_length=1600)
@@ -151,6 +172,13 @@ class Settings(BaseModel):
     tieba_interest_sensitivity: int = Field(default=70, ge=0, le=100)
     tieba_interval_minutes: int = Field(default=30, ge=10, le=1440)
     tieba_share_enabled: bool = True
+    tieba_discovery_share_enabled: bool = True
+    tieba_context_share_enabled: bool = True
+    tieba_meme_eagerness: int = Field(default=80, ge=0, le=100)
+    tieba_recall_eagerness: int = Field(default=80, ge=0, le=100)
+    tieba_share_eagerness: int = Field(default=65, ge=0, le=100)
+    tieba_unused_days: int = Field(default=30, ge=0, le=3650)
+    tieba_trash_days: int = Field(default=7, ge=1, le=90)
     tieba_share_chat_ids: list[str] = Field(default_factory=list, max_length=20)
     tieba_share_per_day: int = Field(default=3, ge=0, le=30)
     tieba_share_cooldown_minutes: int = Field(default=120, ge=10, le=1440)
@@ -167,7 +195,8 @@ class Settings(BaseModel):
     expected_wechat_version: Literal["4.1.0.16", "4.1.1.8"] = "4.1.0.16"
 
     @field_validator("allowed_chat_ids", "keywords", "trigger_only_chat_ids", "interest_keywords", "moments_topics", "moments_friend_ids",
-                     "tieba_forums", "tieba_interests", "tieba_share_chat_ids")
+                     "tieba_forums", "tieba_interests", "tieba_share_chat_ids",
+                     "proactive_chat_ids", "proactive_strict_chat_ids")
     @classmethod
     def clean_strings(cls, values):
         if any(not v.strip() or len(v) > 200 for v in values):

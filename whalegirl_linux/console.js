@@ -64,6 +64,9 @@ function populateSettings() {
   $('vision-enabled').checked = cfg.vision_enabled;
   $('context-count').value = cfg.context_messages;
   $('api-url').value = cfg.api_url; $('model').value = cfg.model;
+  $('api-style').value = cfg.api_style || 'auto';
+  $('reasoning-effort').value = cfg.reasoning_effort || 'default';
+  $('model-stream-enabled').checked = cfg.model_stream_enabled ?? false;
   syncModelPreset();
   $('max-tokens').value = cfg.max_tokens;
   $('cooldown').value = cfg.chat_cooldown; $('send-interval').value = cfg.min_send_interval;
@@ -84,30 +87,41 @@ function populateSettings() {
   window.moments?.populate();
   window.pictureLibrary?.populate();
   window.tieba?.populate();
+  window.proactiveChat?.populate();
   window.tokenUsage?.refresh();
 }
 const MODEL_PRESETS = {
-  flash: { url: 'https://api.deepseek.com/chat/completions', model: 'deepseek-flash' },
-  pro: { url: 'https://api.deepseek.com/chat/completions', model: 'deepseek-v4-pro' }
+  flash: { url: 'https://api.deepseek.com/chat/completions', model: 'deepseek-flash', style: 'openai' },
+  pro: { url: 'https://api.deepseek.com/chat/completions', model: 'deepseek-v4-pro', style: 'openai' }
 };
 function syncModelPreset(force = '') {
   const url=$('api-url').value.trim().replace(/\/$/,'');
   const model=$('model').value.trim();
+  const style=$('api-style').value;
+  const responses=style==='responses'||(style==='auto'&&/\/responses$/i.test(url));
   const match=Object.entries(MODEL_PRESETS).find(([,preset])=>preset.url===url&&preset.model===model);
-  const active=force||match?.[0]||'custom';
+  const active=force||(responses?'responses':match?.[0])||'custom';
   for(const button of document.querySelectorAll('[data-model-preset]'))
     button.setAttribute('aria-pressed',String(button.dataset.modelPreset===active));
+  text('api-style-hint',responses?
+    '使用 Responses 协议；支持 /responses 完整地址或 /v1 基础地址。Token 上限包含推理消耗，过低时可能没有正文。':
+    '自动识别会根据地址选择协议；中转站需提供对应接口。切换在保存后生效。');
 }
 for (const button of document.querySelectorAll('[data-model-preset]')) {
   button.addEventListener('click', () => {
     const name=button.dataset.modelPreset,preset=MODEL_PRESETS[name];
-    if(preset){$('api-url').value=preset.url;$('model').value=preset.model;}
+    if(preset){$('api-url').value=preset.url;$('model').value=preset.model;$('api-style').value=preset.style;$('reasoning-effort').value='default';}
+    if(name==='responses'){
+      $('api-style').value='responses';
+      $('api-url').value=$('api-url').value.trim().replace(/\/(?:chat\/completions|messages)\/?$/i,'/responses');
+    }
+    if(name==='custom')$('api-style').value='auto';
     syncModelPreset(name);
     text('test-result','有未保存的模型修改，点击“保存模型”后生效');
     if(name==='custom')$('model').focus();
   });
 }
-for (const id of ['api-url','model']) $(id).addEventListener('input', () => {
+for (const id of ['api-url','model','api-style','reasoning-effort','model-stream-enabled']) $(id).addEventListener('input', () => {
   syncModelPreset();
   text('test-result','有未保存的模型修改，点击“保存模型”后生效');
 });
@@ -155,6 +169,7 @@ async function refreshChats(silent = false) {
     window.stickerLibrary?.refreshChatLabels();
     window.moments?.refreshChatLabels();
     window.pictureLibrary?.refreshChats();
+    window.proactiveChat?.chatLabels();
       window.tieba?.refreshChatLabels();
     if (!silent) notice('会话列表已更新。');
   } catch (error) { renderChats(); if (!silent) throw error; }
@@ -208,6 +223,7 @@ function renderState(s) {
   if (window.habits) window.habits.stateUpdated(s);
   window.affection?.stateUpdated(s);
   window.stickerLibrary?.stateUpdated(s);
+  window.proactiveChat?.refresh().catch(() => {});
   renderSafety(s.safety);
   const online = s.gateway.status === 'logged_in';
   const login = s.login || {};
@@ -360,7 +376,8 @@ $('save-chats').onclick = () => action($('save-chats'), async () => {
   text('chat-save-note', '会话设置已保存 · ' + new Date().toLocaleTimeString('zh-CN')); notice('会话与唤醒设置已保存。');
 });
 $('save-model').onclick = () => action($('save-model'), async () => {
-  await saveSubset({ api_url: $('api-url').value.trim(), model: $('model').value.trim(), max_tokens: Number($('max-tokens').value) }, $('api-key').value.trim());
+  await saveSubset({ api_url: $('api-url').value.trim(), api_style: $('api-style').value, model: $('model').value.trim(), max_tokens: Number($('max-tokens').value),
+    reasoning_effort: $('reasoning-effort').value, model_stream_enabled: $('model-stream-enabled').checked }, $('api-key').value.trim());
   syncModelPreset();text('test-result','模型设置已保存');
   $('api-key').value = ''; text('key-status', cfg.api_key_configured ? '服务器已保存 API Key；留空不会覆盖。' : '尚未配置 API Key。'); notice('模型设置已保存。');
 });
@@ -379,7 +396,15 @@ $('safety-check').onclick = () => action($('safety-check'), async () => { const 
 $('safety-resume').onclick = () => action($('safety-resume'), async () => { await api('safety/resume','POST');await update();notice('已恢复发送；历史跳过消息不会补发，现有发送限额继续生效。'); });
 $('quick-enabled').onchange = () => action($('quick-enabled'), async () => { try { await saveSubset({ enabled: $('quick-enabled').checked }); notice(cfg.enabled ? '自动回复已开启。' : '自动回复已关闭。'); } catch (error) { $('quick-enabled').checked = cfg.enabled; throw error; } });
 $('quick-affection-enabled')?.addEventListener('change',event=>window.affection?.toggle(event.currentTarget));
-$('test-model').onclick = () => action($('test-model'), async () => { text('test-result', '正在测试已保存的模型…'); const result = await api('model/test', 'POST'); text('test-result', result.message); if (!result.ok) throw new Error(result.message); });
+$('test-model').onclick = () => action($('test-model'), async () => {
+  text('test-result', '正在测试已保存的模型…');
+  const result = await api('model/test', 'POST');
+  const effort = {default:'服务商默认强度',low:'低强度',medium:'中强度',high:'高强度'}[result.reasoning_effort];
+  const detail = [result.stream_enabled == null ? '' : result.stream_enabled ? '流式' : '非流式', effort,
+    result.elapsed_ms == null ? '' : (result.elapsed_ms / 1000).toFixed(1) + ' 秒'].filter(Boolean).join(' · ');
+  text('test-result', result.message + (detail ? '（' + detail + '）' : ''));
+  if (!result.ok) throw new Error(result.message);
+});
 $('login').onclick = () => action($('login'), async () => { text('login-message', '正在请求微信二维码，请稍候…'); await api('gateway/login', 'POST'); await update(); notice('登录请求已提交，请按页面提示在手机确认。'); });
 for (const link of document.querySelectorAll('nav a')) link.onclick = () => { for (const item of document.querySelectorAll('nav a')) item.classList.toggle('active', item === link); };
 if (token) connect().catch(error => { text('auth-error', error.message); $('auth').hidden = false; $('dashboard').hidden = true; });
@@ -391,7 +416,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const groups=[
     ['connection','连接与会话',['#login-panel','#chats','#send-limits-panel','#safety-panel']],
     ['persona','角色与记忆',['#persona','#habits-panel','#category-limits-panel','#memory-panel','#affection-panel']],
-    ['interaction','互动与内容',['#sticker-library-panel','#images-panel','#moments-panel','#tieba-panel']],
+    ['interaction','互动与内容',['#proactive-panel','#sticker-library-panel','#images-panel','#moments-panel','#tieba-panel']],
     ['model','模型与用量',['#model-panel','#web-search-panel','#token-usage-panel']],
     ['activity','日志与记录',['#stability-panel','#records-panel','#inbox-panel']]
   ];

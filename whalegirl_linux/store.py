@@ -83,7 +83,7 @@ class Store:
         self.db.execute("UPDATE inbox SET state='queued',error='' WHERE state='generating'")
         self.db.commit()
 
-    def observe(self, events):
+    def observe(self, events, *, commit=True):
         events=[{'payload_json':'{}',**event} for event in events]
         with self.lock:
             self.db.executemany("""INSERT INTO message_log
@@ -95,7 +95,21 @@ class Store:
                 WHERE message_log.content!=excluded.content OR message_log.sender_id!=excluded.sender_id
                 OR message_log.sender!=excluded.sender OR message_log.is_self!=excluded.is_self
                 OR message_log.payload_json!=excluded.payload_json""", events)
-            self.db.commit()
+            if commit:
+                self.db.commit()
+
+    def ingest_poll(self, account, chat, entries, cursor, *, baseline=False):
+        """Commit inbox, context and live cursor together, once per chat batch."""
+        inserted = []
+        with self.lock, self.db:
+            for event, state in entries:
+                if self.insert(event, state, commit=False):
+                    inserted.append(event)
+            self.observe([event for event, _ in entries], commit=False)
+            self.save_poll_cursor(account, chat, cursor, commit=False)
+            if baseline:
+                self.db.execute("INSERT OR IGNORE INTO baselines VALUES(?,?)", (account, chat))
+        return inserted
 
     def archived(self, account, chat):
         return bool(self.db.execute("SELECT 1 FROM archives WHERE account=? AND chat=?", (account, chat)).fetchone())
@@ -130,7 +144,7 @@ class Store:
                               'ORDER BY timestamp DESC,local_id DESC LIMIT 1', (account, chat)).fetchone()
         return (float(row[0]), int(row[1] or 0)) if row else None
 
-    def save_poll_cursor(self, account, chat, cursor):
+    def save_poll_cursor(self, account, chat, cursor, *, commit=True):
         if cursor is None:
             return
         with self.lock:
@@ -138,9 +152,10 @@ class Store:
                 ON CONFLICT(account,chat) DO UPDATE SET after_time=excluded.after_time,
                 after_id=excluded.after_id,updated=excluded.updated
                 WHERE excluded.after_time>poll_progress.after_time OR
-                (excluded.after_time=poll_progress.after_time AND excluded.after_id>=poll_progress.after_id)''',
+                (excluded.after_time=poll_progress.after_time AND excluded.after_id>poll_progress.after_id)''',
                 (account, chat, cursor[0], cursor[1], time.time()))
-            self.db.commit()
+            if commit:
+                self.db.commit()
 
     def received(self, account, allowed, chat='', query='', before_time=None, before_id=0, before_key='', limit=50):
         scope=[chat] if chat and chat in allowed else allowed if not chat else []
@@ -237,7 +252,7 @@ class Store:
                 'image_descriptions':self.db.execute("SELECT count(*) FROM message_log WHERE description!=''").fetchone()[0],
                 'archived_chats':self.db.execute('SELECT count(*) FROM archives').fetchone()[0]}
 
-    def insert(self, event: dict, state="queued"):
+    def insert(self, event: dict, state="queued", *, commit=True):
         with self.lock:
             existing = self.db.execute('SELECT * FROM inbox WHERE key=? OR '
                 '(account=? AND chat=? AND local_id=? AND local_id>0) LIMIT 1',
@@ -255,13 +270,15 @@ class Store:
                         (event['content'],event['sender'],event.get('sender_id') or existing['sender_id'],payload,
                          event.get('trigger',''), 'queued' if retry else existing['state'],
                          '' if retry else existing['error'],time.time() if retry else existing['updated'],existing['key']))
-                    self.db.commit()
+                    if commit:
+                        self.db.commit()
                 return bool(retry)
             cursor = self.db.execute(
                 "INSERT OR IGNORE INTO inbox(key,account,chat,sender,content,timestamp,state,updated,local_id,sender_id,trigger,payload_json,error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (event["key"], event["account"], event["chat"], event["sender"], event["content"], event["timestamp"], state, time.time(),event.get('local_id'),event.get('sender_id',''),event.get('trigger',''),event.get('payload_json','{}'),event.get('read_reason','')[:300]),
             )
-            self.db.commit()
+            if commit:
+                self.db.commit()
             return cursor.rowcount == 1
 
     def cached_image(self,key):
@@ -332,7 +349,8 @@ class Store:
 
     def remember(self, event, reply):
         with self.lock:
-            for role, content in [("user", event["content"]), ("assistant", reply)]:
+            turns = [("assistant", reply)] if event.get('trigger') in ('proactive', 'tieba_context') else [("user", event["content"]), ("assistant", reply)]
+            for role, content in turns:
                 self.db.execute("INSERT INTO history(account,chat,role,content) VALUES(?,?,?,?)",
                                 (event["account"], event["chat"], role, content))
             self.db.commit()

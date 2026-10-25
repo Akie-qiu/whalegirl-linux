@@ -110,7 +110,7 @@ def start():
         "--init", "--restart", "unless-stopped", "--no-healthcheck", "--read-only",
         "--tmpfs", "/tmp:rw,nosuid,nodev,size=128m,mode=1777", "--tmpfs", "/run:rw,nosuid,nodev,size=32m",
         "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_PTRACE",
-        "--memory", "1g", "--memory-swap", "2g", "--cpus", "1", "--pids-limit", "1024", "--shm-size", "128m",
+        "--memory", "1280m", "--memory-swap", "2560m", "--cpus", "1", "--pids-limit", "1024", "--shm-size", "128m",
         "--publish", f"127.0.0.1:{SPEC['host_port']}:6174",
         "--mount", f"type=bind,src={DATA / 'gateway'},dst=/data",
         "--mount", f"type=bind,src={DATA / 'home'},dst=/home/wechat",

@@ -1,4 +1,5 @@
 """Regressions for archive/live-reader races and delayed native commits."""
+import asyncio
 import importlib.util
 import json
 from pathlib import Path
@@ -129,6 +130,83 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.runtime.poll_once()
         self.assertEqual(self.store.stats().get('sent'), 1)
         self.assertIsNone(self.store.queue())
+
+    async def test_ready_chat_is_committed_before_slow_chat_finishes(self):
+        self.config.save(self.config.settings.model_copy(update={
+            'allowed_chat_ids': ['slow@chatroom', 'test@chatroom']}))
+        for chat in self.config.settings.allowed_chat_ids:
+            old = Runtime.event('account', chat, self.raw(1, 100))
+            self.store.ingest_poll('account', chat, [(old, 'baseline')],
+                                   (self.now-100, 1), baseline=True)
+            self.runtime.last_reconcile[('account', chat)] = time.monotonic()
+        release_slow = asyncio.Event()
+        fast_committed = asyncio.Event()
+
+        async def messages(chat, **kwargs):
+            if chat == 'slow@chatroom':
+                await release_slow.wait()
+                return []
+            return [self.raw(2)]
+
+        original = self.store.ingest_poll
+
+        def ingest(account, chat, *args, **kwargs):
+            result = original(account, chat, *args, **kwargs)
+            if chat == 'test@chatroom':
+                fast_committed.set()
+            return result
+
+        self.gateway.messages = messages
+        with patch.object(self.store, 'ingest_poll', side_effect=ingest):
+            poll = asyncio.create_task(self.runtime.poll_once())
+            try:
+                await asyncio.wait_for(fast_committed.wait(), 1)
+                self.assertFalse(poll.done())
+                self.assertEqual(self.store.queue()['chat'], 'test@chatroom')
+            finally:
+                release_slow.set()
+                await poll
+
+    async def test_empty_incremental_poll_does_not_write_database(self):
+        await self.seed()
+        self.runtime.last_reconcile[('account', 'test@chatroom')] = time.monotonic()
+        before = self.store.db.total_changes
+        with patch.object(self.store, 'ingest_poll', wraps=self.store.ingest_poll) as ingest:
+            await self.runtime.poll_once()
+        ingest.assert_not_called()
+        self.assertEqual(self.store.db.total_changes, before)
+
+    async def test_poll_batch_has_one_commit_for_messages_context_and_cursor(self):
+        statements = []
+        self.store.db.set_trace_callback(statements.append)
+        events = [self.event(self.raw(2)), self.event(self.raw(3))]
+        inserted = self.store.ingest_poll('account', 'test@chatroom',
+            [(event, 'queued') for event in events], (self.now, 3), baseline=True)
+        self.store.db.set_trace_callback(None)
+        self.assertEqual(inserted, events)
+        self.assertEqual(sum(sql == 'COMMIT' for sql in statements), 1)
+        self.assertEqual(self.store.stats().get('queued'), 2)
+        self.assertEqual(len(self.store.conversation('account', 'test@chatroom')), 2)
+        self.assertEqual(self.store.poll_cursor('account', 'test@chatroom'), (self.now, 3))
+        self.assertTrue(self.store.baseline_exists('account', 'test@chatroom'))
+
+    async def test_failed_context_write_rolls_back_inbox_and_cursor(self):
+        await self.seed()
+        before = self.store.poll_cursor('account', 'test@chatroom')
+        event = self.event(self.raw(2))
+        with patch.object(self.store, 'observe', side_effect=RuntimeError('write failed')):
+            with self.assertRaisesRegex(RuntimeError, 'write failed'):
+                self.store.ingest_poll('account', 'test@chatroom',
+                    [(event, 'queued')], (self.now, 2))
+        self.assertIsNone(self.store.get(event['key']))
+        self.assertEqual(self.store.poll_cursor('account', 'test@chatroom'), before)
+
+    async def test_same_cursor_does_not_rewrite_progress(self):
+        self.store.save_poll_cursor('account', 'test@chatroom', (self.now, 2))
+        before = self.store.db.total_changes
+        self.store.save_poll_cursor('account', 'test@chatroom', (self.now, 2))
+        self.store.save_poll_cursor('account', 'test@chatroom', (self.now-1, 1))
+        self.assertEqual(self.store.db.total_changes, before)
 
     async def test_native_failure_does_not_fall_back_to_partial_ui(self):
         gateway = AgentGateway('http://127.0.0.1', 'test')

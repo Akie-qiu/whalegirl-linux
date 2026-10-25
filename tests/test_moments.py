@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 
 from whalegirl_linux.gateway import UIJobError
-from whalegirl_linux.moments import MomentsBook, MomentsService, similar_publication
+from whalegirl_linux.moments import MomentsBook, MomentsService, comment_context, similar_publication
 from whalegirl_linux.moments_payload import parse_post
 from whalegirl_linux.settings import Settings
 from whalegirl_linux.store import Store
@@ -33,6 +33,39 @@ class PayloadTests(unittest.TestCase):
     def test_invalid_xml_and_unpublished_id_are_not_actions(self):
         self.assertIsNone(parse_post({'tid': 0, 'content': '<TimelineObject><id>0</id></TimelineObject>'}))
         self.assertIsNone(parse_post({'content': '<!DOCTYPE foo><TimelineObject/>'}))
+
+
+class CommentContextTests(unittest.TestCase):
+    def test_reply_chain_identifies_the_bot_and_original_question(self):
+        question = {'id': '1', 'author': 'friend', 'name': '朋友', 'text': '去哪儿', 'created': 1}
+        answer = {'id': '2', 'author': 'native-account', 'text': '公园', 'own': True,
+                  'reply_to': '1', 'target': 'friend', 'created': 2}
+        target = {'id': '3', 'author': 'friend', 'text': '那里远吗', 'reply_to': '2',
+                  'target': 'native-account', 'created': 3}
+        post = {'own': True, 'author': 'native-account', 'comments': [target, question, answer]}
+        result = comment_context(post, target, 'configured-account')
+        self.assertEqual([c['id'] for c in result['thread_oldest_first']], ['1', '2', '3'])
+        self.assertTrue(result['reply_target']['reply_to_you'])
+        self.assertEqual(result['reply_target']['reply_to_person'], '你自己')
+        self.assertTrue(result['parent_comment_available'])
+
+    def test_other_people_replying_to_each_other_are_not_addressing_the_bot(self):
+        parent = {'id': '2', 'author': 'alice', 'name': '甲', 'text': '周末见', 'created': 1}
+        target = {'id': '10', 'author': 'bob', 'name': '乙', 'text': '好呀', 'reply_to': '2',
+                  'target': 'alice', 'created': 1}
+        result = comment_context({'comments': [target, parent]}, target, 'account')
+        self.assertFalse(result['reply_target']['reply_to_you'])
+        self.assertEqual(result['reply_target']['reply_to_person'], '甲')
+        self.assertEqual([c['id'] for c in result['recent_public_comments']], ['2', '10'])
+
+    def test_missing_parent_and_cycle_are_explicit_and_bounded(self):
+        target = {'id': '3', 'author': 'friend', 'text': '哪一个', 'reply_to': '2'}
+        result = comment_context({'comments': [target]}, target, 'account')
+        self.assertFalse(result['parent_comment_available'])
+        self.assertEqual(len(result['thread_oldest_first']), 1)
+        parent = {'id': '2', 'author': 'account', 'own': True, 'text': '这个', 'reply_to': '3'}
+        result = comment_context({'comments': [target, parent]}, target, 'account')
+        self.assertEqual(len(result['thread_oldest_first']), 2)
 
 
 class MomentsTests(unittest.IsolatedAsyncioTestCase):
@@ -94,6 +127,60 @@ class MomentsTests(unittest.IsolatedAsyncioTestCase):
         self.service.book.change(identity, 'sent', receipt='server-id')
         self.assertEqual(self.service.book.count('account', 'publish'), 1)
         self.assertEqual(self.service.book.count('account', 'reply_own'), 0)
+
+    async def test_manual_previews_do_not_take_automatic_slots_or_reservations(self):
+        self.generation_fixture({'participate':True, 'text':'新的游戏配色练习', 'media_mode':'none'},
+            moments_publish_per_day=1, moments_mode='auto')
+        self.draft()
+        now = time.time()
+        saved = {}
+        plan = self.service._build_publish_plan(self.runtime.config.settings, now)
+        plan['slots'][0].update(start=now-60, end=now+7200, target=now+600, done=True)
+        saved['publish_plan'] = plan
+        self.assertEqual(self.service.book.count('account', 'publish', pending=True), 1)
+        self.assertEqual(self.service.book.count('account', 'publish', pending=True, scheduled_only=True), 0)
+        self.assertIsNotNone(self.service.next_publish_time(self.runtime.config.settings, saved, now))
+        self.assertFalse(saved['publish_plan']['slots'][0]['done'])
+        row = await self.service.generate('publish', auto_publish=True)
+        self.assertEqual(row['state'], 'draft')
+        self.assertEqual(self.service.book.count('account', 'publish', pending=True, scheduled_only=True), 1)
+        with self.assertRaisesRegex(ValueError, '额度'):
+            await self.service.generate('publish', auto_publish=True)
+
+    async def test_explicit_publish_survives_chat_busy_and_restart_without_sending_manual_preview(self):
+        self.runtime.config.settings = self.settings.model_copy(update={
+            'moments_mode':'draft', 'moments_reply_own_enabled':False, 'moments_publish_per_day':2})
+        self.runtime.images = SimpleNamespace(stage=lambda *args, **kwargs: None)
+        manual, requested = self.draft(), self.draft()
+        self.runtime.processing = 'chat'
+        row = await self.service.send(requested, requested=True)
+        self.assertEqual(row['state'], 'draft')
+        self.assertTrue(next(r for r in self.service.book.recent('account') if r['id'] == requested)['queued'])
+        self.assertFalse(self.calls)
+        self.service = MomentsService(self.runtime)
+        self.runtime.processing = ''
+        async def native(operation, account, **values):
+            self.calls.append(values)
+            return {'confirmed':True}
+        self.runtime.gateway.moments = native
+        await self.service.tick()
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.service.book.get('account', requested)['state'], 'sent')
+        self.assertEqual(self.service.book.get('account', manual)['state'], 'draft')
+        self.service.book.save_state('account', {'last_poll':time.time()})
+        await self.service.tick()
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_empty_moments_generation_keeps_provider_error_in_ledger(self):
+        self.generation_fixture({})
+        class Engine:
+            last_error = 'HTTP 404（模型或接口不可用）'
+            async def chat(self, *args, **kwargs): return ''
+            async def close(self): pass
+        self.runtime.engine_factory = lambda **kwargs: Engine()
+        with self.assertRaisesRegex(ValueError, 'HTTP 404'):
+            await self.service.generate('publish')
+        self.assertIn('HTTP 404', self.service.book.recent('account')[0]['error'])
 
     async def test_master_off_preserves_records_and_prevents_native_calls(self):
         identity = self.draft()
@@ -236,6 +323,27 @@ class MomentsTests(unittest.IsolatedAsyncioTestCase):
             candidates=lambda *args, **kwargs: [{'id': 'existing', 'source': 'uploaded', 'name': '现成配图'}],
             generation_count=lambda: 0, stage=lambda *args, **kwargs: self.staged.append(args[0]),
             enqueue=lambda **kwargs: self.jobs.append(kwargs))
+
+    async def test_comment_generation_uses_one_call_and_only_the_selected_public_thread(self):
+        self.generation_fixture({'participate': True, 'text': '对，就是刚才说的公园'}, global_memory=False)
+        self.service.posts = [{'id': 'other', 'own': True, 'text': '无关的另一条动态'}]
+        parent = {'id': '1', 'author': 'account', 'own': True, 'text': '公园', 'created': 1}
+        target = {'id': '2', 'author': 'friend', 'name': '朋友', 'text': '你说的是那里吗',
+                  'reply_to': '1', 'created': 2}
+        post = {'id': 'chosen', 'author': 'account', 'own': True, 'text': '周末出门',
+                'comments': [parent, target]}
+        payload = {'post': post, 'comment': target}
+        row = await self.service.generate('reply_own', payload)
+        self.assertEqual(row['state'], 'draft')
+        self.assertEqual(json.loads(row['payload']), payload)
+        self.assertEqual(len(self.model_inputs), 1)
+        data, options = self.model_inputs[0]
+        self.assertNotIn('recent_own_posts', data)
+        self.assertNotIn('comments', data['source']['post'])
+        self.assertEqual(data['source']['conversation']['reply_target']['id'], '2')
+        self.assertIn('唯一要回复', options['system_prompt'])
+        self.assertNotIn('无关的另一条动态', json.dumps(data, ensure_ascii=False))
+        self.assertFalse(self.calls)
 
     async def test_new_picture_can_be_preferred_even_with_existing_library_choice(self):
         self.generation_fixture({'participate': True, 'text': '研究一下游戏里这套奇怪的配色',
@@ -472,6 +580,41 @@ class MomentsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sources, [f'{day}/0', f'{day}/0/r2'])
         self.assertTrue(slot['done'])
         self.assertEqual(self.service.book.count('account', 'publish'), 1)
+
+
+class MomentsQueueApiTests(unittest.TestCase):
+    def test_click_publish_queues_and_edit_withdraws_request_without_deleting_draft(self):
+        from fastapi.testclient import TestClient
+        from whalegirl_linux.app import create_app
+        from test_proactive import Gateway
+        folder = Path(tempfile.mkdtemp(prefix='moments-queue-api-', dir=ROOT/'test-runs'))
+        gateway = Gateway()
+        gateway.ui_lock, gateway.inflight_sends = asyncio.Lock(), set()
+        app = create_app(folder, gateway=gateway, run_background=False)
+        runtime, config = app.state.runtime, app.state.config
+        config.save(config.settings.model_copy(update={
+            'enabled':True, 'account_id':'account', 'allowed_chat_ids':['friend'], 'moments_enabled':True,
+            'moments_publish_enabled':True, 'moments_publish_per_day':5}), 'fixture-key')
+        runtime.account_id, runtime.gateway_state = 'account', {'status':'logged_in'}
+        runtime.processing = 'chat'
+        book = runtime.moments.book
+        identity = book.create('account', 'publish', 'manual', {'auto_publish':True})
+        book.change(identity, 'draft', text='保留为草稿')
+        client = TestClient(app)
+        headers = {'Authorization':'Bearer '+config.admin_token}
+        response = client.post('/api/moments/actions/'+identity, headers=headers, json={'op':'publish'})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(next(r for r in response.json()['actions'] if r['id'] == identity)['queued'])
+        response = client.post('/api/moments/actions/'+identity, headers=headers,
+                               json={'op':'edit','text':'修改后保留'})
+        self.assertEqual(response.status_code, 200, response.text)
+        row = book.get('account', identity)
+        self.assertEqual((row['state'], row['text']), ('draft', '修改后保留'))
+        self.assertNotIn('publish_requested_at', json.loads(row['payload']))
+        self.assertFalse(json.loads(row['payload'])['auto_publish'])
+        self.assertFalse(gateway.sent)
+        asyncio.run(runtime.close())
+        runtime.store.close()
 
 
 if __name__ == '__main__':

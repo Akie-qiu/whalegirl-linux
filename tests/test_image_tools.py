@@ -158,6 +158,24 @@ class ImageToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.images.tools.execute(dict(tool='send_library_image',subject_type='self',subject_resolved=True,
             asset_id=public['id'],authorization=first['content']),first,[first],ctx)['code'],'asset_scope_denied')
 
+    def test_cached_catalog_keeps_current_ranking_and_rejects_unrelated_selection(self):
+        blue = self.images.save_asset(self.raw, scope='global')
+        raw = io.BytesIO(); Image.new('RGB', (20,20), 'red').save(raw, format='PNG')
+        red = self.images.save_asset(raw.getvalue(), scope='global')
+        self.images.edit_asset(blue['id'], dict(name='雪景',description='安静的白色雪原',scenes='发泳装照片时',enabled=True))
+        self.images.edit_asset(red['id'], dict(name='泳装少女',description='少女穿着蓝色泳装',scenes='夏天',enabled=True))
+        first = self.message('发一张泳装照片')
+        _, ctx = self.images.tools.context(first, [first])
+        prompt = self.images.tools.dynamic_prompt(ctx, {blue['id'], red['id']})
+        payload = json.loads(prompt.split('：', 1)[1])
+        self.assertEqual(payload['candidates'], [])
+        self.assertEqual(payload['search_matches'][0]['id'], red['id'])
+        self.assertIn('泳装', payload['search_matches'][0]['matching_terms'])
+        self.assertEqual(self.execute(first, dict(tool='send_library_image', asset_id=blue['id']))['code'], 'no_match')
+        self.assertEqual(self.count(), 0)
+        self.assertTrue(self.execute(first, dict(tool='send_library_image', asset_id=red['id']))['ok'])
+        self.assertEqual(self.images.get(self.images.tools.recent(first)[0]['id'])['kind'], 'send')
+
     async def test_rejected_tool_replaces_success_ack_with_model_explanation(self):
         first=self.message('那你画一张')
         self.store.insert(first);self.store.observe([first])

@@ -254,7 +254,7 @@ def matching_post(snapshot, source, kind):
     return post
 
 
-def locate_post(post, snapshot):
+def locate_post(post, snapshot, *, allow_partial=False):
     text = norm(post.get('text') or post.get('title'))
     if len(text) < 4:
         raise ValueError('Post has no unique readable text; do not guess an image-only target')
@@ -278,6 +278,10 @@ def locate_post(post, snapshot):
         if len(rows) == 1:
             b = rows[0]['bounds']
             if b['y'] >= area['y'] and b['y']+b['height'] <= area['y']+area['height']:
+                return rows[0]
+            if allow_partial and b['y'] < area['y']+area['height'] and b['y']+b['height'] > area['y']:
+                # A tall post cannot fit in one viewport. Its unique text still
+                # binds the following comment block; selection scrolls that block.
                 return rows[0]
         command('xdotool', 'mousemove', str(round(area['x']+area['width']/2)), str(round(area['y']+area['height']/2)),
                 'click', '--repeat', '3', '--delay', '40', '5')
@@ -384,8 +388,11 @@ def select_timeline_comment(post, target):
         raise ValueError('Duplicate comment text needs an unambiguous native row; no reply sent')
     seen = set()
     deadline = time.monotonic()+18
+    expected_height = None
     for _ in range(8):
-        bounds, area = comment_detail(post)
+        bounds, area = comment_detail(post, expected_height)
+        if expected_height is None:
+            expected_height = bounds['height']
         top, bottom = max(bounds['y'], area['y']), min(bounds['y']+bounds['height'], area['y']+area['height'])
         if bottom > top:
             clip = {'x': bounds['x'], 'y': top, 'width': bounds['width'], 'height': bottom-top}
@@ -425,13 +432,33 @@ def select_notification_comment(post, target):
     from moments_layout import comment_bands
     click_node(button(frame(), 'Messages'))
     def notification(root):
-        rows = [n for n in walk(root) if n.get('role') == 'list-item' and
-                all(norm(value) in norm(n.get('name')) for value in
-                    (target['text'], target.get('name', ''), post['text']))]
+        rows = []
+        def visit(node, viewport=None):
+            if node.get('role') in ('list', 'scroll-pane') and node.get('bounds'):
+                viewport = node['bounds']
+            if node.get('role') == 'list-item' and all(norm(value) in norm(node.get('name')) for value in
+                    (target['text'], target.get('name', ''))):
+                rows.append((node, viewport or node['bounds']))
+            for child in node.get('children', []):
+                visit(child, viewport)
+        visit(root)
         if len(rows) != 1:
             raise ValueError('Source comment is unavailable in both timeline and notification history')
         return rows[0]
-    click_node(wait_for(notification))
+    # The notification preview contains the author and comment, plus a thumbnail;
+    # it does not contain the source post body. Verify that body in detail instead.
+    for _ in range(6):
+        row, area = wait_for(notification, stage='notification')
+        bounds = row['bounds']
+        if bounds['y'] >= area['y'] and bounds['y']+bounds['height'] <= area['y']+area['height']:
+            click_node(row)
+            break
+        direction = '4' if bounds['y'] < area['y'] else '5'
+        command('xdotool', 'mousemove', str(area['x']+area['width']//2),
+                str(area['y']+area['height']//2), 'click', '--repeat', '2', '--delay', '20', direction)
+        time.sleep(.1)
+    else:
+        raise ValueError('Source notification is outside the visible popup')
     wait_for(lambda r: button(frame(r), 'Back'))
     bounds, area = comment_detail(post)
     ordered = sorted(post['comments'], key=lambda c: (c['created'], int(c['id'])))
@@ -449,24 +476,32 @@ def select_notification_comment(post, target):
     return select_scrolling_comment(post, target)
 
 
-def reply_comment(post, source):
+def reply_comment(post, source, *, snapshot=None):
     """Reply directly under the verified post; notifications are not durable history."""
     target = source['comment']
     try:
+        if snapshot is not None:
+            locate_post(post, snapshot, allow_partial=True)
         x, y = select_timeline_comment(post, target)
     except ValueError as primary:
         try:
             x, y = select_notification_comment(post, target)
         except ValueError as secondary:
             raise ValueError('Timeline: '+str(primary)+'; notification: '+str(secondary)) from None
-    ordered = sorted(post['comments'], key=lambda c: (c['created'], int(c['id'])))
     def menu():
         command('xdotool', 'mousemove', str(x), str(y), 'click', '3')
     fresh = native_read('/moments')
     current = next((p for p in fresh['posts'] if p['id'] == post['id']), {})
-    signature = lambda values: [(c['id'], c['author'], c['text']) for c in sorted(
-        values, key=lambda c: (c['created'], int(c['id'])))]
-    if signature(current.get('comments', [])) != signature(ordered):
+    def signature(values):
+        prefix = []
+        for c in sorted(values, key=lambda c: (c['created'], int(c['id']))):
+            prefix.append((c['id'], c['author'], c['text']))
+            if c['id'] == target['id']:
+                return prefix
+        return None
+    # Only changes at/before the selected row can invalidate its coordinates.
+    # New replies appended below it should not abort an otherwise exact match.
+    if signature(current.get('comments', [])) != signature(post['comments']):
         raise ValueError('Comment order changed before selecting Reply')
     activate_moments()
     menu()
@@ -491,10 +526,10 @@ def put_comment_text(text):
 
 
 def comment_editor(post, source, kind, snapshot):
-    row = locate_post(post, snapshot)
     if kind == 'reply_own':
-        return reply_comment(post, source)
+        return reply_comment(post, source, snapshot=snapshot)
     else:
+        row = locate_post(post, snapshot)
         b = row['bounds']
         # Measured on the pinned 4.1.1.8 layout; validate the named Comment menu next.
         command('/opt/tools/click', str(round(b['x']+b['width']-40)), str(round(b['y']+b['height']-10)))
@@ -508,12 +543,38 @@ def comment_editor(post, source, kind, snapshot):
     return wait_for(find)
 
 
+def reply_navigation_summary(post, target):
+    """Private diagnostic flags, without copying timeline text into logs."""
+    root = tree()
+    f = frame(root)
+    lists = [n for n in walk(f) if n.get('role') == 'list']
+    return {
+        'buttons': [{'name': n.get('name'), 'bounds': n.get('bounds')}
+                    for n in walk(f) if n.get('role') == 'push-button' and n.get('name')],
+        'lists': [{'bounds': n.get('bounds'), 'rows': [
+            {'bounds': row.get('bounds'), 'length': len(row.get('name', '')),
+             'post_match': norm(post.get('text')) in norm(row.get('name')),
+             'post_prefix_match': norm(post.get('text'))[:20] in norm(row.get('name')),
+             'comment_match': norm(target.get('text')) in norm(row.get('name')),
+             'author_match': norm(target.get('name')) in norm(row.get('name'))}
+            for row in n.get('children', []) if row.get('role') == 'list-item']}
+            for n in lists],
+        'matching_nodes': [
+            {'role': n.get('role'), 'bounds': n.get('bounds'), 'length': len(n.get('name', '')),
+             'comment_match': norm(target.get('text')) in norm(n.get('name')),
+             'author_match': norm(target.get('name')) in norm(n.get('name'))}
+            for n in walk(root) if n.get('name') and (
+                norm(target.get('text')) in norm(n.get('name')) or
+                norm(target.get('name')) in norm(n.get('name')))],
+    }
+
+
 def run(path, account):
     import chat_select_linux as native_ui
     native_ui.SKIP_MESSAGES = True
     job = json.loads(path.read_text())
     operation = job.get('operation')
-    if operation not in ('moments_read', 'moments_probe', 'moments_send') or time.time()-float(job.get('created', 0)) > 60:
+    if operation not in ('moments_read', 'moments_probe', 'moments_reply_probe', 'moments_send') or time.time()-float(job.get('created', 0)) > 60:
         raise ValueError('Invalid or stale Moments job')
     if job.get('state'):
         raise ValueError('Moments jobs cannot be replayed')
@@ -525,7 +586,21 @@ def run(path, account):
     try:
         open_moments()
         opened = True
-        if not sending:
+        if operation == 'moments_reply_probe':
+            # Exercise selection through the existing GUI guard, never type or submit.
+            post = matching_post(snapshot, source, 'reply_own')
+            diagnostic = {'initial': reply_navigation_summary(post, source['comment'])}
+            try:
+                comment_editor(post, source, 'reply_own', snapshot)
+                diagnostic['target_verified'] = True
+            except ValueError as exc:
+                diagnostic.update(target_verified=False, error=str(exc),
+                                  final=reply_navigation_summary(post, source['comment']))
+                capture_area(frame()['bounds'], 'moments-reply-navigation')
+                command('scrot', str(ROOT/'moments-reply-desktop.png'))
+                (ROOT/'moments-reply-desktop.png').chmod(0o600)
+            job.update(state='done', diagnostic=diagnostic)
+        elif not sending:
             click_node(button(frame(), 'Refresh'))
             time.sleep(.5)
             snapshot, _ = authorize(account)

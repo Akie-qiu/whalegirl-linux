@@ -12,6 +12,7 @@ from pathlib import Path
 
 import httpx
 from PIL import Image
+from .resources import native_pressure
 
 
 def original_text(source):
@@ -68,7 +69,9 @@ class TiebaArchive:
 
     def stats(self):
         account = self.config.settings.account_id
-        return {'count': self.store.db.execute('SELECT count(*) FROM tieba_archives WHERE account=?', (account,)).fetchone()[0],
+        return {'count': self.store.db.execute('''SELECT count(*) FROM tieba_archives a
+                    LEFT JOIN tieba_lifecycle l ON l.account=a.account AND l.tid=a.tid WHERE a.account=?
+                    AND coalesce(l.trashed_at,0)=0 AND coalesce(l.deleted_at,0)=0''', (account,)).fetchone()[0],
                 'used_bytes': self.used_bytes(), 'limit_mb': self.config.settings.tieba_archive_limit_mb}
 
     def images(self, identity):
@@ -78,8 +81,11 @@ class TiebaArchive:
     def summaries(self, offset=0, limit=20):
         offset, limit = max(0, offset), max(1, min(100, limit))
         rows = self.store.db.execute('''SELECT a.id,a.tid,a.forum,a.title,a.url,a.reason,a.state,a.created,a.updated,a.error,
+            coalesce(l.pinned,0) AS pinned,coalesce(l.last_used,0) AS last_used,coalesce(l.uses,0) AS uses,
             count(i.image_id) AS image_count,coalesce(sum(i.state='saved'),0) AS saved_images
-            FROM tieba_archives a LEFT JOIN tieba_archive_images i ON i.archive_id=a.id WHERE a.account=?
+            FROM tieba_archives a LEFT JOIN tieba_archive_images i ON i.archive_id=a.id
+            LEFT JOIN tieba_lifecycle l ON l.account=a.account AND l.tid=a.tid WHERE a.account=?
+            AND coalesce(l.trashed_at,0)=0 AND coalesce(l.deleted_at,0)=0
             GROUP BY a.id ORDER BY a.created DESC LIMIT ? OFFSET ?''',
             (self.config.settings.account_id, limit, offset)).fetchall()
         return {'items': [dict(r) for r in rows], 'total': self.stats()['count'], 'offset': offset}
@@ -87,6 +93,10 @@ class TiebaArchive:
     def add(self, source, reason):
         """Queue exact v2 data, or re-fetch legacy previews rather than calling them originals."""
         account = self.config.settings.account_id
+        retention = self.service.retention
+        if not retention.active(source['tid']):
+            return None
+        retention.add(source['tid'])
         old = self.store.db.execute('SELECT id FROM tieba_archives WHERE account=? AND tid=?', (account, source['tid'])).fetchone()
         if old:
             return old[0]
@@ -104,6 +114,9 @@ class TiebaArchive:
         if not row:
             raise ValueError('没有这条浏览记录')
         identity = self.add(json.loads(row[0]), '管理员手动收藏')
+        if not identity:
+            raise ValueError('内容已在回收站，请先恢复；永久清理的原文不能恢复')
+        self.service.retention.edit(tid, 'pin')
         return {'queued': True, 'id': identity}
 
     def retry(self, identity):
@@ -116,7 +129,8 @@ class TiebaArchive:
         return {'queued': True}
 
     def current(self, row):
-        return self.service.current(row['account']) and self.config.settings.tieba_archive_enabled
+        return (self.service.current(row['account']) and self.config.settings.tieba_archive_enabled
+                and self.service.retention.active(row['tid']) and not native_pressure(self.config))
 
     def persist_source(self, row, source):
         directory = self.directory(row)
@@ -131,6 +145,7 @@ class TiebaArchive:
             path.chmod(0o600)
         self.execute('UPDATE tieba_archives SET payload=?,title=?,text_bytes=? WHERE id=?',
                      (json.dumps(source, ensure_ascii=False), source['title'], len(raw) + len(text), row['id']))
+        self.service.tools.index(source)
         for image in source.get('images', []):
             self.execute('''INSERT OR IGNORE INTO tieba_archive_images
                 (archive_id,image_id,pid,source_url,post_url,original_available) VALUES(?,?,?,?,?,?)''',
@@ -226,10 +241,12 @@ class TiebaArchive:
                 self.execute("UPDATE tieba_archives SET state='partial',error='保存中断，将在空闲时继续' WHERE id=? AND state='saving'", (identity,))
 
     async def resume_once(self):
-        if not self.config.settings.tieba_archive_enabled or not self.config.settings.tieba_enabled:
+        if not self.config.settings.tieba_archive_enabled or not self.config.settings.tieba_enabled or native_pressure(self.config):
             return False
-        row = self.store.db.execute('''SELECT id FROM tieba_archives WHERE account=? AND state IN ('requested','pending','partial')
-            AND attempts<3 AND retry_at<=? ORDER BY created LIMIT 1''',
+        row = self.store.db.execute('''SELECT a.id FROM tieba_archives a LEFT JOIN tieba_lifecycle l
+            ON l.account=a.account AND l.tid=a.tid WHERE a.account=? AND state IN ('requested','pending','partial')
+            AND coalesce(l.trashed_at,0)=0 AND coalesce(l.deleted_at,0)=0
+            AND attempts<3 AND retry_at<=? ORDER BY a.created LIMIT 1''',
             (self.config.settings.account_id, time.time())).fetchone()
         return await self.process(row[0]) if row else False
 
@@ -237,6 +254,8 @@ class TiebaArchive:
         row = self.row(identity)
         if not row:
             raise ValueError('没有这条收藏')
+        if self.service.retention.active(row['tid']):
+            self.service.retention.used(row['tid'])
         source = json.loads(row.pop('payload'))
         return {**row, 'source': source, 'images': self.images(identity),
                 'original_text': original_text(source) if row['text_bytes'] else ''}

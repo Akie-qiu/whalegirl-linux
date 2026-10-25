@@ -51,9 +51,29 @@ class TiebaEditRequest(BaseModel):
     phrase: str | None = Field(default=None, min_length=1, max_length=80)
     meaning: str | None = Field(default=None, max_length=400)
     scene: str | None = Field(default=None, max_length=240)
+    background: str | None = Field(default=None, max_length=800)
+    examples: str | None = Field(default=None, max_length=600)
+    avoid: str | None = Field(default=None, max_length=400)
+    aliases: str | None = Field(default=None, max_length=300)
     enabled: bool | None = None
     renew: bool = False
     op: str | None = Field(default=None, pattern='^(cancel|received|not_received|retry)$')
+
+
+class TiebaLifecycleRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    op: str = Field(pattern='^(pin|unpin|restore)$')
+
+
+class ProactiveConfigRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    values: dict = Field(default_factory=dict)
+
+
+class ProactivePauseRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    chat: str = Field(min_length=1, max_length=200)
+    resume: bool = False
 
 
 class LoginRequest(BaseModel):
@@ -162,6 +182,12 @@ class ImageEditRequest(BaseModel):
     scope_chat: str = Field(default='', max_length=200)
     character_id: str = Field(default='', pattern='^(|whalegirl)$')
     character_variant: str = Field(default='', pattern='^(|chibi|girl|mature)$')
+    retention_exempt: bool = False
+
+
+class ImageDeleteRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    confirm_id: str = Field(pattern='^[0-9a-f]{64}$')
 
 
 class ImageActionRequest(BaseModel):
@@ -338,6 +364,38 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     async def tieba_state():
         return runtime.tieba.snapshot()
 
+    @app.get('/proactive.js')
+    async def proactive_script():
+        return FileResponse(root/'whalegirl_linux'/'proactive.js', media_type='text/javascript')
+
+    @app.get('/api/proactive')
+    async def proactive_state():
+        return runtime.proactive.snapshot()
+
+    @app.post('/api/proactive/config')
+    async def proactive_config(body: ProactiveConfigRequest):
+        allowed = {name for name in Settings.model_fields if name.startswith('proactive_')}
+        if set(body.values) - allowed:
+            raise HTTPException(400, '自主聊天设置包含未知参数')
+        try:
+            updated = Settings.model_validate({**config.settings.model_dump(), **body.values})
+            if set(updated.proactive_chat_ids) - set(updated.allowed_chat_ids):
+                raise ValueError('主动聊天对象必须先在会话设置中授权')
+            if set(updated.proactive_strict_chat_ids) - set(updated.proactive_chat_ids):
+                raise ValueError('严格群主动权限必须属于已选择的主动聊天会话')
+            config.save(updated)
+        except ValueError as exc:
+            raise HTTPException(400, '请检查参数范围和会话授权：'+str(exc)[:160])
+        return config.public()
+
+    @app.post('/api/proactive/pause')
+    async def proactive_pause(body: ProactivePauseRequest):
+        try:
+            runtime.proactive.pause(body.chat, body.resume)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return runtime.proactive.snapshot()
+
     @app.post('/api/tieba/config')
     async def tieba_config(body: TiebaConfigRequest):
         allowed = {name for name in Settings.model_fields if name.startswith('tieba_')}
@@ -365,6 +423,21 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     @app.get('/api/tieba/archives')
     async def tieba_archives(offset: int = 0, limit: int = 20):
         return runtime.tieba.archives.summaries(offset, limit)
+
+    @app.get('/api/tieba/search')
+    async def tieba_search(query: str = '', limit: int = 5):
+        return runtime.tieba.tools.search(query[:500], limit)
+
+    @app.get('/api/tieba/tools/read')
+    async def tieba_read_source(tid: str, pid: str = '', offset: int = 0):
+        return runtime.tieba.tools.read(tid, pid, offset)
+
+    @app.post('/api/tieba/lifecycle/{tid}')
+    async def tieba_lifecycle(tid: str, body: TiebaLifecycleRequest):
+        try:
+            return runtime.tieba.retention.edit(tid, body.op)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.post('/api/tieba/posts/{tid}/archive')
     async def tieba_archive_post(tid: str):
@@ -445,6 +518,7 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
             settings = Settings.model_validate({**config.settings.model_dump(), **body.values})
             config.save(settings)
             config.save_image_key(body.api_key)
+            runtime.images.retention.next_scan = 0
             return config.public()
         except ValueError as exc:
             raise HTTPException(400, str(exc)[:200]) from exc
@@ -511,6 +585,22 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
             return runtime.images.asset(identity)
         except ValueError as exc:
             raise HTTPException(404, str(exc)) from exc
+
+    @app.get('/api/images/assets/{identity}/deletion')
+    async def image_deletion_plan(identity: str):
+        try:
+            return runtime.images.retention.plan(identity)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.post('/api/images/assets/{identity}/delete')
+    async def image_delete(identity: str, body: ImageDeleteRequest):
+        if identity != body.confirm_id:
+            raise HTTPException(400, '删除确认与图片不匹配')
+        try:
+            return runtime.images.retention.delete(identity)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.post('/api/images/jobs')
     async def image_task(body: ImageTaskRequest):
@@ -621,20 +711,21 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
                 limit = 180 if row['kind'] == 'publish' else 100
                 if not body.text.strip() or len(body.text) > limit:
                     raise HTTPException(400, '文字不能为空且不得超过' + str(limit) + '字')
-                book.change(identity, 'draft', text=body.text.strip())
+                payload = json.loads(row['payload'])
+                payload.pop('publish_requested_at', None)
+                payload['auto_publish'] = False
                 if body.assets is not None:
                     if row['kind'] != 'publish':
                         raise HTTPException(400, '评论不能附带图片')
-                    import json
                     for asset_id in body.assets:
                         runtime.images.stage(asset_id)
-                    payload = json.loads(row['payload'])
                     payload['assets'] = list(dict.fromkeys(body.assets))
                     payload['assets_authorized'] = list(payload['assets'])
-                    with store.lock:
-                        store.db.execute('UPDATE moments_actions SET payload=? WHERE id=?',
-                            (json.dumps(payload, ensure_ascii=False), identity))
-                        store.db.commit()
+                with store.lock:
+                    store.db.execute('UPDATE moments_actions SET payload=? WHERE id=?',
+                        (json.dumps(payload, ensure_ascii=False), identity))
+                    store.db.commit()
+                book.change(identity, 'draft', text=body.text.strip())
         if body.op == 'retry':
             try:
                 created = await runtime.moments.retry_draft(identity)
@@ -643,7 +734,7 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
                 raise HTTPException(409, str(exc)[:200]) from exc
         if body.op == 'publish':
             try:
-                await runtime.moments.send(identity)
+                await runtime.moments.send(identity, requested=True)
             except (ValueError, OSError, httpx.HTTPError) as exc:
                 raise HTTPException(409, str(exc)[:200]) from exc
         return runtime.moments.snapshot()
@@ -732,8 +823,14 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
         if not config.api_key():
             raise HTTPException(400, "先保存 API Key")
         engine = await runtime.model()
-        text = await engine.chat([{"role": "user", "content": "只回复：连接正常"}], max_tokens=32)
-        return {"ok": bool(text), "message": text[:100] if text else engine.last_error or "模型未返回内容"}
+        limit = max(128, config.settings.max_tokens) if engine.api_style == "responses" else 32
+        started = time.monotonic()
+        text = await engine.chat([{"role": "user", "content": "只回复：连接正常"}], max_tokens=limit)
+        return {"ok": bool(text), "message": text[:100] if text else engine.last_error or "模型未返回内容",
+                "api_style": engine.api_style, "stream_enabled": engine.stream_enabled,
+                "reasoning_effort": engine.reasoning_effort,
+                "elapsed_ms": round((time.monotonic()-started)*1000),
+                "first_text_ms": engine.last_first_token_ms}
 
     @app.post("/api/gateway/login")
     async def login():

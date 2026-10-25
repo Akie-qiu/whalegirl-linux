@@ -67,6 +67,58 @@ class MomentsScrollTests(unittest.TestCase):
                 moments_ui.reply_comment(post,{'comment':target})
         command.assert_not_called();click.assert_not_called()
 
+    def test_new_comment_below_target_does_not_invalidate_verified_recipient(self):
+        target={'id':'1','author':'person','text':'source','created':1}
+        post={'id':'post','comments':[target]}
+        fresh={'id':'post','comments':[target,{'id':'2','author':'other','text':'new','created':2}]}
+        reply={'role':'menu-item','name':'Reply'}
+        with patch.object(moments_ui,'select_timeline_comment',return_value=(500,300)),\
+             patch.object(moments_ui,'native_read',return_value={'posts':[fresh]}),\
+             patch.object(moments_ui,'tree',return_value={'children':[reply]}),\
+             patch.object(moments_ui,'command'),patch.object(moments_ui,'activate_moments'),\
+             patch.object(moments_ui,'click_node') as click:
+            self.assertEqual(moments_ui.reply_comment(post,{'comment':target}),{'native_comment':True})
+        click.assert_called_once_with(reply)
+
+    def test_new_comment_above_target_still_invalidates_coordinates(self):
+        target={'id':'2','author':'person','text':'source','created':2}
+        post={'id':'post','comments':[target]}
+        fresh={'id':'post','comments':[{'id':'1','author':'other','text':'late sync','created':1},target]}
+        with patch.object(moments_ui,'select_timeline_comment',return_value=(500,300)),\
+             patch.object(moments_ui,'native_read',return_value={'posts':[fresh]}),\
+             patch.object(moments_ui,'command') as command,patch.object(moments_ui,'click_node') as click:
+            with self.assertRaisesRegex(ValueError,'Comment order changed'):
+                moments_ui.reply_comment(post,{'comment':target})
+        command.assert_not_called();click.assert_not_called()
+
+    def test_missing_timeline_post_can_use_verified_notification(self):
+        target={'id':'1','author':'person','text':'source','created':1}
+        post={'id':'post','comments':[target]}
+        reply={'role':'menu-item','name':'Reply'}
+        with patch.object(moments_ui,'locate_post',side_effect=ValueError('post outside timeline')),\
+             patch.object(moments_ui,'select_timeline_comment') as timeline,\
+             patch.object(moments_ui,'select_notification_comment',return_value=(500,300)) as notification,\
+             patch.object(moments_ui,'native_read',return_value={'posts':[post]}),\
+             patch.object(moments_ui,'tree',return_value={'children':[reply]}),\
+             patch.object(moments_ui,'command'),patch.object(moments_ui,'activate_moments'),\
+             patch.object(moments_ui,'click_node'):
+            self.assertEqual(moments_ui.comment_editor(post,{'comment':target},'reply_own',
+                {'posts':[post]}),{'native_comment':True})
+        timeline.assert_not_called()
+        notification.assert_called_once_with(post,target)
+
+    def test_tall_post_can_bind_reply_without_fitting_entire_viewport(self):
+        post={'id':'post','text':'unique source post'}
+        row={'role':'list-item','name':'unique source post',
+             'bounds':{'x':0,'y':100,'width':548,'height':700}}
+        f={'role':'frame','name':'Moments','children':[{'role':'list',
+           'bounds':{'x':0,'y':40,'width':548,'height':477},'children':[row]}]}
+        with patch.object(moments_ui,'frame',return_value=f),patch.object(moments_ui,'command'),\
+             patch.object(moments_ui.time,'sleep'):
+            self.assertIs(moments_ui.locate_post(post,{'posts':[post]},allow_partial=True),row)
+            with self.assertRaisesRegex(ValueError,'not fully visible'):
+                moments_ui.locate_post(post,{'posts':[post]})
+
     def test_nested_details_returns_through_messages_before_timeline(self):
         step=[0]
         def snapshot():
@@ -97,4 +149,46 @@ class MomentsScrollTests(unittest.TestCase):
         self.assertEqual(len(points),5)
         self.assertTrue(all(48<p<342 for p in points))
         self.assertNotIn(33,points)
+
+    def test_notification_without_post_body_scrolls_clipped_row_before_clicking(self):
+        target = {'id':'1','author':'person','name':'person','text':'source','created':1}
+        post = {'id':'post','text':'the full original post is absent from notification previews','comments':[target]}
+        messages = {'role':'push-button','name':'Messages','bounds':{'x':0,'y':0,'width':50,'height':40}}
+        initial = {'role':'frame','name':'Moments','children':[messages]}
+        def popup(y):
+            row = {'role':'list-item','name':'person: source',
+                   'bounds':{'x':210,'y':y,'width':356,'height':64}}
+            return {'role':'frame','name':'Moments','children':[{'role':'list',
+                'bounds':{'x':210,'y':270,'width':356,'height':290},'children':[row]}]}
+        before, after = popup(526), popup(430)
+        back = {'role':'frame','name':'Moments','children':[{'role':'push-button','name':'Back'}]}
+        copy = {'role':'menu-item','name':'Copy'}
+        snapshots = iter([before, after, back, {'children':[copy]}])
+        with patch.object(moments_ui,'frame',side_effect=lambda root=None:root or initial),\
+             patch.object(moments_ui,'wait_for',side_effect=lambda find,*args,**kwargs:find(next(snapshots))),\
+             patch.object(moments_ui,'click_node') as click,\
+             patch.object(moments_ui,'command',return_value=SimpleNamespace(stdout=b'source')) as command,\
+             patch.object(moments_ui,'comment_detail',return_value=(
+                 {'x':0,'y':40,'width':548,'height':120},
+                 {'x':0,'y':30,'width':548,'height':300})),\
+             patch.object(moments_ui,'capture_area'),patch.object(moments_ui,'clipboard'),\
+             patch.object(moments_ui.time,'sleep'),\
+             patch.object(moments_layout,'comment_bands',return_value=[(12,120)]):
+            self.assertEqual(moments_ui.select_notification_comment(post,target),(160,144))
+        clicked = [call.args[0] for call in click.call_args_list]
+        self.assertEqual(clicked,[messages,after['children'][0]['children'][0],copy])
+        self.assertTrue(any(call.args[-1]=='5' for call in command.call_args_list))
+
+    def test_notification_with_same_author_and_text_is_not_guessed(self):
+        target = {'id':'1','author':'person','name':'person','text':'source','created':1}
+        messages = {'role':'push-button','name':'Messages'}
+        initial = {'role':'frame','name':'Moments','children':[messages]}
+        row = {'role':'list-item','name':'person: source','bounds':{'x':0,'y':40,'width':200,'height':64}}
+        popup = {'role':'list','bounds':{'x':0,'y':40,'width':200,'height':300},'children':[row,dict(row)]}
+        with patch.object(moments_ui,'frame',return_value=initial),\
+             patch.object(moments_ui,'wait_for',side_effect=lambda find,**kwargs:find(popup)),\
+             patch.object(moments_ui,'click_node') as click:
+            with self.assertRaisesRegex(ValueError,'unavailable'):
+                moments_ui.select_notification_comment({'text':'post'},target)
+        click.assert_called_once_with(messages)
 

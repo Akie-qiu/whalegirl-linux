@@ -25,7 +25,7 @@
     ['moments_image_generate_eagerness','主动生成配图积极性 / 0～100',0,100],['moments_variety_days','选题与配图参考最近 / 天',1,30]]){
     const label=el('label','',title),input=el('input');input.type='number';input.min=min;input.max=max;input.step=1;fields[name]=input;label.append(input);grid.append(label);
   }
-  panel.append(grid,el('p','hint','自己的评论每30秒读取一次已同步缓存，无需等动态刷新；微信尚未同步的内容在刷新动态后可见。三个每日上限分别计数，0表示禁止该类发送。每日自主发动态会将活跃时段均分为多个时间段，在每个时间段内随机挑时间发送，避免堆在一起。每天按北京时间零点计算；开始和结束相同表示全天。聊天忙时朋友圈让行，新开启评论不补评历史。'));
+  panel.append(grid,el('p','hint','自己的评论每30秒读取一次已同步缓存，无需等动态刷新；微信尚未同步的内容在刷新动态后可见。三个每日上限分别计数，0表示禁止该类发送。每日自主发动态会将活跃时段均分为多个时间段，在每个时间段内随机挑时间发送，避免堆在一起。每天按北京时间零点计算；开始和结束相同表示全天。手动预览草稿不占自动发布名额；点击发布后遇到聊天忙会排队，空闲后发送，新开启评论不补评历史。'));
   panel.append(el('p','hint','生图积极性默认75：越高越愿意为合适的动态画新图，不是强制生图概率；0表示不主动生图。已有固定配图优先使用。AI 会参考近期已发和待发文案、配图构思，换话题、表达角度和画面；高度雷同的草稿本轮跳过。'));
   const topics=el('textarea');topics.rows=2;topics.maxLength=3000;fields.moments_topics=topics;
   const tl=el('label','','发动态感兴趣的话题 / 每行一个');tl.append(topics);panel.append(tl);
@@ -80,7 +80,8 @@
     status.textContent=(s.enabled?'已开启':'已关闭')+' · '+(s.mode==='auto'?'自动模式':'草稿模式')+' · 今日动态 '+(counts.publish||0)+' / 回复自己的评论 '+(counts.reply_own||0)+' / 评论好友 '+(counts.comment_friend||0)+(s.next_publish_at?' · 下次发动态约 '+new Date(s.next_publish_at*1000).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}):'')+(s.last_scan?' · 动态刷新 '+new Date(s.last_scan*1000).toLocaleTimeString('zh-CN'):'')+(s.last_cache_scan?' · 评论读取 '+new Date(s.last_cache_scan*1000).toLocaleTimeString('zh-CN'):'');
     error.textContent=s.error||(s.uncertain?'有发布结果需要人工核对，朋友圈发送已暂停':'');
     records.replaceChildren();for(const row of s.actions||[]){
-      const card=el('article','record');card.append(el('strong','',kindNames[row.kind]+' · '+(stateNames[row.state]||row.state)),el('p','hint',new Date(row.created*1000).toLocaleString('zh-CN')));
+      const label=row.queued?'已排队，等待空闲':row.state==='draft'&&row.kind==='publish'?(row.auto_publish?'自动待发布':'手动待发布'):stateNames[row.state]||row.state;
+      const card=el('article','record');card.append(el('strong','',kindNames[row.kind]+' · '+label),el('p','hint',new Date(row.created*1000).toLocaleString('zh-CN')));
       if(row.target?.post_text)card.append(el('p','muted','来源动态：'+row.target.post_text));if(row.target?.comment)card.append(el('p','muted','来源评论：'+row.target.person+' '+row.target.comment));
       if(row.state==='draft'){
         const text=el('textarea');text.rows=3;text.maxLength=row.kind==='publish'?180:100;text.value=row.text;card.append(text);
@@ -90,7 +91,10 @@
           card.append(btn('选择 / 调整这条动态的配图',async()=>window.pictureLibrary.pick({selected,onSave:async chosen=>render(await api('moments/actions/'+row.id,'POST',{op:'edit',text:text.value,assets:chosen}))})));
           if(cfg.moments_image_generate_enabled){const detail=el('details'),imagePrompt=el('textarea');detail.append(el('summary','','为这条动态生成新配图'));imagePrompt.rows=2;imagePrompt.maxLength=3000;imagePrompt.value=row.text;detail.append(imagePrompt,btn('提交配图生成任务',async()=>{if(text.value!==row.text)await actionRow(row.id,'edit',text.value);await api('images/jobs','POST',{kind:'generate',prompt:imagePrompt.value,destination:'moments',moment_id:row.id});render(await api('moments'));notice('配图在后台生成，完成后附加到草稿');}));card.append(detail);}
         }
-        const buttons=el('div','row');buttons.append(btn('保存修改',()=>actionRow(row.id,'edit',text.value)),btn(row.kind==='publish'?'发布这条朋友圈':'发送这条评论',async()=>{if(text.value!==row.text)await actionRow(row.id,'edit',text.value);await actionRow(row.id,'publish');}),btn('取消草稿',()=>actionRow(row.id,'cancel')));card.append(buttons);
+        const buttons=el('div','row');buttons.append(btn(row.queued?'撤回排队并保存草稿':'保存修改',()=>actionRow(row.id,'edit',text.value)));
+        const publish=btn(row.kind==='publish'?'发布这条朋友圈':'发送这条评论',async()=>{if(text.value!==row.text)await actionRow(row.id,'edit',text.value);await actionRow(row.id,'publish');});publish.disabled=!!row.queued;
+        buttons.append(publish,btn('取消草稿',()=>actionRow(row.id,'cancel')));card.append(buttons);
+        if(row.queued)card.append(el('p','hint','已记录发布请求，每30秒检查一次空闲状态；仅当天有效。保存修改会撤回排队，保留为手动草稿。'));
       }else if(row.text)card.append(el('p','',row.text));
       if(row.error)card.append(el('p','hint',row.error));if(row.receipt)card.append(el('p','hint','确认记录：'+row.receipt));
       if(row.state==='awaiting_image')card.append(el('p','hint','等待期间可以继续聊天。任务进度与取消入口在“图片与生图”。'));

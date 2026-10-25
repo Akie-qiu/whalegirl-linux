@@ -1,6 +1,7 @@
 """Restart the Python reply core once when its HTTP health check stays down."""
 import json
 import os
+import pwd
 from pathlib import Path
 import subprocess
 import time
@@ -14,6 +15,76 @@ FAILURE_THRESHOLD = 3
 RESTART_COOLDOWN = 900
 HEALTH_TIMEOUT = 2
 RECOVERY_TIMEOUT = 20
+CONTAINER = 'whalegirl-wechat-candidate-4118'
+NATIVE_PUBLIC = Path('/var/lib/whalegirl-linux/core/stability/native-resources.json')
+
+
+def native_resources():
+    """Measure the container's own budget, independent of free host RAM."""
+    info = json.loads(subprocess.check_output(['docker', 'inspect', CONTAINER], text=True, timeout=4))[0]
+    pid = info['State']['Pid']
+    relative = next(line.split(':', 2)[2] for line in (Path('/proc')/str(pid)/'cgroup').read_text().splitlines()
+                    if line.startswith('0::'))
+    cg = Path('/sys/fs/cgroup')/relative.lstrip('/')
+    stats = dict((k, int(v)) for k, v in (line.split() for line in (cg/'memory.stat').read_text().splitlines()))
+    limit = int((cg/'memory.max').read_text())
+    current = int((cg/'memory.current').read_text())
+    # Clean file cache is reclaimable; anon + shared memory are the working-set risk.
+    working = max(0, current-stats.get('inactive_file', 0))
+    processes = []
+    for process in Path('/proc').iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            if info['Id'] not in (process/'cgroup').read_text():
+                continue
+            fields = dict(line.split(':', 1) for line in (process/'status').read_text().splitlines() if ':' in line)
+            rss = int(fields.get('VmRSS', '0 kB').split()[0])*1024
+            if rss >= 32*1024**2:
+                processes.append({'pid': int(process.name), 'name': fields['Name'].strip(), 'rss': rss,
+                                  'anon': int(fields.get('RssAnon', '0 kB').split()[0])*1024,
+                                  'shmem': int(fields.get('RssShmem', '0 kB').split()[0])*1024})
+        except (OSError, ValueError):
+            continue
+    return {'at': time.time(), 'container_id': info['Id'][:12], 'cgroup': str(cg), 'memory_current': current,
+            'memory_limit': limit, 'working_bytes': working, 'ratio': round(working/limit, 3),
+            'pressure': working >= limit*.82 or (_mem_available_mb() or 0) < 240,
+            'anon': stats.get('anon', 0), 'shmem': stats.get('shmem', 0),
+            'swap_current': int((cg/'memory.swap.current').read_text()),
+            'events': dict((k, int(v)) for k, v in (line.split() for line in (cg/'memory.events').read_text().splitlines())),
+            'processes': sorted(processes, key=lambda p:p['rss'], reverse=True)[:8]}
+
+
+def publish_native_resources(value):
+    NATIVE_PUBLIC.parent.mkdir(parents=True, exist_ok=True)
+    temporary = NATIVE_PUBLIC.with_suffix('.pending')
+    temporary.write_text(json.dumps(value), encoding='utf-8')
+    os.chown(temporary, 0, pwd.getpwnam('whalegirl-ai').pw_gid)
+    temporary.chmod(0o640)
+    temporary.replace(NATIVE_PUBLIC)
+
+
+def maintain_native_memory(state, now):
+    sample = native_resources()
+    cg = Path(sample['cgroup'])
+    # Reclaim before the hard OOM boundary. Do not kill WeChat or wxocr.
+    high = int(sample['memory_limit']*.90)//4096*4096
+    try:
+        if (cg/'memory.high').read_text().strip() != str(high):
+            (cg/'memory.high').write_text(str(high))
+        sample['high_bytes'] = high
+        if sample['ratio'] >= .86 and now-state.get('last_native_reclaim_at', 0) >= 180:
+            state['last_native_reclaim_at'] = now
+            try:
+                (cg/'memory.reclaim').write_text(str(64*1024**2))
+                sample['reclaim'] = 'requested_64MiB'
+            except OSError as exc:
+                # EAGAIN means some but not all requested bytes could be reclaimed.
+                sample['reclaim'] = 'partial' if exc.errno == 11 else type(exc).__name__
+    except OSError as exc:
+        sample['policy_error'] = type(exc).__name__
+    publish_native_resources(sample)
+    return sample
 
 
 def load_state():
@@ -213,6 +284,11 @@ def main():
     state, action = transition(prior, now, _probe())
     state['hygiene'] = hygiene
     state['resources'] = resource_snapshot()
+    try:
+        native = maintain_native_memory(state, now)
+        state['native'] = native
+    except (OSError, ValueError, KeyError, StopIteration, subprocess.SubprocessError) as exc:
+        state['native_probe_error'] = type(exc).__name__
     if action in ('healthy', 'recovered'):
         save_state(state)
         print(json.dumps({'status': action, 'consecutive_failures': 0}))

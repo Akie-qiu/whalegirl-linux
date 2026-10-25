@@ -12,10 +12,15 @@
   const grid=el('div','settings-grid'),fields={};
   const advanced=el('details','record'),advancedGrid=el('div','settings-grid');
   advanced.append(el('summary','','更多设置：分享时段、筛选门槛与收藏容量'),advancedGrid);
-  const basic=new Set(['tieba_share_enabled','tieba_learn_enabled','tieba_images_enabled','tieba_archive_enabled','tieba_forums','tieba_interests','tieba_interest_sensitivity','tieba_interval_minutes','tieba_share_per_day']);
+  const basic=new Set(['tieba_share_enabled','tieba_context_share_enabled','tieba_discovery_share_enabled','tieba_meme_eagerness','tieba_recall_eagerness','tieba_share_eagerness','tieba_learn_enabled','tieba_images_enabled','tieba_archive_enabled','tieba_forums','tieba_interests','tieba_interest_sensitivity','tieba_interval_minutes','tieba_share_per_day']);
   const defs=[
     ['tieba_share_enabled','允许主动分享链接','checkbox'],
+    ['tieba_context_share_enabled','允许根据聊天话题自主选段分享','checkbox'],
+    ['tieba_discovery_share_enabled','允许逛贴吧后主动分享新发现','checkbox'],
     ['tieba_learn_enabled','学习与调用贴吧梗','checkbox'],
+    ['tieba_meme_eagerness','接梗积极性 / 0—100','number',0,100],
+    ['tieba_recall_eagerness','查原文积极性 / 0—100','number',0,100],
+    ['tieba_share_eagerness','跟话题分享积极性 / 0—100','number',0,100],
     ['tieba_images_enabled','收藏并允许使用贴吧图片','checkbox'],
     ['tieba_archive_enabled','完整收藏感兴趣的原文与配图','checkbox'],
     ['tieba_forums','关注贴吧 / 每行一个，不必加“吧”','textarea'],
@@ -30,7 +35,9 @@
     ['tieba_memes_ttl_days','学到的梗有效期 / 天','number',1,90],
     ['tieba_images_per_day','每天最多入库聊天素材图 / 不限制原文配图','number',0,20],
     ['tieba_images_limit','贴吧聊天素材库容量','number',1,500],
-    ['tieba_archive_limit_mb','原文收藏总容量 / MB，满后保留已有收藏','number',64,4096]
+    ['tieba_archive_limit_mb','原文收藏总容量 / MB，满后保留已有收藏','number',64,4096],
+    ['tieba_unused_days','连续多少天未使用后放入回收站 / 0关闭','number',0,3650],
+    ['tieba_trash_days','回收站保留天数 / 到期清理原文及配图','number',1,90]
   ];
   for(const [key,title,type,min,max] of defs){
     const label=el('label',type==='checkbox'?'check-label':'',title);
@@ -40,6 +47,8 @@
     if(type==='checkbox')label.prepend(input);else label.append(input);fields[key]=input;(basic.has(key)?grid:advancedGrid).append(label);
   }
   grid.append(el('p','hint','兴趣词命中的帖子优先阅读，AI 同时识别同义表达和别称。灵敏度默认70；0表示不额外加分。修改兴趣词或灵敏度后，最近40条已读帖子会在后续浏览中分批重判。浏览记录显示命中词及加分；分享还需满足时段、每日条数和会话间隔。'));
+  grid.append(el('p','hint','AI 可自主搜索本地原文、阅读全文和选择分享片段。接梗积极性控制自然使用倾向，查原文积极性控制背景召回，分享积极性控制旁观聊天时是否插入相关内容；高积极性也会结合语境，避免反复只说同一个梗。两种分享都需要开启“允许主动分享链接”，并勾选目标会话；严格唤醒群仍遵守原规则。'));
+  advancedGrid.append(el('p','hint','检索候选不算使用；实际阅读、回答使用或成功分享才刷新使用时间。默认闲置30天进回收站，再保留7天。固定保留和管理员手动收藏不自动清理；聊天图库独立素材、聊天记录不在此清理范围。删除前会记录逐个文件计划。'));
   const targets=el('div','chatlist');targets.id='tieba-targets';
   const targetTitle=el('h3','','分享会话');
   const login=el('details','record');login.append(el('summary','','可选：贴吧登录凭据'));
@@ -47,7 +56,7 @@
   const bduss=el('input'),stoken=el('input');bduss.type=stoken.type='password';bduss.autocomplete=stoken.autocomplete='new-password';
   bduss.setAttribute('aria-label','贴吧 BDUSS');stoken.setAttribute('aria-label','贴吧 STOKEN');
   bduss.placeholder='BDUSS / 可选';stoken.placeholder='STOKEN / 可选';login.append(loginHint,bduss,stoken);
-  const status=el('p','timing-detail','正在读取浏览状态'),records=el('div'),memes=el('div'),pictures=el('div'),shares=el('div'),archives=el('div');
+  const status=el('p','timing-detail','正在读取浏览状态'),records=el('div'),memes=el('div'),pictures=el('div'),shares=el('div'),archives=el('div'),toolEvents=el('div'),retention=el('div');
   archives.id='tieba-archives';let archivePage=0;
   const archiveSummary=el('summary','','原文收藏');
   const tabs=el('div','panel-footer');
@@ -70,7 +79,15 @@
   }
   const archiveSection=el('details','record');archiveSection.id='tieba-archive-section';archiveSection.open=true;
   archiveSection.append(archiveSummary,el('p','hint','保存主楼及本次实际读到的楼层、楼中楼原文和全部配图；不改写、不截断。未读取的楼层不计入完整范围，缺图会标注并在空闲时补存。收藏不占每天素材图入库额度。'),archives);
+  const search=el('input');search.type='search';search.placeholder='搜索已收藏原文、梗的含义或别称';search.setAttribute('aria-label','搜索贴吧原文');
+  const searchResults=el('div'),searchBar=el('div','chat-toolbar');
+  searchBar.append(search,button('搜索原文库',async()=>{
+    const result=await api('tieba/search?query='+encodeURIComponent(search.value));searchResults.replaceChildren();
+    for(const p of result.posts||[]){const row=el('article','record');row.append(el('strong','',p.title),el('p','tieba-meme-copy',p.excerpt),button('读取原文',()=>viewSource(p.tid)));searchResults.append(row);}
+    if(!result.posts?.length)searchResults.append(el('p','hint','没有匹配的原文，试试含义或角色别称'));
+  }));archiveSection.insertBefore(searchBar,archives);archiveSection.insertBefore(searchResults,archives);
   records.parentElement.after(archiveSection);
+  for(const [title,box] of [['AI 检索与分享工具记录',toolEvents],['闲置回收站与清理记录',retention]]){const d=el('details','record');d.append(el('summary','',title),box);panel.append(d);}
   document.querySelector('main').append(panel);
   const nav=el('a');nav.href='#tieba-panel';nav.append(el('span','','贴吧见闻'));document.querySelector('nav').append(nav);
   const fmt=n=>n?new Date(n*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'}):'尚未记录';
@@ -82,10 +99,10 @@
   function editMeme(m){
     const d=dialog('编辑学到的梗');d.classList.add('tieba-meme-dialog');
     const inputs={};
-    for(const [key,title,cap] of [['phrase','梗的说法',80],['meaning','含义',400],['scene','适用与不适用场景',240]]){
+    for(const [key,title,cap] of [['phrase','梗的说法',80],['meaning','含义',400],['scene','适用场景',240],['background','来龙去脉与原文背景',800],['examples','自然接话示例',600],['avoid','不适合的情况',400],['aliases','别称与相关概念',300]]){
       const label=el('label','',title),input=el(key==='phrase'?'input':'textarea');
-      input.value=m[key];input.maxLength=cap;input.setAttribute('aria-label',title);
-      if(key!=='scene')input.required=true;if(key!=='phrase')input.rows=4;
+      input.value=m[key]||'';input.maxLength=cap;input.setAttribute('aria-label',title);
+      if(['phrase','meaning'].includes(key))input.required=true;if(key!=='phrase')input.rows=3;
       label.append(input);d.append(label);inputs[key]=input;
     }
     d.append(el('p','hint','来源原说法：'+(m.source_phrase||m.phrase)),link('查看来源帖子',m.source_url));
@@ -94,6 +111,13 @@
       await api('tieba/memes/'+m.id,'POST',Object.fromEntries(Object.entries(inputs).map(([k,input])=>[k,input.value])));
       d.close();notice('梗已保存，后续聊天按更新后的描述调用');await load();
     }),button('取消',async()=>d.close()));d.append(tools);inputs.phrase.focus();
+  }
+  async function viewSource(tid,offset=0,existing=null){
+    const result=await api('tieba/tools/read?tid='+encodeURIComponent(tid)+'&offset='+offset),d=existing||dialog(result.title||'原文');
+    if(!result.ok){d.append(el('p','hint','该原文已不可用或尚未读取'));return;}
+    if(!existing)d.append(el('p','hint','展示本次实际保存的楼层原文；未读取的后续楼层不在此范围'),link('来源帖子',result.url));
+    for(const p of result.passages||[])d.append(el('p','hint',p.label+' · 楼层ID '+p.pid),el('pre','tieba-original-text',p.text));
+    if(result.next_offset!==null){const b=button('继续读后面的原文',async()=>{b.remove();await viewSource(tid,result.next_offset,d);});d.append(b);}
   }
   async function fullImage(route){const d=dialog('原始图片'),image=el('img','tieba-original-image');d.append(image);try{const r=await archiveFetch(route),url=URL.createObjectURL(await r.blob());if(!d.isConnected){URL.revokeObjectURL(url);return;}image.src=url;d.addEventListener('close',()=>URL.revokeObjectURL(url),{once:true});}catch(e){d.append(el('p','error-text',e.message));}}
   async function viewArchive(id){
@@ -121,7 +145,7 @@
   }
   function renderArchives(data){
     archives.replaceChildren();
-    for(const a of data.items){const row=el('article','record');row.append(el('strong','',a.title),el('p','hint',a.forum+'吧 · '+(archiveState[a.state]||a.state)+' · 图片 '+a.saved_images+'/'+a.image_count+' · '+fmt(a.created)),el('p','hint',a.reason),button('查看原文与图片',()=>viewArchive(a.id)));if(a.error)row.append(el('p','error-text',a.error));archives.append(row);}
+    for(const a of data.items){const row=el('article','record');row.append(el('strong','',a.title),el('p','hint',a.forum+'吧 · '+(archiveState[a.state]||a.state)+' · 图片 '+a.saved_images+'/'+a.image_count+' · '+fmt(a.created)),el('p','hint',a.reason),el('p','hint',(a.pinned?'固定保留 · ':'')+'最近使用 '+fmt(a.last_used)),button('查看原文与图片',()=>viewArchive(a.id)),button(a.pinned?'取消固定保留':'固定保留',async()=>{await api('tieba/lifecycle/'+a.tid,'POST',{op:a.pinned?'unpin':'pin'});await load();}));if(a.error)row.append(el('p','error-text',a.error));archives.append(row);}
     if(!data.total)archives.append(el('p','hint','暂无原文收藏。AI 遇到感兴趣的内容会自动保存，也可在浏览记录中手动收藏。'));
     const pager=el('div','tieba-archive-tools');if(archivePage)pager.append(button('较新的收藏',async()=>{archivePage--;await load();}));
     if((archivePage+1)*20<data.total)pager.append(button('更早的收藏',async()=>{archivePage++;await load();}));archives.append(pager);
@@ -143,7 +167,7 @@
     try{
       const s=await api('tieba'),run=s.runs[0];
       if(!master.disabled){master.checked=!!s.enabled;cfg.tieba_enabled=!!s.enabled;}
-      status.textContent=(s.enabled?'已开启 · '+(s.busy?'正在浏览':s.requested?'等候空闲浏览':'下次 '+fmt(s.next_at)):'总开关已关闭 · 自动浏览、分享与调用均暂停')+' · 今日分享 '+s.sent_today+' · '+(s.login_configured?'已保存登录凭据':'匿名读取');
+      status.textContent=(s.enabled?'已开启 · '+(s.busy?'正在浏览':s.context_busy?'正在判断相关分享':s.requested?'等候空闲浏览':'下次 '+fmt(s.next_at)):'总开关已关闭 · 自动浏览、分享与调用均暂停')+' · 今日分享 '+s.sent_today+' · '+(s.login_configured?'已保存登录凭据':'匿名读取')+(s.memory_pressure?' · 内存紧张，后台浏览和归档暂缓':'');
       records.replaceChildren();
       if(run)records.append(el('p',run.state==='failed'?'error-text':'hint',fmt(run.started)+' · '+({done:'已完成',running:'浏览中',failed:'失败',interrupted:'已中断'}[run.state]||run.state)+' · 读取 '+run.read_count+' 帖 / 排队分享 '+run.picked_count+' / 收藏图片 '+run.image_count+(run.error?' · '+run.error:'')));
       for(const p of s.posts){const row=el('article','record');row.append(link(p.title,p.url),el('p','hint',p.forum+'吧 · 兴趣 '+p.score+' / 100 · '+(p.analyzed?p.reason:'待分析')));if(p.share_preview||p.share_text)row.append(el('p','tieba-meme-copy',p.share_preview||p.share_text));row.append(p.archive?button('查看原文收藏',()=>viewArchive(p.archive.id)):button('收藏原文与全部配图',async()=>{await api('tieba/posts/'+p.tid+'/archive','POST');notice('已加入收藏队列，旧记录会重新读取完整来源');await load();}));records.append(row);}
@@ -154,6 +178,8 @@
       for(const m of s.memes){
         const row=el('article','record tieba-meme');
         row.append(el('strong','',m.phrase),el('p','hint',(!m.enabled?'已停用':m.expires_at<Date.now()/1000?'已过期':!s.enabled||!cfg.tieba_learn_enabled?'已暂停调用':'可调用')+' · 有效至 '+fmt(m.expires_at)),el('p','tieba-meme-copy',m.meaning),el('p','hint tieba-meme-copy','场景：'+(m.scene||'未设置')),link('来源帖子',m.source_url));
+        if(m.background)row.append(el('p','hint tieba-meme-copy','背景：'+m.background));if(m.examples)row.append(el('p','tieba-meme-copy','用法：'+m.examples));
+        if(m.last_used)row.append(el('p','hint','最近实际使用 '+fmt(m.last_used)));
         const tools=el('div','tieba-archive-tools');tools.append(button('编辑这个梗',async()=>editMeme(m)),
           button(m.enabled?'停用 / 保留记录':'恢复使用',async()=>{await api('tieba/memes/'+m.id,'POST',{enabled:!m.enabled});await load();}),
           button('续期',async()=>{await api('tieba/memes/'+m.id,'POST',{renew:true});await load();}));row.append(tools);memes.append(row);
@@ -170,6 +196,14 @@
         if(['failed','cancelled'].includes(sh.state))row.append(button('重试这条分享',async()=>{await api('tieba/shares/'+sh.id,'POST',{op:'retry'});notice('已重新排队，按当前分享限制发送');await load();}));
         shares.append(row);
       }
+      toolEvents.replaceChildren();
+      for(const t of s.tools||[]){const row=el('article','record');row.append(el('strong','',({search_tieba:'搜索原文',read_tieba:'阅读原文',share_tieba:'选择原文分享'}[t.tool]||t.tool)+' · '+(t.ok?'成功':'未执行')),el('p','hint',chatName(t.chat)+' · '+fmt(t.created)+' · '+t.code));if(t.query)row.append(el('p','tieba-meme-copy',t.query));toolEvents.append(row);}
+      if(!s.tools?.length)toolEvents.append(el('p','hint','AI 实际调用工具后显示在这里；普通候选召回不会产生额外调用'));
+      retention.replaceChildren();const life=s.retention||{};
+      retention.append(el('p','hint','闲置 '+(life.unused_days??30)+' 天进回收站 · 保留 '+(life.trash_days??7)+' 天 · 本次到期待处理 '+(life.next_due_count||0)+' 条'));
+      for(const a of life.trash||[]){const row=el('article','record');row.append(el('strong','',a.title||'帖子 '+a.tid),el('p','hint','放入时间 '+fmt(a.trashed_at)),button('恢复并重新计时',async()=>{await api('tieba/lifecycle/'+a.tid,'POST',{op:'restore'});await load();}),button('恢复并固定保留',async()=>{await api('tieba/lifecycle/'+a.tid,'POST',{op:'pin'});await load();}));retention.append(row);}
+      if(!life.trash?.length)retention.append(el('p','hint','回收站为空'));
+      for(const t of life.events||[]){const row=el('details','record');row.append(el('summary','',({trash:'转入回收站',purge_planned:'删除前逐项文件计划',purged:'已完成清理'}[t.operation]||t.operation)+' · 帖子 '+t.tid+' · '+fmt(t.created)));row.append(el('p','hint',(t.files||0)+' 个文件 / '+((t.bytes||0)/1024/1024).toFixed(1)+' MB'));if(t.plan_json&&t.plan_json!=='[]')row.append(el('pre','tieba-original-text',JSON.parse(t.plan_json).join('\n')));retention.append(row);}
     }finally{loading=false;}
   }
   function refreshChatLabels(){for(const check of targets.querySelectorAll('input'))check.parentElement.lastChild.textContent=chatName(check.value);}

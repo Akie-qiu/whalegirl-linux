@@ -1,17 +1,19 @@
 # 鲸鱼娘 Linux 微信机器人交接文档
 
-**交接时间：** 2026-10-24 18:48（北京时间，含下午完整迭代与四层内存清理机制）  
-**目的：** 让接手的 agent 能从当前代码、Git 和服务器状态继续工作，避免重复部署、重复登录或误判已验收范围。  
+> **2026-10-25 最新补充：** 当前核心已更新至 `tieba-tools-20261025-114557-78576617`，14 个后台任务；已接贴吧检索/读原文/选段分享工具、接梗调节与闲置回收。11:01 的新掉线由微信容器 1 GiB 上限 OOM 导致，已改 1280 MiB 并补充容器压力守护，详情先读 `TIEBA_TOOLS_20261025.md`。本轮没有推送 Git；以下 10 月 24 日版本、Git 与资源数据为历史快照。原主动分享总开关仍保持关闭。
+
+**交接时间：** 2026-10-24 20:18（北京时间，含全天完整迭代、四层内存清理机制与图库权限文件自愈修复）\
+**目的：** 让接手的 agent 能从当前代码、Git 和服务器状态继续工作，避免重复部署、重复登录或误判已验收范围。\
 **项目范围：** 仅 `D:\appData\qqbot\wechat-linux` 里的全 Linux 微信机器人。
 
-> 这份文档包含 2026-10-24 上午的稳定性修复与 2026-10-24 下午（12:45–18:48）完成的六项功能/智能度/内存守护迭代更新，最新生产状态快照核对于 2026-10-24 18:48（北京时间）。服务可能在之后发生变化，接手时应先短暂复核服务器，不要把快照当作实时状态。  
+> 这份文档包含 2026-10-24 上午的稳定性修复与 2026-10-24 下午至晚间（12:45–20:18）完成的七项功能/智能度/内存守护/图库权限自愈迭代更新，最新生产状态快照核对于 2026-10-24 20:17（北京时间）。服务可能在之后发生变化，接手时应先短暂复核服务器，不要把快照当作实时状态。\
 > 本文不含 API Key、管理密码、SSH 私钥、微信登录数据或私人聊天原文。
 
 ## 1. 交接摘要
 
 - 微信固定使用 **4.1.1.8**，运行在 Linux Docker 容器中；回复核心、原生读取辅助服务和管理入口也在 Linux 服务器常驻。
-- GitHub 仓库为 `Akie-qiu/whalegirl-linux`（已按用户要求设为 **Public 公开仓库**，全库已完成凭据扫描无敏感信息），`main` 分支与 `backup/local-snapshot-20261024` 分支保持同步；最新代码基线为 `7875449`。
-- **2026-10-24 下午会话完成的六项核心更新**（均已部署至远端并推送到 GitHub）：
+- GitHub 仓库为 `Akie-qiu/whalegirl-linux`（已按用户要求设为 **Public 公开仓库**，全库已完成凭据扫描无敏感信息），`main` 分支与 `backup/local-snapshot-20261024` 分支保持同步；最新功能代码基线为 `8f730c2`。
+- **2026-10-24 下午至晚间完成的七项核心更新**（均已部署至远端并推送到 GitHub）：
   1. **Prefix Cache（前缀缓存）拼贴顺序重构（`7b05faa`、`4776344`）**：在**零改动用户人设提示词原文**的前提下，将所有静态规则提示词与基础图库列表前置到 `static_system`，将单轮变化的候选差集、群成员 `@` 花名册、检索记忆、贴吧召回、表情候选及好感度移至 `【本轮动态上下文】` 尾部，并引入历史对话窗口步进锚定（stride anchoring）。多轮对话 Prefix Cache 命中率由 ~18% 提升至 **78%–93%**。
   2. **微信 `4.1.1.8` 退出后无法恢复重登故障修复（`8b6ed1a`）**：修复网关 `wechat.js` 中英文界面 `"Enter Weixin"` 按钮未归一化为 `"进入微信"` 导致快捷复登点击失效的问题；修复微信退出后残留“你已退出微信”良性提示弹窗被误判为风控拦截从而阻断 `getLoginQr()` 刷新二维码的问题；修复宿主机 `wechat-home` 目录属主（`1000:1000`）。
   3. **本地登录频次保护调整（`a8c1f3c`）**：将本地 10 分钟内允许发起的登录/重登请求上限从 `3` 次调整为 **`7` 次**（同步更新 `safety.py`、`app.py`、`web.html`）。
@@ -24,9 +26,13 @@
   6. **四层全自动内存清理与 `WeChatAppEx` 命名空间压制机制（`7875449`）**：
      - 解决群内收到网页链接触发 11 个 `WeChatAppEx` Chromium 子进程吞噬 `400+ MiB` 内存并阻塞 AT-SPI 总线导致 `a11y-dump` 8 秒超时的问题；
      - `core_watchdog.py` 每分钟自动在容器挂载命名空间将轻量休眠桩绑定至 `/opt/wechat/RadiumWMPF/runtime/WeChatAppEx`（不删原文件），自动收割超时 `a11y-dump` / `xclip` / `unittest` 孤儿进程，并在宿主机 `MemAvailable < 320 MiB` 时自动回收干净页缓存；
-     - `runtime.py` 每 30 秒空闲周期执行 `PRAGMA shrink_memory` + `gc.collect()` + `libc.malloc_trim(0)`，将宿主机可用物理内存稳定恢复至 **`597 MiB`**，负载回落至 **`0.89`**。
-- **2026-10-24 上午完成的稳定性优化**：回复核心有效限制为 `MemoryHigh=384M`、`MemoryMax=512M`、`MemorySwapMax=512M`；Uvicorn 有界并发；每分钟独立检查核心健康。
-- 最近检查（18:48）时核心与网页健康接口均返回 200（`status=ok`，13 个后台协程全部正常，失败任务 0，`MemoryCurrent=72.7 MiB`），微信已扫码登录在线。
+     - `runtime.py` 每 30 秒空闲周期执行 `PRAGMA shrink_memory` + `gc.collect()` + `libc.malloc_trim(0)`。
+  7. **图库发送权限文件防误删与自动自愈修复（`8f730c2`）**：
+     - 修复 `7875449` 中 `trim_memory()` 用 `*.json` 通配清理过期临时 UI 任务文件时误删常驻权限文件 `authorized-chats.json`（导致 18:56 报 `No such file or directory: '/data/whalegirl-jobs/authorized-chats.json'`）的缺陷；
+     - 将清理范围严格收窄为仅匹配 32 位十六进制临时任务文件名（`^[0-9a-f]{32}\.json$`），并新增 `Config.sync_authority()` 与 `Runtime.ensure_authority_files()` 在启动及每轮清理后自动检查并自愈重建 `authorized-chats.json` 与 `image-assets.json`。
+- **19:02–20:17 线上真机运行验证**：
+  - 私聊多图连发（`19:17:03`、`19:17:17`、`19:17:32` 连发 3 张图库图）、群聊图库发图（`19:27:37`）、群聊 AI 生图并发送（`19:51:11`）以及群聊多轮文字+贴吧梗召回+原生表情回复（`19:58~20:05`）**全部 `sent` 且 `err=''`**；
+  - 20:17 实时检查：宿主机 `load average: 0.40, 0.57, 0.70`，`MemAvailable: 387 MiB`，核心 `status=ok`（13 个后台协程正常，`failed_background_tasks=0`，`MemoryCurrent=162 MiB`，`Swap=0`，`appex_stub_mounted=true`）。
 
 ## 2. 首要操作规则
 
@@ -61,6 +67,8 @@
 - 仓库：`Akie-qiu/whalegirl-linux`（Public 公开仓库，`https://github.com/Akie-qiu/whalegirl-linux`）
 - 当前同步分支：`main`（默认分支）与 `backup/local-snapshot-20261024`
 - 2026-10-24 提交演进记录（由新到旧）：
+  - `8f730c2` — `fix(images): stop trim_memory deleting authority files; self-heal authorized-chats.json`（收窄临时任务 JSON 清理正则并自愈重建容器权限文件）
+  - `a3aab6d` — `docs: record 18:15 WeChatAppEx memory exhaustion root cause and 4-layer memory cleanup mechanism`
   - `7875449` — `feat(stability): add 4-layer automatic memory cleanup and WeChatAppEx bind-mount suppression`（四层自动内存清理、WeChatAppEx 挂载压制与发送前置容错）
   - `1220d08` — `更新-10/24`（下午阶段性交接文档归档）
   - `85a91e6` — `fix(chat): prevent stale image re-attachment, support homophone/multi-image library send, and guard empty image promises`（群聊防旧图误挂、同音别称与多图连发、空口发图拦截补救）
@@ -219,8 +227,11 @@ systemd 的历史 `NRestarts=89` 包含上述部署权限错误期间的自动�
    - 核心改动：
      - **第一层（微信内置浏览器 `WeChatAppEx` 永久压制）**：`core_watchdog.py` 每分钟检查容器挂载命名空间（`/proc/<cpid>/mountinfo`），自动通过 `nsenter ... mount -n --bind` 将轻量休眠桩绑定至 `/opt/wechat/RadiumWMPF/runtime/WeChatAppEx`，防止群内收到网页链接/小程序时拉起 6～11 个 Chromium 进程吞噬 `400+ MB` 内存并阻塞 AT-SPI 无障碍总线（`bus_99`）。
      - **第二层（超时挂起子进程自动收割）**：`core_watchdog.py` 每分钟自动清理超时卡死的 `a11y-dump`（>20s）、`xclip`（>90s）、残留 `unittest/pytest`（>300s）与 `crashpad_handler`。
-     - **第三层（Python 核心进程内堆内存与缓存回收）**：`runtime.py` 新增 `trim_memory()`，每 30 秒空闲周期自动清理过期群成员缓存、过期 UI 任务 JSON 文件，并执行 SQLite `PRAGMA shrink_memory`、`gc.collect()` 及 `libc.malloc_trim(0)` 强制归还 glibc 堆页给操作系统；同时将 `safety_notice()` 全树探测降频至每 5 分钟一次。
+     - **第三层（Python 核心进程内堆内存与缓存回收）**：`runtime.py` 新增 `trim_memory()`，每 30 秒空闲周期自动清理过期群成员缓存、仅匹配 `^[0-9a-f]{32}\.json$` 的过期临时 UI 任务文件（通过 `ensure_authority_files()` 保护并自愈常驻的 `authorized-chats.json` 与 `image-assets.json`），并执行 SQLite `PRAGMA shrink_memory`、`gc.collect()` 及 `libc.malloc_trim(0)` 强制归还 glibc 堆页给操作系统；同时将 `safety_notice()` 全树探测降频至每 5 分钟一次。
      - **第四层（宿主机低内存水位回收与发送状态容错）**：`core_watchdog.py` 将 `vm.swappiness` 控制在 `20`，当宿主机 `MemAvailable < 320 MB` 时自动触发 `sync` + `drop_caches=1` 释放干净页缓存；`gateway.py` 将 `status_for_send` 缓存有效期扩至 30 秒并支持在瞬时超时时回退使用 180 秒内已知的 `logged_in` 状态。
+7. **图库权限文件防误删与自愈修复（`8f730c2`）**
+   - 涉及文件：`whalegirl_linux/settings.py`、`whalegirl_linux/runtime.py`、`tests/test_images.py`。
+   - 核心改动：`Config.sync_authority()` 独立封装权限文件写入，`Runtime.ensure_authority_files()` 在启动与每次 `trim_memory()` 时自动检查并重建缺失的 `authorized-chats.json` / `image-assets.json`；容器内 31 张启用图片 100% 通过 `native_image_send.approved()` 校验，19:17~19:51 真机私聊多图连发、群聊图库发图与群聊 AI 生图发送全部成功。
 
 ## 6. 故障检查和安全发布流程
 

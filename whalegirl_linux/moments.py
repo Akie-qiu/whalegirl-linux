@@ -20,6 +20,43 @@ LIMITS = {'publish': 'moments_publish_per_day', 'reply_own': 'moments_reply_own_
           'comment_friend': 'moments_comment_friends_per_day'}
 
 
+def comment_context(post, target, account):
+    """Describe the selected public thread without mixing in other Moments posts."""
+    comments = {str(c['id']): c for c in post.get('comments', []) if c.get('id') is not None}
+    comments[str(target['id'])] = target
+    names = {c.get('author'): c.get('name') or c.get('author') for c in comments.values()}
+    own_authors = {account, *(c.get('author') for c in comments.values() if c.get('own'))}
+    if post.get('own'):
+        own_authors.add(post.get('author'))
+    own_authors.discard(None)
+    own_authors.discard('')
+    names.update({author: '你自己' for author in own_authors})
+
+    def describe(comment):
+        parent = comments.get(str(comment.get('reply_to')))
+        recipient = comment.get('target') or (parent or {}).get('author')
+        return {'id': str(comment['id']), 'speaker': comment.get('name') or comment.get('author'),
+                'speaker_id': comment.get('author'),
+                'is_you': bool(comment.get('own')), 'text': comment.get('text', ''),
+                'reply_to_id': str(comment.get('reply_to') or ''),
+                'reply_to_person': names.get(recipient, recipient or ''),
+                'reply_to_you': bool(recipient in own_authors or parent and parent.get('own'))}
+
+    chain, seen = [], set()
+    current = target
+    while current and str(current['id']) not in seen and len(chain) < 12:
+        seen.add(str(current['id']))
+        chain.append(describe(current))
+        current = comments.get(str(current.get('reply_to')))
+    chain.reverse()
+    ordered = sorted(comments.values(), key=lambda c: (
+        c.get('created') or 0, len(str(c['id'])), str(c['id'])))
+    return {'reply_target': describe(target), 'thread_oldest_first': chain,
+            'recent_public_comments': [describe(c) for c in ordered[-12:]],
+            'parent_comment_available': not target.get('reply_to') or
+                str(target.get('reply_to')) in ('0', '') or str(target['reply_to']) in comments}
+
+
 def similar_publication(left, right):
     """Catch near copies locally; semantic variety is decided in the existing model call."""
     clean = lambda text: re.sub(r'[\W_]+', '', str(text).casefold())
@@ -109,6 +146,12 @@ class MomentsBook:
         for row in rows:
             item = dict(row)
             payload = json.loads(item.pop('payload'))
+            item['auto_publish'] = bool(payload.get('auto_publish'))
+            item['publish_requested_at'] = payload.get('publish_requested_at', 0)
+            since = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            item['queued'] = item['state'] == 'draft' and item['publish_requested_at'] >= since
+            if item['state'] == 'draft' and 0 < item['publish_requested_at'] < since:
+                item['error'] = '当天排队已过期，请重新点击发布'
             post, comment = payload.get('post', {}), payload.get('comment', {})
             item['target'] = {'post_id': post.get('id', ''), 'author': post.get('name', ''),
                               'post_text': post.get('text', '')[:500], 'comment': comment.get('text', '')[:500],
@@ -116,11 +159,19 @@ class MomentsBook:
             result.append(item)
         return result
 
-    def count(self, account, kind, *, pending=False):
+    def count(self, account, kind, *, pending=False, scheduled_only=False):
         now = datetime.now(TZ)
         since = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-        pending_sql = " OR (state IN ('draft','generating','awaiting_image') AND created>=?)" if pending else ''
-        args = (account, kind, since, since) if pending else (account, kind, since)
+        reservation = (" AND (json_extract(payload,'$.auto_publish')=1"
+                       " OR json_extract(payload,'$.publish_requested_at')>=?"
+                       " OR source GLOB '????-??-??/[0-9]*')") if scheduled_only and kind == 'publish' else ''
+        pending_sql = (" OR (state IN ('draft','generating','awaiting_image')"
+                       " AND (created>=? OR json_extract(payload,'$.publish_requested_at')>=?)" + reservation + ")") if pending else ''
+        args = [account, kind, since]
+        if pending:
+            args.extend([since, since])
+            if reservation:
+                args.append(since)
         return self.store.db.execute(f'''SELECT count(*) FROM moments_actions
             WHERE account=? AND kind=? AND ((updated>=? AND state IN ('sent','sending','uncertain')){pending_sql})''', args).fetchone()[0]
 
@@ -274,10 +325,31 @@ class MomentsService:
             plan = self._build_publish_plan(s, now)
             saved['publish_plan'] = plan
 
-        rows = self.runtime.store.db.execute('''SELECT source, state, created, updated, error FROM moments_actions
+        rows = self.runtime.store.db.execute('''SELECT source, state, created, updated, error, payload FROM moments_actions
             WHERE account=? AND kind='publish' AND (created>=? OR updated>=?)''',
             (s.account_id, since, since)).fetchall() if s.account_id else []
         occupied_states = ('sent', 'sending', 'uncertain', 'draft', 'generating', 'awaiting_image', 'image_failed')
+        previews = []
+        reserved = []
+        for row in rows:
+            payload = json.loads(row['payload'])
+            scheduled = (payload.get('auto_publish') or payload.get('publish_requested_at', 0) >= since
+                         or re.fullmatch(r'\d{4}-\d{2}-\d{2}/\d+(?:/r\d+)?', row['source'] or ''))
+            if row['state'] in ('draft', 'generating', 'awaiting_image', 'image_failed') and not scheduled:
+                previews.append(row)
+            else:
+                reserved.append(row)
+        rows = reserved
+        # Repair only future/current slots that the previous version consumed
+        # solely because an unapproved manual preview was created there.
+        if plan.get('reservation_version', 1) < 2:
+            for slot in plan.get('slots', []):
+                if (slot.get('done') and slot['end'] > now
+                        and any(slot['start'] <= r['created'] < slot['end'] for r in previews)
+                        and not any(slot['start'] <= r['created'] < slot['end']
+                                    and (r['state'] in occupied_states or r['state'] == 'skipped') for r in rows)):
+                    slot['done'] = False
+            plan['reservation_version'] = 2
         active_times = [max(r['created'], r['updated']) for r in rows if r['state'] in occupied_states]
         last_active_ts = max(active_times, default=0.0)
 
@@ -300,7 +372,7 @@ class MomentsService:
         now = time.time() if now is None else now
         if not s.moments_enabled or not s.moments_publish_enabled or s.moments_publish_per_day <= 0:
             return None
-        if self.book.count(s.account_id, 'publish', pending=True) >= s.moments_publish_per_day:
+        if self.book.count(s.account_id, 'publish', pending=True, scheduled_only=True) >= s.moments_publish_per_day:
             return None
         plan, last_active_ts = self.ensure_publish_plan(s, saved, now)
         slots = plan.get('slots', [])
@@ -326,7 +398,7 @@ class MomentsService:
         now = time.time() if now is None else now
         if not s.moments_enabled or not s.moments_publish_enabled or s.moments_publish_per_day <= 0:
             return None
-        if self.book.count(s.account_id, 'publish', pending=True) >= s.moments_publish_per_day:
+        if self.book.count(s.account_id, 'publish', pending=True, scheduled_only=True) >= s.moments_publish_per_day:
             return None
         before = json.dumps(saved.get('publish_plan'), sort_keys=True) if 'publish_plan' in saved else ''
         plan, last_active_ts = self.ensure_publish_plan(s, saved, now)
@@ -447,7 +519,8 @@ class MomentsService:
         async with self.lock:
             self.gate(kind)
             s = self.runtime.config.settings
-            if self.book.count(s.account_id, kind, pending=True) >= getattr(s, LIMITS[kind]):
+            pending = kind != 'publish' or bool(auto_publish or source)
+            if self.book.count(s.account_id, kind, pending=pending, scheduled_only=True) >= getattr(s, LIMITS[kind]):
                 raise ValueError('今日额度已被发送或待审草稿占用')
             payload = payload or {}
             if kind == 'publish':
@@ -486,6 +559,21 @@ class MomentsService:
                         'friendliness': ('温柔熟悉，但保持公开场合的朋友边界' if subject and s.affection_enabled
                             and self.runtime.affection.personal_priority(s.account_id, subject, s) else '自然亲切'),
                         'recent_own_posts': [p['text'] for p in self.posts if p.get('own')][:4]}
+                if kind != 'publish':
+                    post = payload['post']
+                    data['source'] = {'post': {k: post.get(k) for k in
+                        ('id', 'author', 'name', 'own', 'text', 'title', 'kind', 'image_count', 'created')}}
+                    data.pop('recent_own_posts')
+                    public_rules += ('只围绕source中的这一条动态发言，不把其他动态或聊天内容当成当前话题。'
+                        '先理解原动态的语气、反话和玩笑；没有依据时不要替对方补故事，不要机械附和。')
+                    if kind == 'reply_own':
+                        data['source']['conversation'] = comment_context(post, payload['comment'], s.account_id)
+                        public_rules += ('conversation.reply_target是这次唯一要回复的那条评论，'
+                            'thread_oldest_first按从旧到新给出它所回复的对话链，recent_public_comments只是同一动态下的背景。'
+                            '区分评论者、被回复者和你自己：is_you=true才是你说过的话，'
+                            'reply_to_person标明对方原本在和谁说话，不能把群友互相交谈都理解为在问你。'
+                            '理解对方具体在回应哪句话，再自然接话；缺少父评论时不要编造上文。'
+                            '不要重复自己已经说过的话；如果问题已被回答或插话不合适，可以不参与。')
                 history = self.publication_history(identity) if kind == 'publish' else []
                 if kind == 'publish':
                     data['recent_publications'] = history
@@ -521,6 +609,8 @@ class MomentsService:
                         '不得把私聊、群聊或未公开人物记忆写入配图提示；只描述公开可见的画面。')
                 # Own client prevents a console config change from closing an in-flight chat request.
                 engine = self.runtime.engine_factory(api_url=s.api_url, api_key=self.runtime.config.api_key(),
+                    api_style=s.api_style,
+                    reasoning_effort=s.reasoning_effort, stream_enabled=s.model_stream_enabled,
                     model=s.model, max_tokens=1000 if kind == 'publish' else 320,
                     temperature=.85 if kind == 'publish' else .7, timeout=20, max_retries=1)
                 try:
@@ -528,6 +618,8 @@ class MomentsService:
                         system_prompt=style + '\n' + public_rules, response_format={'type': 'json_object'})
                 finally:
                     await engine.close()
+                if not answer or not answer.strip():
+                    raise ValueError(getattr(engine, 'last_error', '') or '模型没有返回朋友圈内容')
                 value = parse_json(answer) or {}
                 if not isinstance(value, dict) or not isinstance(value.get('participate'), bool):
                     raise ValueError('朋友圈生成未返回有效决定，未发送')
@@ -570,9 +662,11 @@ class MomentsService:
                         except ValueError:
                             self.book.change(identity, 'image_failed', error='配图任务未能提交，文案保留，可调整配图后发布')
                 return self.book.get(s.account_id, identity)
-            except Exception:
-                self.book.change(identity, 'failed', error='生成失败，未提交微信')
-                raise
+            except Exception as exc:
+                detail = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+                error = '生成失败，未提交微信：' + detail[:220]
+                self.book.change(identity, 'failed', error=error)
+                raise ValueError(error) from exc
 
     async def retry_draft(self, identity):
         """Keep approved text and rebind one definite failure to its current source."""
@@ -601,7 +695,7 @@ class MomentsService:
             self.book.change(created, 'draft', text=old['text'])
             return created
 
-    async def send(self, identity):
+    async def send(self, identity, *, requested=False):
         async with self.lock:
             r = self.runtime
             s = r.config.settings
@@ -616,11 +710,21 @@ class MomentsService:
             if row['kind']=='publish':
                 for asset_id in payload.get('assets',[]):
                     r.images.stage(asset_id, chat='', admin=asset_id in payload.get('assets_authorized',[]))
+            if requested:
+                payload['publish_requested_at'] = time.time()
+                with r.store.lock:
+                    r.store.db.execute('UPDATE moments_actions SET payload=? WHERE id=?',
+                        (json.dumps(payload, ensure_ascii=False), identity))
+                    r.store.db.commit()
             if self.busy():
-                raise ValueError('聊天正在处理，草稿保留，稍后发布')
+                self.book.change(identity, 'draft', error='已排队，聊天空闲后发送' if requested or payload.get('publish_requested_at')
+                                 else '聊天正在处理，自动任务稍后再试')
+                return self.book.get(s.account_id, identity)
             await asyncio.sleep(max(0, r.last_send+s.min_send_interval-time.time()))
             if self.busy():
-                raise ValueError('聊天正在处理，草稿保留，稍后发布')
+                self.book.change(identity, 'draft', error='已排队，聊天空闲后发送' if requested or payload.get('publish_requested_at')
+                                 else '聊天正在处理，自动任务稍后再试')
+                return self.book.get(s.account_id, identity)
             self.gate(row['kind'])
             channel = 'moments:' + row['kind'] + ':' + str(payload.get('post', {}).get('id') or 'timeline')
             check = r.safety.check(s.account_id, channel, r.config.settings, reply=row['text'], kind='text')
@@ -646,6 +750,17 @@ class MomentsService:
         s = r.config.settings
         if not s.moments_enabled or self.busy() or r.gateway_state.get('status') != 'logged_in':
             return
+        # Explicit administrator requests survive a busy chat and a core restart.
+        # Unapproved previews and last day's queued requests are never picked up.
+        since = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        queued = r.store.db.execute('''SELECT id,kind FROM moments_actions WHERE account=? AND state='draft'
+            AND json_extract(payload,'$.publish_requested_at')>=? ORDER BY updated''',
+            (s.account_id, since)).fetchall()
+        for row in queued:
+            if (getattr(s, SWITCHES[row['kind']]) and
+                    self.book.count(s.account_id, row['kind']) < getattr(s, LIMITS[row['kind']])):
+                await self.send(row['id'])
+                return
         hour = datetime.now(TZ).hour
         if s.moments_start_hour != s.moments_end_hour:
             inside = (s.moments_start_hour <= hour < s.moments_end_hour if s.moments_start_hour < s.moments_end_hour
@@ -657,7 +772,7 @@ class MomentsService:
             since = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
             ready = r.store.db.execute('''SELECT id FROM moments_actions WHERE account=? AND kind='publish'
                 AND state='draft' AND created>=? AND json_extract(payload,'$.auto_publish')=1
-                AND (json_extract(payload,'$.media_mode')<>'generate' OR json_array_length(payload,'$.assets')>0)
+                AND (COALESCE(json_extract(payload,'$.media_mode'),'none')<>'generate' OR json_array_length(payload,'$.assets')>0)
                 ORDER BY created LIMIT 1''', (s.account_id, since)).fetchone()
             if ready:
                 await self.send(ready['id'])
