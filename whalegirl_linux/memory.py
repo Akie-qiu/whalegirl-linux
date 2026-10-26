@@ -39,6 +39,10 @@ class MemoryBook:
                 store.db.execute("ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'chat'")
             if 'expires_at' not in columns:
                 store.db.execute('ALTER TABLE memories ADD COLUMN expires_at REAL NOT NULL DEFAULT 0')
+            if 'triggers' not in columns:
+                store.db.execute("ALTER TABLE memories ADD COLUMN triggers TEXT NOT NULL DEFAULT ''")
+            if 'salience' not in columns:
+                store.db.execute('ALTER TABLE memories ADD COLUMN salience INTEGER NOT NULL DEFAULT 3')
             store.db.commit()
 
     def get(self, account, memory_id, allowed):
@@ -62,8 +66,8 @@ class MemoryBook:
         if subject:
             sql += ' AND subject=?';params.append(subject)
         if query:
-            sql += " AND (instr(lower(content),lower(?))>0 OR instr(lower(subject),lower(?))>0)"
-            params.extend([query[:200],query[:200]])
+            sql += " AND (instr(lower(content),lower(?))>0 OR instr(lower(subject),lower(?))>0 OR instr(lower(triggers),lower(?))>0)"
+            params.extend([query[:200],query[:200],query[:200]])
         rows = self.store.db.execute(sql+' ORDER BY updated DESC,id DESC LIMIT ?',(*params,min(100,limit))).fetchall()
         return [dict(r) for r in rows]
 
@@ -78,14 +82,25 @@ class MemoryBook:
         return bool(row and not row.get('archived') and
                     (not row.get('expires_at') or row['expires_at'] > (time.time() if now is None else now)))
 
-    def recall(self, account, allowed, subject, question, *, chat=None, subjects=(), shared=True, limit=12, personal_priority=0, diagnostics=None, include_jokes=True):
+    @staticmethod
+    def _trigger_matches(row, words, question_lower):
+        raw = str(row.get('triggers') or '').casefold()
+        if not raw:
+            return 0
+        tags = [t.strip() for t in re.split(r'[,，、\s/#]+', raw) if len(t.strip()) >= 2]
+        direct = sum(1 for t in tags if t in question_lower)
+        overlap = sum(1 for w in words if w in raw)
+        return direct * 2 + overlap
+
+    def recall(self, account, allowed, subject, question, *, chat=None, subjects=(), shared=True, limit=12, personal_priority=0, diagnostics=None, include_jokes=True, half_life_days=21):
         if not allowed or limit <= 0:
             if diagnostics is not None:diagnostics.update(available_in_scope=0)
             return []
         people = {p for p in (*subjects, subject) if p}
         marks = ','.join('?' for _ in allowed)
+        now = time.time()
         sql = f'SELECT * FROM memories WHERE account=? AND chat IN ({marks}) AND archived=0 AND (expires_at=0 OR expires_at>?)'
-        params = [account, *allowed, time.time()]
+        params = [account, *allowed, now]
         if not include_jokes:sql+=" AND kind!='joke'"
         if chat is not None:
             if shared and people:
@@ -101,15 +116,29 @@ class MemoryBook:
             rows=[r for r in rows if self.visible(r,chat,people,shared)]
         if diagnostics is not None:diagnostics.update(available_in_scope=len(rows))
         words = recall_terms(question)
+        q_lower = str(question or '').casefold()
+        hl = max(3, int(half_life_days or 21))
         def score(r):
-            related=sum(w in r['content'].casefold() for w in words)
+            related=sum(w in r['content'].casefold() for w in words) + self._trigger_matches(r, words, q_lower)
             personal=r['subject'] in people and r['kind'] in ('fact','preference')
+            self_flag=r['kind'] in ('self_stance','shared_moment') and (r['subject'] in people or r['subject'] in ('self', account))
             admin=r['actor']=='admin'
+            salience=max(1, min(5, int(r.get('salience') or 3)))
             # Explicit facts and administrator corrections should remain
             # available during ordinary conversation, ahead of unrelated events.
-            return (6*min(related,12) + 10*personal + 4*(r['subject']==subject)
+            base = (6*min(related,12) + 10*personal + 4*(r['subject']==subject)
+                    + (5 if self_flag and related else 0)
                     + 8*admin + 2*int(r['kind']=='preference')
                     + 2*min(2,max(0,personal_priority))*bool(related and personal))
+            if base <= 0:
+                return 0.0
+            salience_boost = 1.0 + 0.15 * (salience - 3)
+            if salience >= 5 or admin:
+                decay = 1.0
+            else:
+                age_days = max(0.0, (now - float(r.get('updated') or now)) / 86400.0)
+                decay = 0.5 ** (age_days / (hl * (1.5 if salience >= 3 else 0.75)))
+            return round(base * salience_boost * max(0.25, decay), 3)
         return sorted((r for r in rows if score(r)>0),
                       key=lambda r:(score(r), r['updated'], r['id']),reverse=True)[:limit]
 
@@ -118,12 +147,14 @@ class MemoryBook:
         limit={'off':0,'low':1,'normal':2,'high':3}[frequency]
         if not limit or chat not in allowed or not chat.endswith('@chatroom'):
             return []
-        words=recall_terms(question[-2400:])
+        q_slice = question[-2400:]
+        words=recall_terms(q_slice)
         if not words:return []
+        q_lower = q_slice.casefold()
         rows=[dict(r) for r in self.store.db.execute('''SELECT * FROM memories
             WHERE account=? AND chat=? AND scope='chat' AND kind='joke' AND archived=0
             AND expires_at>? ORDER BY updated DESC,id DESC''',(account,chat,time.time()))]
-        def score(row):return sum(w in row['content'].casefold() for w in words)
+        def score(row):return sum(w in row['content'].casefold() for w in words) + self._trigger_matches(row, words, q_lower)
         threshold=2 if frequency=='low' else 1
         return sorted((r for r in rows if score(r)>=threshold),
                       key=lambda r:(score(r),r['updated'],r['id']),reverse=True)[:limit]
@@ -146,7 +177,7 @@ class MemoryBook:
             WHERE r.account=? AND m.chat IN ({marks}) ORDER BY r.id DESC LIMIT 50''',(account,*allowed)).fetchall()
         return [dict(r) for r in rows]
 
-    def change(self, account, allowed, data, *, actor='admin', allowed_sources=()):
+    def change(self, account, allowed, data, *, actor='admin', allowed_sources=(), allow_self=False):
         op = data.get('op','create')
         if op not in ('create','update','archive','restore'):
             raise ValueError('不支持的记忆操作')
@@ -156,11 +187,25 @@ class MemoryBook:
                 raise ValueError('记忆不存在或会话未授权')
             if old and data.get('version')!=old['version']:
                 raise ValueError('记忆已经修改，请刷新后重试')
-            value = dict(old or {'account':account,'created':time.time(),'archived':0,'scope':'chat','expires_at':0})
+            value = dict(old or {'account':account,'created':time.time(),'archived':0,'scope':'chat','expires_at':0,'triggers':'','salience':3})
+            value.setdefault('triggers', '')
+            value.setdefault('salience', 3)
             if op in ('create','update'):
                 for key in ('chat','subject','kind','content','source_key','scope'):
-                    if key in data:value[key]=data[key]
-                if value.get('chat') not in allowed or value.get('kind') not in ('fact','impression','preference','relationship','event','joke'):
+                    if key in data and data[key] is not None:value[key]=data[key]
+                if 'triggers' in data and data['triggers'] is not None:
+                    raw_t = data['triggers']
+                    if isinstance(raw_t, list):
+                        raw_t = '，'.join(str(x).strip() for x in raw_t if str(x).strip())
+                    if not isinstance(raw_t, str) or len(raw_t) > 300:
+                        raise ValueError('联想触发词需为不超过300字的字符串')
+                    value['triggers'] = raw_t.strip()
+                if 'salience' in data and data['salience'] is not None:
+                    sal = data['salience']
+                    if isinstance(sal, bool) or not isinstance(sal, int) or not 1 <= sal <= 5:
+                        raise ValueError('记忆情绪权重需为1～5的整数')
+                    value['salience'] = sal
+                if value.get('chat') not in allowed or value.get('kind') not in ('fact','impression','preference','relationship','event','joke','self_stance','shared_moment'):
                     raise ValueError('记忆会话或类型无效')
                 if value.get('scope') not in ('chat','profile'):
                     raise ValueError('记忆范围无效')
@@ -169,7 +214,7 @@ class MemoryBook:
                 if value['kind']=='joke':
                     if value['scope']!='chat' or not value['chat'].endswith('@chatroom'):
                         raise ValueError('共同梗只保存在来源群聊，不能进入共享人物档案或私聊')
-                    if 'ttl_days' in data:
+                    if 'ttl_days' in data and data['ttl_days'] is not None:
                         days=data['ttl_days']
                         if isinstance(days,bool) or not isinstance(days,int) or not 1<=days<=90:
                             raise ValueError('共同梗有效期需为1～90天')
@@ -187,9 +232,13 @@ class MemoryBook:
                 if op=='restore':raise ValueError('恢复归档记忆需要管理员操作')
                 source = self.store.db.execute('SELECT * FROM message_log WHERE key=? AND account=?',
                                               (data.get('source_key'),account)).fetchone()
-                if not source or source['key'] not in allowed_sources or source['is_self']!=0:
+                is_self_kind = allow_self and value.get('kind') in ('self_stance','shared_moment')
+                if not source or source['key'] not in allowed_sources or (source['is_self']!=0 and not (is_self_kind and source['is_self']==1)):
                     raise ValueError('AI记忆修改必须引用本次真实收到的消息')
-                if value['subject']!=source['sender_id'] or (old and old['subject']!=source['sender_id']):
+                if is_self_kind and source['is_self']==1:
+                    if value['kind']=='self_stance':
+                        value['subject']='self'
+                elif value['subject']!=source['sender_id'] or (old and old['subject']!=source['sender_id']):
                     raise ValueError('只能修改消息作者本人的记忆或相处印象')
                 if op in ('create','update') and value['chat']!=source['chat']:
                     raise ValueError('记忆来源会话不匹配')
@@ -218,10 +267,11 @@ class MemoryBook:
                          evidence_key=data.get('source_key') or '')
             if old:
                 self.store.db.execute('''UPDATE memories SET chat=:chat,subject=:subject,kind=:kind,content=:content,
-                    source_key=:source_key,actor=:actor,version=:version,archived=:archived,updated=:updated,scope=:scope,expires_at=:expires_at WHERE id=:id''',value)
+                    source_key=:source_key,actor=:actor,version=:version,archived=:archived,updated=:updated,
+                    scope=:scope,expires_at=:expires_at,triggers=:triggers,salience=:salience WHERE id=:id''',value)
             else:
-                cur=self.store.db.execute('''INSERT INTO memories(account,chat,subject,kind,content,source_key,actor,version,archived,created,updated,scope,expires_at)
-                    VALUES(:account,:chat,:subject,:kind,:content,:source_key,:actor,:version,:archived,:created,:updated,:scope,:expires_at)''',value)
+                cur=self.store.db.execute('''INSERT INTO memories(account,chat,subject,kind,content,source_key,actor,version,archived,created,updated,scope,expires_at,triggers,salience)
+                    VALUES(:account,:chat,:subject,:kind,:content,:source_key,:actor,:version,:archived,:created,:updated,:scope,:expires_at,:triggers,:salience)''',value)
                 value['id']=cur.lastrowid
             self._revision(account,value,old,actor,op)
             self.store.db.commit()
@@ -243,9 +293,12 @@ class MemoryBook:
             value=json.loads(row['before_json']) if row['before_json'] else {**current,'archived':1}
             value.setdefault('scope','chat')
             value.setdefault('expires_at',0)
+            value.setdefault('triggers','')
+            value.setdefault('salience',3)
             value.update(version=current['version']+1,actor='admin',updated=time.time())
             self.store.db.execute('''UPDATE memories SET chat=:chat,subject=:subject,kind=:kind,content=:content,
-                source_key=:source_key,actor=:actor,version=:version,archived=:archived,updated=:updated,scope=:scope,expires_at=:expires_at WHERE id=:id''',value)
+                source_key=:source_key,actor=:actor,version=:version,archived=:archived,updated=:updated,
+                scope=:scope,expires_at=:expires_at,triggers=:triggers,salience=:salience WHERE id=:id''',value)
             self._revision(account,value,current,'admin','undo')
             self.store.db.commit()
             self.archive_snapshot(value,current)
@@ -262,7 +315,7 @@ class MemoryBook:
             rows=[dict(r) for r in self.store.db.execute("SELECT * FROM memories WHERE account=? AND subject=? AND scope='profile' ORDER BY id",(account,value['subject']))]
             private_write(folder/'memories.json',json.dumps({'subject':value['subject'],'updated':time.time(),'memories':rows},ensure_ascii=False,indent=2))
 
-    def model_ops(self,account,allowed,operations,sources,enabled, *, chat=None, subjects=(), shared=True):
+    def model_ops(self,account,allowed,operations,sources,enabled, *, chat=None, subjects=(), shared=True, allow_self=False):
         results=[]
         if not enabled:return results
         for item in (operations if isinstance(operations,list) else [])[:3]:
@@ -281,7 +334,7 @@ class MemoryBook:
                     old=self.get(account,item.get('id'),allowed) if op!='create' else None
                     if old and chat is not None and not self.visible(old,chat,subjects,shared):
                         raise ValueError('不能修改其他群的独立记忆')
-                    result=self.change(account,allowed,item,actor='model',allowed_sources=sources)
+                    result=self.change(account,allowed,item,actor='model',allowed_sources=sources,allow_self=allow_self)
                 results.append({'op':op,'ok':True,'result':result})
             except (ValueError,TypeError,KeyError) as exc:
                 results.append({'op':op,'ok':False,'error':str(exc)[:150]})
@@ -351,7 +404,8 @@ def memory_parts(book,settings,first,batch,affection=None,diagnostics=None):
                          chat=first['chat'],subjects=subjects,shared=settings.global_memory and settings.memory_scope_mode=='shared_profiles',
                          limit=settings.memory_recall_limit,
                          personal_priority=affection.personal_priority(first['account'],first.get('sender_id',''),settings) if affection else 0,
-                         diagnostics=retrieval,include_jokes=False)
+                         diagnostics=retrieval,include_jokes=False,
+                         half_life_days=getattr(settings,'memory_half_life_days',21))
     joke_context='\n'.join(m['content'] for m in batch)
     if settings.chat_habits_enabled and first['chat'].endswith('@chatroom'):
         recent=book.store.conversation(first['account'],first['chat'],8)
@@ -366,7 +420,7 @@ def memory_parts(book,settings,first,batch,affection=None,diagnostics=None):
                            joke_ids=[r['id'] for r in jokes])
     # Versions and source attribution are needed by edit tools; database/audit
     # bookkeeping is not useful input for every language-model response.
-    memories=[{k:r[k] for k in ('id','version','chat','subject','scope','kind','content','source_key','actor','updated')}
+    memories=[{k:r.get(k) for k in ('id','version','chat','subject','scope','kind','content','triggers','salience','source_key','actor','updated')}
               for r in memories]
     callbacks=[{k:r[k] for k in ('id','version','chat','subject','content','source_key','expires_at')}
                for r in jokes]

@@ -23,6 +23,7 @@ from .settings import Config, Settings
 from .store import Store
 from .stability import read_stability
 from .personas import PersonaLibrary, PersonaSpec, PersonaSaveRequest, PersonaActionRequest, compile_persona
+from .conversation import admin_persona_state_action
 
 
 class ConfigRequest(BaseModel):
@@ -88,11 +89,13 @@ class MemoryRequest(BaseModel):
     version: int | None = None
     chat: str | None = Field(default=None,max_length=200)
     subject: str | None = Field(default=None,max_length=200)
-    kind: str | None = Field(default=None,pattern='^(fact|preference|impression|relationship|event|joke)$')
+    kind: str | None = Field(default=None,pattern='^(fact|preference|impression|relationship|event|joke|self_stance|shared_moment)$')
     scope: str | None = Field(default=None,pattern='^(chat|profile)$')
     content: str | None = Field(default=None,max_length=700)
     source_key: str = Field(default='',max_length=700)
     ttl_days: int | None = Field(default=None,ge=1,le=90)
+    triggers: str | list[str] | None = None
+    salience: int | None = Field(default=None,ge=1,le=5)
 
 
 class AffectionRequest(BaseModel):
@@ -102,14 +105,34 @@ class AffectionRequest(BaseModel):
     score: int | None = Field(default=None,ge=0,le=100)
     locked: bool | None = None
     reason: str = Field(default='管理员调整',max_length=120)
+    nickname: str | None = Field(default=None,max_length=40)
+    vibe_tags: list[str] | str | None = None
+    interaction_rule: str | None = Field(default=None,max_length=200)
+    notable_events: str | None = Field(default=None,max_length=300)
+    profile_locked: bool | None = None
 
 
 class LearningRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    op: str = Field(pattern='^(accept|reject|revoke|revise)$')
+    op: str = Field(pattern='^(accept|reject|revoke|revise|block)$')
     version: int = Field(ge=1)
     content: str | None = Field(default=None, min_length=1, max_length=400)
     ttl_days: int | None = Field(default=None, ge=1, le=365)
+    reason: str | None = Field(default=None, max_length=120)
+
+
+class PersonaStateRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    op: str = Field(pattern='^(reset_mood|refresh_life_scene|reset_group_mask|save_group_mask)$')
+    chat: str = Field(default='', max_length=200)
+    mood: str | None = Field(default=None, max_length=30)
+    energy: int | None = Field(default=None, ge=10, le=100)
+    life_override: str | None = Field(default=None, max_length=120)
+    teasing_delta: int | None = Field(default=None, ge=-1, le=1)
+    banter_delta: int | None = Field(default=None, ge=-1, le=1)
+    guard_level: str | None = Field(default=None, max_length=20)
+    vibe_summary: str | None = Field(default=None, max_length=160)
+    locked: bool | None = None
 
 
 class StickerLibraryRequest(BaseModel):
@@ -1022,11 +1045,26 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
             raise HTTPException(409,str(exc)) from exc
 
     @app.get('/api/learning')
-    def learning_list(state: str='', q: str='', chat: str=''):
+    def learning_list(state: str='', q: str='', chat: str='', kind: str=''):
         try:
-            return runtime.learning.snapshot(state=state, query=q[:200], chat=chat)
+            return runtime.learning.snapshot(state=state, query=q[:200], chat=chat, kind=kind)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+
+    @app.get('/api/persona-state')
+    def get_persona_state(chat: str=''):
+        return runtime.persona_live_snapshot(chat=chat)
+
+    @app.post('/api/persona-state')
+    def update_persona_state(body: PersonaStateRequest):
+        s = config.settings
+        try:
+            return admin_persona_state_action(
+                store, s, s.account_id, s.allowed_chat_ids,
+                body.model_dump(exclude_none=True), tieba_service=runtime.tieba
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.get('/api/learning/{identity}')
     def learning_detail(identity: int):

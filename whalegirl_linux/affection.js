@@ -55,13 +55,49 @@
     if(loading)return;loading=true;
     try{
       const r=await api('affection?q='+encodeURIComponent(query.value.trim()));loaded=true;list.replaceChildren();
-      count.textContent='显示 '+r.people.length+' 位最近参与已授权会话的人物 · 好感度跨群 / 私聊共用';
+      count.textContent='显示 '+r.people.length+' 位最近参与已授权会话的人物 · 好感度与千人千面印象卡跨群 / 私聊共用';
       for(const person of r.people){
-        const card=el('article','record');card.append(el('strong','',person.name+' · '+person.stage),el('p','hint',person.subject+' · 出现在 '+person.chat_count+' 个已授权会话'));
+        const card=el('article','record');
+        const nickBadge=person.nickname?` · 专属称呼「${person.nickname}」`:'';
+        const tags=Array.isArray(person.vibe_tags)?person.vibe_tags:[];
+        const tagBadge=tags.length?' · 标签：'+tags.map(t=>'#'+t).join(' '):'';
+        card.append(el('strong','',person.name+' · '+person.stage+nickBadge),
+          el('p','hint',person.subject+' · 出现在 '+person.chat_count+' 个已授权会话'+tagBadge));
+        if(person.interaction_rule || person.notable_events){
+          const summaryLine=[];
+          if(person.interaction_rule)summaryLine.push('相处指南：'+person.interaction_rule);
+          if(person.notable_events)summaryLine.push('代表性记忆：'+person.notable_events);
+          card.append(el('p','message',summaryLine.join(' ｜ ')));
+        }
         const row=el('div','two-fields'),score=el('input');score.type='number';score.min=0;score.max=100;score.step=1;score.value=person.score;score.setAttribute('aria-label',person.name+'的好感度');
         const scoreLabel=el('label','','好感度 / 100');scoreLabel.append(score);
         const locked=el('input');locked.type='checkbox';locked.checked=!!person.locked;const lockLabel=el('label','check-label');lockLabel.append(locked,document.createTextNode('锁定分数，暂停自动变化'));row.append(scoreLabel,lockLabel);card.append(row);
-        card.append(button('保存这个人物',async()=>{await api('affection','POST',{subject:person.subject,version:person.version,score:Number(score.value),locked:locked.checked,reason:'后台手动调整'});await load();notice('人物好感度已保存');}));
+        const profileBox=el('details','record');profileBox.style.marginTop='8px';
+        profileBox.append(el('summary','','🪪 千人千面专属印象卡（称呼 / 标签 / 相处指南 / 共同名场面）'));
+        const profileGrid=el('div','two-fields');profileGrid.style.marginTop='8px';
+        const nickInput=el('input');nickInput.type='text';nickInput.maxLength=40;nickInput.placeholder='例如：老李 / 熬夜冠军（留空用原名）';nickInput.value=person.nickname||'';
+        const nickLabel=el('label','','专属称呼');nickLabel.append(nickInput);
+        const tagsInput=el('input');tagsInput.type='text';tagsInput.maxLength=120;tagsInput.placeholder='逗号分隔，如：爱开玩笑,嘴硬心软,夜猫子';tagsInput.value=tags.join(', ');
+        const tagsLabel=el('label','','印象标签（最多6个）');tagsLabel.append(tagsInput);
+        profileGrid.append(nickLabel,tagsLabel);
+        const ruleInput=el('textarea');ruleInput.rows=2;ruleInput.maxLength=200;ruleInput.placeholder='例如：熟人互损模式，别对他太客气；聊工作时认真接话';ruleInput.value=person.interaction_rule||'';
+        const ruleLabel=el('label','','专属相处指南');ruleLabel.append(ruleInput);
+        const eventInput=el('textarea');eventInput.rows=2;eventInput.maxLength=300;eventInput.placeholder='例如：曾立Flag说戒奶茶结果当晚破功；一起在群里熬夜看球';eventInput.value=person.notable_events||'';
+        const eventLabel=el('label','','代表性互动记忆 / 名场面');eventLabel.append(eventInput);
+        const profLock=el('input');profLock.type='checkbox';profLock.checked=!!person.profile_locked;
+        const profLockLabel=el('label','check-label');profLockLabel.append(profLock,document.createTextNode('锁定印象卡，禁止后台摘要自动微调此人的称呼与标签'));
+        profileBox.append(profileGrid,ruleLabel,eventLabel,profLockLabel);
+        card.append(profileBox);
+        card.append(button('保存这个人物',async()=>{
+          const tagList=tagsInput.value.split(/[,，、]/).map(s=>s.trim()).filter(Boolean).slice(0,6);
+          await api('affection','POST',{
+            subject:person.subject,version:person.version,score:Number(score.value),locked:locked.checked,
+            nickname:nickInput.value.trim(),vibe_tags:tagList,
+            interaction_rule:ruleInput.value.trim(),notable_events:eventInput.value.trim(),
+            profile_locked:profLock.checked,reason:'后台手动调整'
+          });
+          await load();notice('人物好感度与千人千面印象卡已保存');
+        }));
         const details=el('details');details.append(el('summary','','最近变化原因'));const revisions=el('div');details.append(revisions);details.ontoggle=()=>{if(details.open&&!details.dataset.loaded){details.dataset.loaded='true';history(person,revisions).catch(e=>{details.dataset.loaded='';notice(e.message,true);});}};card.append(details);list.append(card);
       }
     }finally{loading=false;}

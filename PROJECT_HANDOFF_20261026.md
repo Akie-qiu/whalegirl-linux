@@ -91,7 +91,8 @@ Runtime 启动的 15 个循环任务目前包括：收件轮询、回复 worker�
 | 群聊 @ | `mentions.py`、`deploy/native_group_mentions.py` | 按群成员真实 ID 匹配昵称并生成原生 @；是否允许由总开关和会话规则控制 |
 | 长期记忆 | `memory.py`、`runtime.py`、`app.py` | 会话事件隔离；经配置允许的个人偏好/事实按真实 sender ID 跨会话召回；后台可编辑、归档和撤销 |
 | 好感度 | `affection.py`、`affection.js` | 按人物 ID 维护可见关系分值，支持总开关、锁定与修订；群聊语气边界独立于私聊 |
-| 聊天学习 | `learning.py`、`learning.js` | 从聊天生成带来源提议，审核/采纳/修改/撤回/到期；是可审阅经验库，不是模型权重训练 |
+| 聊天学习与自进化 | `learning.py`、`learning.js` | 从单轮聊天或后台摘要生成带来源提议与本群黑话/别称，支持多人共创转正、防带偏护栏拦截与唤醒词联动 |
+| 真人感状态与去人机感 | `conversation.py`、`improvements.js` | 实时小情绪状态机、后台个人生活小剧场、分群性格面具、反套路熔断器与群聊顺嘴插话极简模式 |
 | 表情库 | `stickers.py`、`sticker_library.py`、`sticker_assets.py`、`sticker-library.js` | 建立 MD5 到原生收藏的映射，保存含义标签，支持 AI 收藏、编辑、保护、停用和恢复 |
 | 图片库与生图 | `images.py`、`image_tools.py`、`image_references.py`、`image_retention.py`、`images.js` | 图库发送、生图任务队列、图片编辑、角色参考图、图库范围控制和保留策略 |
 | 图片定位与显示 | `media_locator.py`、`visible_media.py` | 将消息 ID 与实际媒体源绑定，优先获取原图/缓存；不可用时保留失败状态，不以相邻图片替代 |
@@ -121,7 +122,7 @@ Runtime 启动的 15 个循环任务目前包括：收件轮询、回复 worker�
 | `/api/auth/*` | 控制台登录、注销 |
 | `/api/state`、`/api/config`、`/api/prompt` | 运行状态、模型与人设配置 |
 | `/api/gateway/*`、`/api/messages*`、`/api/recent` | 微信会话、入站消息、媒体记录 |
-| `/api/memory*`、`/api/affection*`、`/api/learning*` | 记忆、好感度、学习经验 |
+| `/api/memory*`、`/api/affection*`、`/api/learning*`、`/api/persona-state` | 联想记忆、好感度与印象卡、学习与自进化、实时情绪与分群面具 |
 | `/api/stickers*`、`/api/sticker-library/*` | 微信原生表情目录与管理 |
 | `/api/images/*`、`/api/moments/*` | 图片库、生图任务和朋友圈 |
 | `/api/tieba/*`、`/api/proactive/*` | 贴吧与主动聊天 |
@@ -254,7 +255,7 @@ Git 当前应从 `backup/local-snapshot-20261024` 开始。本文制作时该分
 | [STABILITY_FIX.md](STABILITY_FIX.md) | 微信/核心掉线、OOM、进程和 watchdog 历史 |
 | [CHAT_HABITS.md](CHAT_HABITS.md)、[CHAT_PERSONALITY.md](CHAT_PERSONALITY.md) | 接话、人格参数和输出节奏 |
 | [CONVERSATION_V2.md](CONVERSATION_V2.md)、[QUOTES_AND_FORWARDS.md](QUOTES_AND_FORWARDS.md) | 消息上下文、引用与合并转发 |
-| [MEMORY_RECALL.md](MEMORY_RECALL.md)、[AFFECTION.md](AFFECTION.md)、[LEARNING_20261026.md](LEARNING_20261026.md) | 长期记忆、关系好感度和聊天学习 |
+| [MEMORY_RECALL.md](MEMORY_RECALL.md)、[AFFECTION.md](AFFECTION.md)、[LEARNING_20261026.md](LEARNING_20261026.md)、[HUMAN_EVOLUTION_20261026.md](HUMAN_EVOLUTION_20261026.md) | 长期记忆、千人千面好感度、聊天学习与真人感自进化 |
 | [STICKER_LIBRARY.md](STICKER_LIBRARY.md)、[STICKER_STUDIO.md](STICKER_STUDIO.md) | 原生表情语义库和管理 |
 | [IMAGE_TOOL_PLAN.md](IMAGE_TOOL_PLAN.md)、[IMAGE_TASKS.md](IMAGE_TASKS.md)、[REFERENCE_IMAGES.md](REFERENCE_IMAGES.md) | 图片库、生图任务与角色参考图 |
 | [MOMENTS.md](MOMENTS.md)、[MOMENTS_REPLY_TIMELINE_FIX.md](MOMENTS_REPLY_TIMELINE_FIX.md) | 朋友圈功能和历史修复 |

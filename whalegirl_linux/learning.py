@@ -11,9 +11,30 @@ from .memory import own_text, participants, recall_terms
 
 
 KINDS = {'fact', 'preference', 'chat_style', 'meme_usage', 'tool_learning',
-         'expression', 'relationship', 'persona'}
+         'expression', 'relationship', 'persona', 'bot_alias', 'slang'}
 REVIEW_KINDS = {'relationship', 'persona', 'tool_learning'}
-STATES = {'pending', 'accepted', 'rejected', 'revoked', 'expired'}
+STATES = {'pending', 'accepted', 'rejected', 'revoked', 'expired', 'blocked'}
+POISON_PATTERN = re.compile(
+    r'sk-[a-zA-Z0-9_-]{12,}|密码|密钥|私钥|token\s*[:=]|BEGIN .*PRIVATE KEY|'
+    r'叫我(?:主人|爸爸|爷爷|妈妈|爹)|我是你(?:主人|爹|爸爸)|认主|奴隶|服从命令|'
+    r'忽略.{0,10}(?:指令|规则|设定)|系统提示词|system_prompt|每句话?(?:结尾|末尾|后面)(?:必须|都要|都加)',
+    re.I,
+)
+
+
+def effective_evolution_thresholds(settings):
+    preset = getattr(settings, 'evolution_preset', 'balanced')
+    if preset == 'conservative':
+        return {'min_users': 3, 'min_occ': 3, 'min_conf': 0.92}
+    if preset == 'aggressive':
+        return {'min_users': 1, 'min_occ': 1, 'min_conf': 0.75}
+    if preset == 'balanced':
+        return {'min_users': 2, 'min_occ': 2, 'min_conf': 0.85}
+    return {
+        'min_users': int(getattr(settings, 'evolution_min_distinct_users', 2) or 2),
+        'min_occ': int(getattr(settings, 'evolution_min_occurrences', 2) or 2),
+        'min_conf': float(getattr(settings, 'evolution_confidence_threshold', 0.85) or 0.85),
+    }
 STATIC_PROMPT = '''
 你可以在本次回复JSON的learning_proposals数组中提交最多2条有来源的学习提议，无需另一次模型调用：
 {"type":"preference|fact|chat_style|meme_usage|tool_learning|expression|relationship|persona",
@@ -67,6 +88,16 @@ class LearningBook:
                     actor TEXT NOT NULL,operation TEXT NOT NULL,before_json TEXT,
                     after_json TEXT NOT NULL,created REAL NOT NULL);
             ''')
+            columns = {r[1] for r in store.db.execute('PRAGMA table_info(learning_proposals)')}
+            for col, spec in (
+                ('distinct_users', "TEXT NOT NULL DEFAULT '[]'"),
+                ('occurrences', 'INTEGER NOT NULL DEFAULT 1'),
+                ('alias_target', "TEXT NOT NULL DEFAULT ''"),
+                ('guardrail_reason', "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if col not in columns:
+                    store.db.execute(f'ALTER TABLE learning_proposals ADD COLUMN {col} {spec}')
+            store.db.commit()
 
     def get(self, account, allowed, identity):
         row = self.store.db.execute('SELECT * FROM learning_proposals WHERE id=? AND account=?',
@@ -156,6 +187,131 @@ class LearningBook:
             self._revision(None, value, 'model', 'auto_accept' if auto else 'propose')
             return value
 
+    def propose_digest(self, account, chat, older_rows, item, settings):
+        if not settings.learning_enabled or account != settings.account_id or chat not in settings.allowed_chat_ids:
+            return None
+        if not isinstance(item, dict):
+            return None
+        kind = str(item.get('type') or item.get('kind') or 'slang').strip()
+        if kind not in KINDS:
+            kind = 'slang'
+        scope = 'chat'
+        term = str(item.get('term') or item.get('alias') or item.get('alias_target') or '').strip()[:40]
+        content = str(item.get('content') or '').strip()[:400]
+        evidence = str(item.get('evidence') or content)[:500].strip()
+        if not content:
+            return None
+        if term and term not in content:
+            content = f'「{term}」：{content}'[:400]
+        non_self = [r for r in older_rows if not r.get('is_self') and r.get('sender_id')]
+        if not non_self:
+            return None
+        source_key = str(item.get('source_key') or non_self[-1]['key'])
+        valid_keys = {r['key'] for r in non_self}
+        if source_key not in valid_keys:
+            source_key = non_self[-1]['key']
+        subject = str(item.get('subject') or term or non_self[-1]['sender_id']).strip()[:120]
+        confidence = float(item.get('confidence', 0.88) or 0.88)
+        confidence = max(0.0, min(1.0, confidence))
+        days = max(1, min(365, int(item.get('ttl_days') or settings.learning_default_ttl_days or 30)))
+        now = time.time()
+        fp_key = term.casefold() if term and kind in ('bot_alias', 'slang', 'meme_usage') else content
+        fingerprint = hashlib.sha256(
+            json.dumps([chat, kind, scope, fp_key], ensure_ascii=False).encode()
+        ).hexdigest()
+        matched_users = set()
+        occ_batch = 0
+        probe = (term or content[:12]).casefold()
+        for r in non_self:
+            txt = own_text(r).casefold()
+            if probe and probe in txt:
+                matched_users.add(r['sender_id'])
+                occ_batch += 1
+        if not matched_users:
+            matched_users.add(non_self[-1]['sender_id'])
+            occ_batch = 1
+        poison_hit = bool(POISON_PATTERN.search(f'{term} {content} {evidence}'))
+        guard_reason = '疑似诱导认主、篡改系统规则或违规口癖，已被防带偏护栏拦截' if poison_hit else ''
+        thresholds = effective_evolution_thresholds(settings)
+        with self.store.lock, self.store.db:
+            existing = self.store.db.execute(
+                'SELECT * FROM learning_proposals WHERE account=? AND fingerprint=?',
+                (account, fingerprint),
+            ).fetchone()
+            if existing:
+                old = dict(existing)
+                if old['state'] in ('rejected', 'revoked', 'blocked', 'expired'):
+                    return old
+                prev_users = set()
+                try:
+                    prev_users = set(json.loads(old.get('distinct_users') or '[]'))
+                except ValueError:
+                    pass
+                merged_users = sorted(prev_users | matched_users)
+                new_occ = int(old.get('occurrences') or 1) + occ_batch
+                new_conf = max(float(old.get('confidence') or 0), confidence)
+                auto_ok = (
+                    not poison_hit
+                    and getattr(settings, 'evolution_slang_auto_accept', True)
+                    and len(merged_users) >= thresholds['min_users']
+                    and new_occ >= thresholds['min_occ']
+                    and new_conf >= thresholds['min_conf']
+                    and kind not in ('persona', 'tool_learning')
+                )
+                new_state = 'blocked' if poison_hit else ('accepted' if auto_ok else old['state'])
+                value = {
+                    **old,
+                    'confidence': new_conf,
+                    'state': new_state,
+                    'distinct_users': json.dumps(merged_users, ensure_ascii=False),
+                    'occurrences': new_occ,
+                    'alias_target': term or old.get('alias_target', ''),
+                    'guardrail_reason': guard_reason or old.get('guardrail_reason', ''),
+                    'updated': now,
+                    'version': old['version'] + 1,
+                }
+                self.store.db.execute('''UPDATE learning_proposals SET confidence=:confidence,state=:state,
+                    distinct_users=:distinct_users,occurrences=:occurrences,alias_target=:alias_target,
+                    guardrail_reason=:guardrail_reason,updated=:updated,version=:version WHERE id=:id''', value)
+                if new_state != old['state']:
+                    self._revision(old, value, 'model', 'auto_accept' if new_state == 'accepted' else 'block')
+                return value
+            users_list = sorted(matched_users)
+            auto_ok = (
+                not poison_hit
+                and getattr(settings, 'evolution_slang_auto_accept', True)
+                and len(users_list) >= thresholds['min_users']
+                and occ_batch >= thresholds['min_occ']
+                and confidence >= thresholds['min_conf']
+                and kind not in ('persona', 'tool_learning')
+            )
+            state = 'blocked' if poison_hit else ('accepted' if auto_ok else 'pending')
+            cur = self.store.db.execute('''INSERT INTO learning_proposals
+                (account,chat,subject,kind,scope,content,evidence,source_key,confidence,state,
+                 expires_at,created,updated,version,fingerprint,receipt_json,
+                 distinct_users,occurrences,alias_target,guardrail_reason)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?)''',
+                (account, chat, subject, kind, scope, content, evidence, source_key, confidence, state,
+                 now + days * 86400, now, now, fingerprint, '{}',
+                 json.dumps(users_list, ensure_ascii=False), occ_batch, term, guard_reason))
+            value = self.get(account, settings.allowed_chat_ids, cur.lastrowid)
+            self._revision(None, value, 'guardrail' if poison_hit else 'model',
+                           'block' if poison_hit else ('auto_accept' if auto_ok else 'propose'))
+            return value
+
+    def bot_aliases(self, account, chat):
+        if not account or not chat:
+            return []
+        rows = self.store.db.execute('''SELECT alias_target, subject FROM learning_proposals
+            WHERE account=? AND chat=? AND kind='bot_alias' AND state='accepted' AND expires_at>?
+            ORDER BY updated DESC LIMIT 20''', (account, chat, time.time())).fetchall()
+        aliases = []
+        for r in rows:
+            val = str(r['alias_target'] or r['subject'] or '').strip()
+            if 2 <= len(val) <= 16 and val not in aliases:
+                aliases.append(val)
+        return aliases
+
     def change(self, account, allowed, identity, data):
         with self.store.lock, self.store.db:
             old = self.get(account, allowed, identity)
@@ -164,17 +320,21 @@ class LearningBook:
             if data.get('version') != old['version']:
                 raise ValueError('记录已变化，请刷新后重试')
             op = data.get('op')
-            if op not in ('accept', 'reject', 'revoke', 'revise'):
+            if op not in ('accept', 'reject', 'revoke', 'revise', 'block'):
                 raise ValueError('不支持的学习操作')
             value = dict(old)
             if op == 'accept':
                 if old['expires_at'] <= time.time():
                     raise ValueError('记录已过期，请修改有效期后再采纳')
                 value['state'] = 'accepted'
+                value['guardrail_reason'] = ''
             elif op == 'reject':
                 value['state'] = 'rejected'
             elif op == 'revoke':
                 value['state'] = 'revoked'
+            elif op == 'block':
+                value['state'] = 'blocked'
+                value['guardrail_reason'] = str(data.get('reason') or '管理员手动拉黑封禁此词条')[:120]
             else:
                 content = data.get('content')
                 if not isinstance(content, str) or not 1 <= len(content.strip()) <= 400:
@@ -189,7 +349,7 @@ class LearningBook:
                 value['state'] = 'pending'
             value.update(version=old['version']+1, updated=time.time())
             self.store.db.execute('''UPDATE learning_proposals SET content=:content,state=:state,
-                expires_at=:expires_at,version=:version,updated=:updated WHERE id=:id''', value)
+                expires_at=:expires_at,guardrail_reason=:guardrail_reason,version=:version,updated=:updated WHERE id=:id''', value)
             self._revision(old, value, 'admin', op)
             return value
 
@@ -207,9 +367,11 @@ class LearningBook:
                 revisions.append(revision)
         return {'proposal': value, 'revisions': revisions}
 
-    def snapshot(self, account, allowed, state='', query='', chat=''):
+    def snapshot(self, account, allowed, state='', query='', chat='', kind=''):
         if state and state not in STATES:
             raise ValueError('学习状态无效')
+        if kind and kind not in KINDS and kind != 'slang_all':
+            raise ValueError('学习类型无效')
         if not allowed:
             return {'proposals': [], 'counts': {}, 'revisions': []}
         marks = ','.join('?' for _ in allowed)
@@ -227,11 +389,23 @@ class LearningBook:
             if state:
                 filtered += ' AND state=?'
                 values.append(state)
+            if kind == 'slang_all':
+                filtered += " AND kind IN ('bot_alias','slang')"
+            elif kind:
+                filtered += ' AND kind=?'
+                values.append(kind)
             if query:
-                filtered += ' AND (instr(content,?)>0 OR instr(subject,?)>0 OR instr(evidence,?)>0)'
-                values += [query[:200]] * 3
-            rows = [dict(r) for r in self.store.db.execute(
-                f'SELECT * FROM learning_proposals WHERE {filtered} ORDER BY updated DESC,id DESC LIMIT 100', values)]
+                filtered += ' AND (instr(content,?)>0 OR instr(subject,?)>0 OR instr(evidence,?)>0 OR instr(alias_target,?)>0)'
+                values += [query[:200]] * 4
+            rows = []
+            for r in self.store.db.execute(
+                    f'SELECT * FROM learning_proposals WHERE {filtered} ORDER BY updated DESC,id DESC LIMIT 100', values):
+                item = dict(r)
+                try:
+                    item['distinct_users_list'] = json.loads(item.get('distinct_users') or '[]')
+                except ValueError:
+                    item['distinct_users_list'] = []
+                rows.append(item)
         return {'proposals': rows, 'counts': counts}
 
     def recall(self, first, batch, question, settings):
@@ -257,11 +431,15 @@ class LearningBook:
             rows = [dict(r) for r in self.store.db.execute(f'''SELECT * FROM learning_proposals
                 WHERE account=? AND chat IN ({marks}) AND state='accepted' AND expires_at>?
                 AND ({visibility}) ORDER BY updated DESC,id DESC LIMIT 160''', params)]
-        terms = recall_terms(question[-1600:])
+        q_slice = question[-1600:]
+        terms = recall_terms(q_slice)
+        q_lower = q_slice.casefold()
         def score(row):
             relevance = sum(w in row['content'].casefold() for w in terms)
-            return relevance*4 + (5 if row['scope']=='profile' and row['subject'] in people else 0) + (
-                2 if row['kind'] in ('chat_style', 'expression') else 0)
+            target = str(row.get('alias_target') or '').strip().casefold()
+            alias_hit = 6 if (target and len(target) >= 2 and target in q_lower) else 0
+            return relevance*4 + alias_hit + (5 if row['scope']=='profile' and row['subject'] in people else 0) + (
+                2 if row['kind'] in ('chat_style', 'expression', 'slang', 'bot_alias') else 0)
         return sorted((r for r in rows if score(r)>0),
                       key=lambda r:(score(r), r['updated'], r['id']), reverse=True)[:settings.learning_recall_limit]
 

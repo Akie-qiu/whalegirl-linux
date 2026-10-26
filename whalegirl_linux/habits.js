@@ -2,6 +2,27 @@
 (() => {
   const panels = $('habits-panels').content.cloneNode(true);
   document.querySelector('.content-grid').insertBefore(panels, $('stability-panel'));
+  const assocRow = document.createElement('div'); assocRow.className = 'two-fields';
+  const salienceLabel = document.createElement('label'); salienceLabel.textContent = '情绪刻骨度星级';
+  const salienceSelect = document.createElement('select'); salienceSelect.id = 'memory-salience';
+  for (const [val, txt] of [
+    ['1', '★☆☆☆☆ 随口一提（随时间较快淡忘）'],
+    ['2', '★★☆☆☆ 轻微印象'],
+    ['3', '★★★☆☆ 日常事实 / 偏好（默认）'],
+    ['4', '★★★★☆ 重要约定 / 鲜明特征'],
+    ['5', '★★★★★ 刻骨铭心 / 重大名场面（免时间衰减）'],
+  ]) {
+    const opt = document.createElement('option'); opt.value = val; opt.textContent = txt;
+    if (val === '3') opt.selected = true;
+    salienceSelect.append(opt);
+  }
+  salienceLabel.append(salienceSelect);
+  const trigLabel = document.createElement('label'); trigLabel.textContent = '联想触发词（逗号分隔，命中即跨话题唤醒）';
+  const trigInput = document.createElement('input'); trigInput.id = 'memory-triggers'; trigInput.type = 'text';
+  trigInput.maxLength = 300; trigInput.placeholder = '例如：火锅,微辣,熬夜,戒奶茶';
+  trigLabel.append(trigInput);
+  assocRow.append(salienceLabel, trigLabel);
+  $('memory-content').parentElement.before(assocRow);
   const nav = document.querySelector('nav');
   for (const [id, title] of [['web-search-panel', '联网搜索'], ['habits-panel', '聊天习惯'], ['category-limits-panel', '文字与表情额度'], ['memory-panel', '长期记忆']]) {
     const a = document.createElement('a'); a.href = '#' + id; a.textContent = title;
@@ -41,18 +62,23 @@
     editing = null; $('memory-subject').value = ''; $('memory-content').value = ''; $('memory-kind').value = 'fact';
     $('memory-joke-ttl').value=''; updateExpiry();
     if($('memory-scope')) $('memory-scope').value='chat';
+    if($('memory-salience')) $('memory-salience').value='3';
+    if($('memory-triggers')) $('memory-triggers').value='';
     text('memory-editor-title', '新增记忆'); text('memory-source', '网页手动新增，来源标为管理员');
   }
   function updateExpiry() {$('memory-joke-ttl-label').hidden=$('memory-kind').value!=='joke';}
   function render(result) {
     loaded = result.memories; const box = $('memory-list'); box.replaceChildren();
     if (!loaded.length) { const p = document.createElement('p'); p.className = 'hint'; p.textContent = '暂无匹配记忆。明确偏好或要求记住的内容会在这里显示。'; box.append(p); }
-    const kinds = {fact:'事实',preference:'偏好',impression:'暂时印象',relationship:'关系',event:'本群事件',joke:'群内共同梗'};
+    const kinds = {fact:'事实',preference:'偏好',impression:'暂时印象',relationship:'关系',event:'本群事件',joke:'群内共同梗',
+      self_stance:'机器人自身言行/Flag',shared_moment:'群内共同名场面'};
     for (const m of loaded) {
       const article = document.createElement('article'); article.className = 'record'; article.dataset.memoryId = m.id;
-      const top = document.createElement('strong'); top.textContent = '#' + m.id + ' · ' + m.subject + ' · ' + kinds[m.kind] + ' · ' + (m.scope==='profile'?'共享人物档案':'本会话独立') + (m.archived ? ' · 已删除（可恢复）' : '');
+      const stars = '★'.repeat(Math.max(1, Math.min(5, Number(m.salience || 3))));
+      const top = document.createElement('strong'); top.textContent = '#' + m.id + ' · ' + m.subject + ' · ' + (kinds[m.kind] || m.kind) + ' · ' + stars + ' · ' + (m.scope==='profile'?'共享人物档案':'本会话独立') + (m.archived ? ' · 已删除（可恢复）' : '');
       const p = document.createElement('p'); p.className = 'message'; p.textContent = m.content;
       const source = document.createElement('p'); source.className = 'hint'; source.textContent = chatName(m.chat) + ' · v' + m.version + ' · ' + (m.actor === 'model' ? 'AI 工具' : '管理员') + ' · 来源 ' + (m.source_key || '网页手动录入');
+      if(m.triggers) source.textContent += ' · 🔗 联想词：' + m.triggers;
       if(m.expires_at) source.textContent+=' · '+(m.expires_at*1000<=Date.now()?'已到期，停止自动召回':'到期时间')+' '+new Date(m.expires_at*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'});
       const actions = document.createElement('div'); actions.className = 'row';
       actions.append(button('编辑', async () => {
@@ -60,6 +86,8 @@
         $('memory-kind').value = m.kind; $('memory-content').value = m.content;
         $('memory-joke-ttl').value='';updateExpiry();
         if($('memory-scope')) $('memory-scope').value=m.scope || 'chat';
+        if($('memory-salience')) $('memory-salience').value=String(m.salience || 3);
+        if($('memory-triggers')) $('memory-triggers').value=m.triggers || '';
         text('memory-editor-title', '编辑记忆 #' + m.id + ' · v' + m.version); text('memory-source', '原始来源：' + (m.source_key || '管理员'));
         $('memory-content').focus();
       }), button(m.archived ? '恢复' : '删除', async () => {
@@ -131,7 +159,9 @@
     await api('memory','POST',{op:editing?'update':'create',...(editing?{id:editing.id,version:editing.version}:{}),
       chat:$('memory-chat').value,subject:$('memory-subject').value.trim(),kind:$('memory-kind').value,
       ...($('memory-kind').value==='joke' && ttl.value!==''?{ttl_days:Number(ttl.value)}:{}),
-      content:$('memory-content').value.trim(),scope:$('memory-scope')?.value || 'chat',source_key:editing?.source_key || ''});
+      content:$('memory-content').value.trim(),scope:$('memory-scope')?.value || 'chat',
+      salience:Number($('memory-salience')?.value || 3),triggers:$('memory-triggers')?.value.trim() || '',
+      source_key:editing?.source_key || ''});
     reset();await refresh();notice('记忆已保存，下一轮检索生效。');
   });
   window.habits={populate,refresh,stateUpdated,chatLabels};

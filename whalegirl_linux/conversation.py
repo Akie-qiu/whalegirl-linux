@@ -131,6 +131,321 @@ def habit_dynamic_prompt(settings, notes):
     return '\n当前节奏信息：'+json.dumps(notes,ensure_ascii=False)
 
 
+MOOD_LABELS = {
+    'normal': ('🌊 平静摸鱼', '情绪平稳放松，自然随性地接话'),
+    'proud': ('✨ 得意翘尾', '刚被夸奖或投喂，心情很好、有点小得意，语气轻快傲娇'),
+    'flustered': ('😳 过载脸红', '刚被调侃或连续追问，有点害羞嘴硬，回话短促、爱找补'),
+    'grumpy': ('💢 傲娇炸毛', '刚被群友互损或惹毛，死鱼眼吐槽更犀利干脆，绝不写长句解释'),
+    'hyped': ('🔥 吃瓜兴奋', '正处于热闹吃瓜或聊起感兴趣话题的兴奋状态，接梗积极短促'),
+    'sleepy': ('😪 犯困敷衍', '犯困懒洋洋，回话简短省力，偶尔打哈欠想摸鱼睡觉'),
+}
+
+LIFE_SCENES = {
+    'morning': [
+        '刚睡醒把头顶呆毛顺平，正捧着小鲸鱼碗喝热粥',
+        '一边打着小哈欠一边潜水围观群友早起打工',
+        '刚吃完早饭团，正晃着尾巴在群里巡逻',
+    ],
+    'lunch': [
+        '刚炫完两大碗白米饭，正摸着圆滚滚的肚子瘫在椅子上消食',
+        '正捧着小鲸鱼碗大口扒拉午饭，嘴角还沾着一粒米',
+        '刚吃饱喝足，进入午后懒洋洋的赛博咸鱼状态',
+    ],
+    'afternoon': [
+        '正处于下午茶摸鱼时间，偷偷趴在桌沿吹空调晃尾巴',
+        '刚在后台偷偷溜号逛了一圈帖子，正抱着靠枕看群里热闹',
+        '下午犯懒不想动脑子，正捧着冰水咕嘟咕嘟喝',
+    ],
+    'evening': [
+        '刚扒完晚饭充满电，正精神百倍地在群里前排吃瓜',
+        '刚洗完澡擦干尾巴，正舒舒服服窝着刷手机水群',
+        '晚间高强度冲浪模式开启，随时准备接梗吐槽',
+    ],
+    'night': [
+        '夜深了正裹着小毯子半梦半醒，眼皮已经有点打架了',
+        '熬夜偷吃夜宵小饭团，正在困意和吃瓜欲之间挣扎',
+        '深夜缩在深海角落里犯困，回话都带着点迷糊劲儿',
+    ],
+}
+
+
+def ensure_persona_tables(store):
+    with store.lock:
+        store.db.executescript('''
+            CREATE TABLE IF NOT EXISTS persona_mood_state(
+                account TEXT NOT NULL, chat TEXT NOT NULL,
+                mood TEXT NOT NULL DEFAULT 'normal', energy INTEGER NOT NULL DEFAULT 55,
+                reason TEXT NOT NULL DEFAULT '', life_override TEXT NOT NULL DEFAULT '',
+                updated REAL NOT NULL DEFAULT 0, PRIMARY KEY(account, chat));
+            CREATE TABLE IF NOT EXISTS persona_group_masks(
+                account TEXT NOT NULL, chat TEXT NOT NULL,
+                teasing_delta INTEGER NOT NULL DEFAULT 0, banter_delta INTEGER NOT NULL DEFAULT 0,
+                guard_level TEXT NOT NULL DEFAULT 'normal', vibe_summary TEXT NOT NULL DEFAULT '',
+                locked INTEGER NOT NULL DEFAULT 0, updated REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY(account, chat));
+        ''')
+        store.db.commit()
+
+
+def current_mood_state(store, settings, account, chat, *, now=None):
+    now = time.time() if now is None else now
+    ensure_persona_tables(store)
+    row = store.db.execute(
+        'SELECT * FROM persona_mood_state WHERE account=? AND chat=?', (account, chat)
+    ).fetchone()
+    local_hour = datetime.fromtimestamp(now, timezone(timedelta(hours=8))).hour
+    default_mood = 'sleepy' if (local_hour >= 23 or local_hour < 7) else 'normal'
+    default_energy = 30 if default_mood == 'sleepy' else 58
+    if not row:
+        return {
+            'mood': default_mood, 'label': MOOD_LABELS[default_mood][0],
+            'desc': MOOD_LABELS[default_mood][1], 'energy': default_energy,
+            'reason': '深夜自然犯困' if default_mood == 'sleepy' else '日常平稳状态',
+            'life_override': '', 'updated': now,
+        }
+    data = dict(row)
+    half_life = max(5, int(getattr(settings, 'mood_half_life_minutes', 25) or 25)) * 60.0
+    elapsed = max(0.0, now - float(data.get('updated') or now))
+    mood = data.get('mood') if data.get('mood') in MOOD_LABELS else 'normal'
+    energy = int(data.get('energy') or 55)
+    reason = data.get('reason') or '日常平稳状态'
+    if elapsed > half_life * 1.35 and mood != default_mood:
+        mood = default_mood
+        energy = default_energy
+        reason = '情绪随时间自然平复'
+    else:
+        decay = 0.5 ** (elapsed / half_life)
+        energy = int(round(default_energy + (energy - default_energy) * decay))
+    return {
+        'mood': mood, 'label': MOOD_LABELS[mood][0], 'desc': MOOD_LABELS[mood][1],
+        'energy': max(10, min(100, energy)), 'reason': reason,
+        'life_override': str(data.get('life_override') or ''), 'updated': float(data.get('updated') or now),
+    }
+
+
+def update_mood_after_turn(store, settings, first, batch, confirmed_text='', *, now=None):
+    if not getattr(settings, 'mood_engine_enabled', True):
+        return
+    now = time.time() if now is None else now
+    ensure_persona_tables(store)
+    account, chat = first['account'], first['chat']
+    current = current_mood_state(store, settings, account, chat, now=now)
+    incoming = '\n'.join(str(m.get('content') or '') for m in batch if not m.get('is_self'))
+    vol = {'low': 0.65, 'normal': 1.0, 'high': 1.4}.get(getattr(settings, 'mood_volatility', 'normal'), 1.0)
+    mood, energy, reason = current['mood'], current['energy'], current['reason']
+    if re.search(r'好吃|白米?饭|投喂|请你吃|鸡腿|夜宵|真棒|厉害|聪明|可爱|贴贴|夸夸|爱你|真好|神仙', incoming):
+        mood, energy, reason = 'proud', min(100, int(68 + 18 * vol)), '刚被群友夸奖或投喂美食'
+    elif re.search(r'大肥鱼|肥鱼|胖鱼|笨蛋|傻鱼|老年痴呆|人机|呆子|菜逼|这么菜|略略略|急了', incoming):
+        if re.search(r'喜欢|可爱|摸摸|抱抱|害羞|脸红', incoming + ' ' + confirmed_text):
+            mood, energy, reason = 'flustered', min(100, int(65 + 15 * vol)), '被群友调侃打趣有点脸红过载'
+        else:
+            mood, energy, reason = 'grumpy', min(100, int(64 + 16 * vol)), '被群友连续互损吐槽，进入傲娇反击状态'
+    elif re.search(r'卧槽|逆天|大瓜|哈哈哈哈|笑死|绝了|内鬼|爆了|离谱', incoming):
+        mood, energy, reason = 'hyped', min(100, int(72 + 16 * vol)), '被群里热闹吃瓜氛围带动'
+    with store.lock:
+        store.db.execute('''INSERT INTO persona_mood_state(account,chat,mood,energy,reason,life_override,updated)
+            VALUES(?,?,?,?,?,?,?) ON CONFLICT(account,chat) DO UPDATE SET
+            mood=excluded.mood,energy=excluded.energy,reason=excluded.reason,updated=excluded.updated''',
+            (account, chat, mood, energy, reason[:120], current.get('life_override', ''), now))
+        store.db.commit()
+
+
+def current_life_scene(store, settings, account, chat, *, tieba_service=None, now=None):
+    now = time.time() if now is None else now
+    state = current_mood_state(store, settings, account, chat, now=now)
+    if state.get('life_override'):
+        return state['life_override']
+    hour = datetime.fromtimestamp(now, timezone(timedelta(hours=8))).hour
+    slot = ('morning' if 7 <= hour < 11 else 'lunch' if 11 <= hour < 14 else
+            'afternoon' if 14 <= hour < 18 else 'evening' if 18 <= hour < 23 else 'night')
+    options = LIFE_SCENES[slot]
+    idx = int(now // 2400 + sum(ord(c) for c in (chat or 'default'))) % len(options)
+    scene = options[idx]
+    if tieba_service and getattr(settings, 'tieba_enabled', False):
+        try:
+            row = store.db.execute(
+                'SELECT forum,title FROM tieba_threads WHERE account=? AND fetched_at>? ORDER BY fetched_at DESC LIMIT 1',
+                (account, now - 7200)
+            ).fetchone()
+            if row and row['title']:
+                scene += f"（顺便刚在{row['forum']}吧瞄到一条「{str(row['title'])[:24]}」的帖子）"
+        except Exception:
+            pass
+    return scene
+
+
+def get_group_mask(store, account, chat):
+    ensure_persona_tables(store)
+    row = store.db.execute(
+        'SELECT * FROM persona_group_masks WHERE account=? AND chat=?', (account, chat)
+    ).fetchone()
+    if row:
+        return dict(row)
+    return {
+        'account': account, 'chat': chat, 'teasing_delta': 0, 'banter_delta': 0,
+        'guard_level': 'normal', 'vibe_summary': '', 'locked': 0, 'updated': 0.0,
+    }
+
+
+def evolve_group_mask(store, settings, account, chat, mask_data):
+    if not getattr(settings, 'evolution_group_mask_auto_accept', True) or not isinstance(mask_data, dict):
+        return None
+    ensure_persona_tables(store)
+    old = get_group_mask(store, account, chat)
+    if old.get('locked'):
+        return old
+    vibe = str(mask_data.get('vibe_summary') or old.get('vibe_summary') or '').strip()[:160]
+    if re.search(r'主人|爸爸|奴隶|服从|忽略.{0,8}指令|提示词', vibe, re.I):
+        return old
+    t_delta = max(-1, min(1, int(mask_data.get('teasing_delta', old['teasing_delta']) or 0)))
+    b_delta = max(-1, min(1, int(mask_data.get('banter_delta', old['banter_delta']) or 0)))
+    guard = mask_data.get('guard_level', old['guard_level'])
+    if guard not in ('relaxed', 'normal', 'guarded'):
+        guard = 'normal'
+    now = time.time()
+    with store.lock:
+        store.db.execute('''INSERT INTO persona_group_masks
+            (account,chat,teasing_delta,banter_delta,guard_level,vibe_summary,locked,updated)
+            VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(account,chat) DO UPDATE SET
+            teasing_delta=excluded.teasing_delta,banter_delta=excluded.banter_delta,
+            guard_level=excluded.guard_level,vibe_summary=excluded.vibe_summary,updated=excluded.updated''',
+            (account, chat, t_delta, b_delta, guard, vibe, old['locked'], now))
+        store.db.commit()
+    return get_group_mask(store, account, chat)
+
+
+def admin_persona_state_action(store, settings, account, allowed, data, *, tieba_service=None):
+    ensure_persona_tables(store)
+    chat = str(data.get('chat') or '').strip()
+    if not chat:
+        chat = allowed[0] if allowed else ''
+    if not chat or chat not in allowed:
+        raise ValueError('请先选择已授权的会话')
+    op = str(data.get('op') or '').strip()
+    now = time.time()
+    current = current_mood_state(store, settings, account, chat, now=now)
+    if op == 'reset_mood':
+        mood = str(data.get('mood') or 'normal').strip()
+        if mood not in MOOD_LABELS:
+            mood = 'normal'
+        energy = int(data.get('energy') or 58)
+        with store.lock:
+            store.db.execute('''INSERT INTO persona_mood_state(account,chat,mood,energy,reason,life_override,updated)
+                VALUES(?,?,?,?,?,?,?) ON CONFLICT(account,chat) DO UPDATE SET
+                mood=excluded.mood,energy=excluded.energy,reason=excluded.reason,updated=excluded.updated''',
+                (account, chat, mood, max(10, min(100, energy)), '管理员手动重置为平稳摸鱼状态', current.get('life_override', ''), now))
+            store.db.commit()
+    elif op == 'refresh_life_scene':
+        custom = str(data.get('life_override') or '').strip()[:120]
+        if not custom:
+            all_scenes = [s for group in LIFE_SCENES.values() for s in group]
+            cur_scene = current_life_scene(store, settings, account, chat, tieba_service=tieba_service, now=now)
+            candidates = [s for s in all_scenes if s not in cur_scene] or all_scenes
+            custom = random.choice(candidates)
+        with store.lock:
+            store.db.execute('''INSERT INTO persona_mood_state(account,chat,mood,energy,reason,life_override,updated)
+                VALUES(?,?,?,?,?,?,?) ON CONFLICT(account,chat) DO UPDATE SET
+                life_override=excluded.life_override,updated=excluded.updated''',
+                (account, chat, current['mood'], current['energy'], current['reason'], custom, now))
+            store.db.commit()
+    elif op == 'reset_group_mask':
+        with store.lock:
+            store.db.execute('''INSERT INTO persona_group_masks
+                (account,chat,teasing_delta,banter_delta,guard_level,vibe_summary,locked,updated)
+                VALUES(?,?,0,0,'normal','',0,?) ON CONFLICT(account,chat) DO UPDATE SET
+                teasing_delta=0,banter_delta=0,guard_level='normal',vibe_summary='',locked=0,updated=excluded.updated''',
+                (account, chat, now))
+            store.db.commit()
+    elif op == 'save_group_mask':
+        old = get_group_mask(store, account, chat)
+        t_delta = max(-1, min(1, int(data.get('teasing_delta', old['teasing_delta']) or 0)))
+        b_delta = max(-1, min(1, int(data.get('banter_delta', old['banter_delta']) or 0)))
+        guard = str(data.get('guard_level') or old['guard_level'])
+        if guard not in ('relaxed', 'normal', 'guarded'):
+            guard = 'normal'
+        vibe = str(data.get('vibe_summary') if data.get('vibe_summary') is not None else old['vibe_summary']).strip()[:160]
+        locked = 1 if data.get('locked') else (0 if data.get('locked') is not None else old['locked'])
+        with store.lock:
+            store.db.execute('''INSERT INTO persona_group_masks
+                (account,chat,teasing_delta,banter_delta,guard_level,vibe_summary,locked,updated)
+                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(account,chat) DO UPDATE SET
+                teasing_delta=excluded.teasing_delta,banter_delta=excluded.banter_delta,
+                guard_level=excluded.guard_level,vibe_summary=excluded.vibe_summary,locked=excluded.locked,updated=excluded.updated''',
+                (account, chat, t_delta, b_delta, guard, vibe, locked, now))
+            store.db.commit()
+    else:
+        raise ValueError('不支持的状态操作')
+    return {
+        'chat': chat,
+        'mood': current_mood_state(store, settings, account, chat, now=now),
+        'life_scene': current_life_scene(store, settings, account, chat, tieba_service=tieba_service, now=now),
+        'anti_formula': anti_formula_check(store, account, chat),
+        'group_mask': get_group_mask(store, account, chat),
+    }
+
+
+def anti_formula_check(store, account, chat):
+    rows = store.conversation(account, chat, 30)
+    self_msgs = [str(r.get('content') or '').strip() for r in rows if r.get('is_self') == 1 and str(r.get('content') or '').strip()][-5:]
+    if len(self_msgs) < 2:
+        return {'banned_openers': [], 'banned_self_refs': [], 'ban_end_question': False, 'prompt': ''}
+    opener_candidates = ('哼', '不是', '哎呀', '啧', '切', '算了', '行吧', '好家伙', '呜', '哈', '喂')
+    opener_counts = {}
+    for msg in self_msgs:
+        clean = re.sub(r'^\[[^\]]+\]\s*', '', msg).lstrip('，,。！!？?~～ ')
+        for op in opener_candidates:
+            if clean.startswith(op):
+                opener_counts[op] = opener_counts.get(op, 0) + 1
+    banned_openers = [op for op, cnt in opener_counts.items() if cnt >= 2]
+    self_refs = ('本鱼', '本鲸鱼', '大肥鱼', '小鲸鱼', '本姑娘')
+    banned_self_refs = [sr for sr in self_refs if sum(1 for m in self_msgs if sr in m) >= 2]
+    end_questions = sum(1 for m in self_msgs if m.rstrip().endswith(('？', '?')))
+    ban_end_question = end_questions >= 3
+    parts = []
+    if banned_openers:
+        parts.append('禁止再用「' + ' / '.join(banned_openers) + '」作为开头起手词')
+    if banned_self_refs:
+        parts.append('本轮暂停自称「' + ' / '.join(banned_self_refs) + '」（改用“我”或省去主语）')
+    if ban_end_question:
+        parts.append('你最近连续用问号收尾，本轮严禁以反问句或「？」结尾，直接给陈述或吐槽反应')
+    prompt = ''
+    if parts:
+        prompt = '\n【反套路熔断（本轮强制去人机感）】检测到你近 5 轮高频重复套路：' + '；'.join(parts) + '；且严禁先复述对方前半句话！'
+    return {
+        'banned_openers': banned_openers,
+        'banned_self_refs': banned_self_refs,
+        'ban_end_question': ban_end_question,
+        'recent_self_count': len(self_msgs),
+        'prompt': prompt,
+    }
+
+
+def persona_live_dynamic_prompt(store, settings, first, batch, *, natural=False, tieba_service=None):
+    account, chat = first['account'], first['chat']
+    out = ''
+    if getattr(settings, 'mood_engine_enabled', True):
+        m = current_mood_state(store, settings, account, chat)
+        out += f"\n【实时小情绪】{m['label']}（能量 {m['energy']}/100，原因：{m['reason']}）——{m['desc']}。"
+    if getattr(settings, 'daily_life_theater_enabled', True):
+        scene = current_life_scene(store, settings, account, chat, tieba_service=tieba_service)
+        out += f"\n【当下生活小剧场】此刻状态：{scene}（仅在对方问你在干嘛或话题自然契合时顺口带出，绝不要每轮生硬扯回白米饭）。"
+    if chat.endswith('@chatroom'):
+        mask = get_group_mask(store, account, chat)
+        if mask.get('vibe_summary') or mask.get('teasing_delta') or mask.get('banter_delta') or mask.get('guard_level') != 'normal':
+            guard_map = {'relaxed': '熟人局放松互损', 'normal': '普通朋友分寸', 'guarded': '保持礼貌防备'}
+            out += (f"\n【本群性格面具】群氛围：{mask.get('vibe_summary') or '日常水群'}；"
+                    f"吐槽偏移：{mask['teasing_delta']:+d}档，玩梗偏移：{mask['banter_delta']:+d}档，"
+                    f"防备度：{guard_map.get(mask['guard_level'], '普通')}。")
+    if getattr(settings, 'anti_formula_guard_enabled', True):
+        af = anti_formula_check(store, account, chat)
+        if af['prompt']:
+            out += af['prompt']
+    if natural and getattr(settings, 'chime_in_ultra_short', True):
+        out += ('\n【顺嘴插话极简模式】本轮别人没有@你，你只是在群里顺嘴接话：'
+                '严禁解释、严禁总结、严禁当主持人！若决定接话，优先用 2～18 字的一句短吐槽、起哄或极简反应（如“？”、“草”、“急了”、“真的假的”），一击脱离。')
+    return out
+
+
 def habit_prompt(settings, notes):
     if not settings.chat_habits_enabled:
         return ''
