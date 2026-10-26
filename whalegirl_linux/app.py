@@ -104,6 +104,14 @@ class AffectionRequest(BaseModel):
     reason: str = Field(default='管理员调整',max_length=120)
 
 
+class LearningRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    op: str = Field(pattern='^(accept|reject|revoke|revise)$')
+    version: int = Field(ge=1)
+    content: str | None = Field(default=None, min_length=1, max_length=400)
+    ttl_days: int | None = Field(default=None, ge=1, le=365)
+
+
 class StickerLibraryRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
     id: str = Field(pattern='^[0-9a-f]{32}$')
@@ -331,6 +339,10 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     @app.get('/habits.js')
     async def habits_script():
         return FileResponse(root/'whalegirl_linux'/'habits.js',media_type='text/javascript')
+
+    @app.get('/learning.js')
+    async def learning_script():
+        return FileResponse(root/'whalegirl_linux'/'learning.js', media_type='text/javascript')
 
     @app.get('/improvements.js')
     async def improvements_js():
@@ -1008,6 +1020,30 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
             return runtime.affection.undo(s.account_id,s.allowed_chat_ids,revision_id)
         except ValueError as exc:
             raise HTTPException(409,str(exc)) from exc
+
+    @app.get('/api/learning')
+    def learning_list(state: str='', q: str='', chat: str=''):
+        try:
+            return runtime.learning.snapshot(state=state, query=q[:200], chat=chat)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get('/api/learning/{identity}')
+    def learning_detail(identity: int):
+        s = config.settings
+        result = runtime.learning.book.detail(s.account_id, s.allowed_chat_ids, identity)
+        if not result:
+            raise HTTPException(404, '学习记录不存在或会话未授权')
+        return result
+
+    @app.post('/api/learning/{identity}')
+    def learning_change(identity: int, body: LearningRequest):
+        s = config.settings
+        try:
+            return runtime.learning.book.change(s.account_id, s.allowed_chat_ids, identity,
+                                                body.model_dump(exclude_none=True))
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.get('/api/memory')
     def memories(q: str='', include_archived: bool=False, chat: str=''):

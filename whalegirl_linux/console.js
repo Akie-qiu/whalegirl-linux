@@ -81,6 +81,7 @@ function populateSettings() {
   text('wechat-version', '微信固定版本 ' + cfg.expected_wechat_version);
   renderChats();
   if (window.habits) window.habits.populate();
+  window.learning?.populate();
   window.improvements?.populate();
   window.affection?.populate();
   window.stickerLibrary?.populate();
@@ -221,6 +222,7 @@ function renderRecords(rows) {
 function renderState(s) {
   state = s;
   if (window.habits) window.habits.stateUpdated(s);
+  window.learning?.stateUpdated(s);
   window.affection?.stateUpdated(s);
   window.stickerLibrary?.stateUpdated(s);
   window.proactiveChat?.refresh().catch(() => {});
@@ -415,7 +417,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const sidebar=document.querySelector('.sidebar'),nav=sidebar.querySelector('nav');
   const groups=[
     ['connection','连接与会话',['#login-panel','#chats','#send-limits-panel','#safety-panel']],
-    ['persona','角色与记忆',['#persona','#habits-panel','#category-limits-panel','#memory-panel','#affection-panel']],
+    ['persona','角色与记忆',['#persona','#habits-panel','#category-limits-panel','#memory-panel','#learning-panel','#affection-panel']],
     ['interaction','互动与内容',['#proactive-panel','#sticker-library-panel','#images-panel','#moments-panel','#tieba-panel']],
     ['model','模型与用量',['#model-panel','#web-search-panel','#token-usage-panel']],
     ['activity','日志与记录',['#stability-panel','#records-panel','#inbox-panel']]

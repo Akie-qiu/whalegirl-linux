@@ -121,6 +121,11 @@ class Settings(BaseModel):
     proactive_pause_hours: int = Field(default=24, ge=1, le=168)
     repeat_probability: float = Field(default=0.4, ge=0, le=1)
     editable_memory_enabled: bool = True
+    learning_enabled: bool = True
+    learning_eagerness: int = Field(default=70, ge=0, le=100)
+    learning_auto_accept: bool = True
+    learning_default_ttl_days: int = Field(default=30, ge=1, le=365)
+    learning_recall_limit: int = Field(default=4, ge=1, le=8)
     web_search_enabled: bool = False
     web_search_result_count: int = Field(default=5, ge=1, le=10)
     web_search_timeout: float = Field(default=35, ge=10, le=60)

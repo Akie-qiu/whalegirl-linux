@@ -56,15 +56,18 @@ class TiebaToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_requested_tools_read_then_share_through_existing_send_ledger(self):
         first = self.event()
         engine = Engine()
+        learning = {'type': 'tool_learning', 'content': '先读原文再选择摘录'}
         engine.answers = [{'should_reply': True, 'actions': [], 'tieba_request': {'tool': 'read_tieba', 'tid': '123', 'offset': 4500}},
             {'should_reply': True, 'actions': [], 'tieba_request': {'tool': 'share_tieba', 'tid': '123',
              'excerpts': [{'pid': '11', 'text': '摸鱼是物种优势，这里是尾部重要说明'}], 'comment': '这下有正当理由了'}}]
         diagnostics = {}
         decision = await self.t.resolve(engine, [], self.t.static_prompt(),
-            {'should_reply': True, 'tieba_request': {'tool': 'search_tieba', 'query': '工作划水'}},
+            {'should_reply': True, 'tieba_request': {'tool': 'search_tieba', 'query': '工作划水'},
+             'learning_proposals': [learning]},
             first, self.config.generation, diagnostics, 1000)
         self.assertEqual(engine.calls, 2)
         self.assertEqual(diagnostics['tool_rounds'], 2)
+        self.assertEqual(decision['learning_proposals'], [learning])
         actions = self.t.attach_share(decision, first, [])
         self.store.insert(first, 'generating')
         await self.r.send_plan(first, [first], first, actions, {}, self.config.generation, {})

@@ -444,7 +444,9 @@ class TiebaTools:
 
     async def resolve(self, engine, messages, system, decision, first, generation, diagnostics, max_tokens):
         """Only a requested read adds a model round trip; normal replies stay one call."""
+        from .learning import merge_proposals
         history = list(messages)
+        proposals = merge_proposals(decision.get('learning_proposals'))
         allowed_ids = set(diagnostics.get('offered_meme_ids', diagnostics.get('meme_ids', [])))
         rounds = diagnostics.get('tool_rounds', 0)
         while isinstance(decision.get('tieba_request'), dict):
@@ -483,8 +485,11 @@ class TiebaTools:
             decision = parse_json(raw or '')
             if not isinstance(decision, dict):
                 raise ValueError('Invalid Tieba tool follow-up')
+            proposals = merge_proposals(proposals, decision.get('learning_proposals'))
             rounds += 1
         diagnostics.update(tool_rounds=rounds, offered_meme_ids=sorted(allowed_ids))
+        if proposals:
+            decision['learning_proposals'] = proposals
         return decision
 
     def validate_share(self, first, request):
