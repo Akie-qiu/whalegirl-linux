@@ -124,11 +124,11 @@ flowchart TB
 
 ## 🚀 生产发布与线上状态
 
-- **当前活动发布**：`/opt/whalegirl-linux/releases/human-evolution-20261026-185458-554420761`
-- **上一发布**：`/opt/whalegirl-linux/releases/log-repair-20261026-174349-446143366`
-- **上线前文件备份**：`/opt/whalegirl-linux-assets/human-evolution-before-20261026-185458-554420761`
+- **当前活动发布**：`/opt/whalegirl-linux/releases/human-evolution-20261026-193555-383308671`
+- **上一发布**：`/opt/whalegirl-linux/releases/human-evolution-20261026-185458-554420761`
+- **上线前文件备份**：`/opt/whalegirl-linux-assets/human-evolution-before-20261026-193555-383308671`
 - **部署报告**：`/opt/whalegirl-linux-assets/human-evolution-deployment.json`
-- **发布脚本**：`deploy/deploy_human_evolution.py`
+- **发布脚本**：`deploy/deploy_human_evolution.py`（共 14 个核心与前端文件）
 - **边界保护校验**：
   - `/health` 返回 `status=ok`、15 个后台任务、失败任务 `0`、微信版本 `4.1.1.8`；
   - 原生微信客户端 PID、只读读取服务 `whalegirl-native-reader` PID、Docker 容器 ID 与重启计数（0）、以及 `settings.json` / 密钥文件哈希在发布前后 100% 保持一致；

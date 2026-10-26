@@ -224,7 +224,7 @@ git diff --check
 
 **2026 年 10 月 26 日现场复核：**
 
-- 活动发布：`/opt/whalegirl-linux/releases/human-evolution-20261026-185458-554420761`（上一发布：`/opt/whalegirl-linux/releases/log-repair-20261026-174349-446143366`）。
+- 活动发布：`/opt/whalegirl-linux/releases/human-evolution-20261026-193555-383308671`（上一发布：`/opt/whalegirl-linux/releases/human-evolution-20261026-185458-554420761`）。
 - `/health` 返回 `status=ok`、15 个后台任务、失败任务 0、微信版本 4.1.1.8。
 - `/api/state` 只读快照：总开关开启、没有暂停、网关状态 `logged_in`。
 - 微信容器为运行状态、重启计数 0；原生读取服务、稳定性采样 timer 和核心 watchdog timer 均为 active。
