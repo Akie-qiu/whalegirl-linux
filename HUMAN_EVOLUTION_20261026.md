@@ -108,3 +108,18 @@ flowchart TB
 - **前端语法检查**：`node --check` 校验 `learning.js`、`affection.js`、`improvements.js`、`habits.js` 全部通过。
 - **专项自动化测试**：`tests/test_human_like_evolution.py`（6 项测试全部通过，覆盖情绪跃迁与半衰期衰减、反套路熔断与极简插话、联想触发词跨话题召回与自身 Flag 记忆、千人千面印象卡演化与防投毒、黑话多人共创自动转正与 `bot_alias` 唤醒联动、以及全部新增管理 API）。
 - **回归测试套件**：`test_learning.py`（6/6）、`test_chat_habits.py`（10/10）、`test_memory_recall.py`（8/8）、`test_affection.py`（8/8）、`test_conversation_upgrade.py`（9/9）、`test_chat_personality.py`（7/7）、`test_reply_expression.py`（4/4）共 **58 项测试全部通过**。
+
+---
+
+## 🚀 生产发布与线上状态
+
+- **当前活动发布**：`/opt/whalegirl-linux/releases/human-evolution-20261026-185458-554420761`
+- **上一发布**：`/opt/whalegirl-linux/releases/log-repair-20261026-174349-446143366`
+- **上线前文件备份**：`/opt/whalegirl-linux-assets/human-evolution-before-20261026-185458-554420761`
+- **部署报告**：`/opt/whalegirl-linux-assets/human-evolution-deployment.json`
+- **发布脚本**：`deploy/deploy_human_evolution.py`
+- **边界保护校验**：
+  - `/health` 返回 `status=ok`、15 个后台任务、失败任务 `0`、微信版本 `4.1.1.8`；
+  - 原生微信客户端 PID、只读读取服务 `whalegirl-native-reader` PID、Docker 容器 ID 与重启计数（0）、以及 `settings.json` / 密钥文件哈希在发布前后 100% 保持一致；
+  - `/api/persona-state`、`/api/learning`、`/api/affection`、`/api/memory` 全部正常响应，SQLite 新列与新表已平滑初始化。
+
