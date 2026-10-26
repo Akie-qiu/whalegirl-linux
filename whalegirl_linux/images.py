@@ -242,14 +242,39 @@ class ImageService:
             self.store.db.commit()
         self.sync_authority()
 
-    def candidates(self, query='', limit=24, *, chat='', character=False):
+    def candidates(self, query='', limit=24, *, chat='', character=False, prefer_fresh=True):
         words, chars = self.search_terms(query)
         rows = [a for a in self.assets() if self.tools.allowed(a, chat) and (not character or a['character_id']==CHARACTER)]
+        usage = {}
+        if prefer_fresh and chat:
+            with self.store.lock:
+                usage = {r['asset_id']: dict(r) for r in self.store.db.execute('''SELECT asset_id,
+                    sum(state='sent') AS sent_count,
+                    max(CASE WHEN state='sent' THEN updated ELSE 0 END) AS last_sent_at,
+                    sum(state IN ('queued','ready','sending')) AS reserved_count
+                    FROM picture_jobs WHERE account=? AND chat=? AND destination='chat' AND asset_id!=''
+                    AND state IN ('sent','queued','ready','sending') GROUP BY asset_id''',
+                    (self.config.settings.account_id, chat))}
+        cutoff = time.time() - 300
+        for history in usage.values():
+            history['recently_sent'] = history['last_sent_at'] >= cutoff
         ranked = [(a, self.match_details(a, words, chars)) for a in rows]
-        ranked.sort(key=lambda row: row[1]['score'], reverse=True)
+        # Match quality comes first, then newest library additions. Usage only
+        # avoids pending or very recent duplicates, never favors unseen old images.
+        # The stable base catalog deliberately ignores usage.
+        ranked.sort(key=lambda row: (
+            row[1]['coverage'],
+            -int(bool(usage.get(row[0]['id'], {}).get('reserved_count')
+                      or usage.get(row[0]['id'], {}).get('recently_sent'))),
+            row[0]['created'], row[1]['score'], row[0]['id']), reverse=True)
         return [{**{k:a[k] for k in ('id','source','name','character_id','character_variant')},
                  'description':a['description'][:600], 'scenes':a['scenes'][:180],
-                 'match_score':match['score'], 'matching_terms':match['terms']}
+                 'match_score':match['score'], 'match_coverage':match['coverage'],
+                 'matching_terms':match['terms'], 'matching_chars':match['characters'],
+                 **({'created':a['created'], 'sent_count':usage.get(a['id'], {}).get('sent_count', 0),
+                     'last_sent_at':usage.get(a['id'], {}).get('last_sent_at', 0),
+                     'recently_sent':usage.get(a['id'], {}).get('recently_sent', False),
+                     'reserved_count':usage.get(a['id'], {}).get('reserved_count', 0)} if prefer_fresh else {})}
                 for a, match in ranked[:limit]]
 
     @staticmethod
@@ -260,6 +285,10 @@ class ImageService:
             if src in q:
                 q = q.replace(src, dst)
         q = re.sub(r'绝区(?!零)', '绝区零', q)
+        q = re.sub(r'最新的|最新|新一点的|新一点|没发过的|没发过|没看过的|没看过|没见过的|没见过|'
+                   r'不重复的|别重复|换一张|换个|换张|再来一张|再来|新图片|新照片|新图|新的|直接|快发', ' ', q)
+        q = re.sub(r'你自己|自己的|你的|自拍|你画过的|你画的|你生成过的|你生成的', ' ', q)
+        q = re.sub(r'还有|的|了|呢|啊|呀|吗|吧|嘛|呗', ' ', q)
         for expression, term in ((r'猫咪|小猫|猫猫', '猫'), (r'狗狗|小狗|犬', '狗'),
                                  (r'泳衣|死库水', '泳装'), (r'兔女郎', '兔耳'),
                                  (r'白丝', '白色丝袜'), (r'黑丝', '黑色丝袜')):
@@ -284,7 +313,9 @@ class ImageService:
         terms = sorted((w for w in words if w in visible), key=lambda v: (-len(v), v))
         score = sum((8 if w in title else 4)*min(len(w), 4) for w in terms)
         score += sum(1 for c in chars if c in visible)
-        return {'score':score, 'terms':terms[:8]}
+        characters = sorted(c for c in chars if c in visible)
+        return {'score':score, 'coverage':sum(4*min(len(w), 4) for w in terms)+len(characters),
+                'terms':terms[:8], 'characters':characters}
 
     def generation_count(self, *, pending=True, now=None):
         since = datetime.fromtimestamp(time.time() if now is None else now,TZ).replace(hour=0,minute=0,second=0,microsecond=0).timestamp()

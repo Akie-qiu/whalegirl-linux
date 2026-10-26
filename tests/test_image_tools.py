@@ -275,5 +275,127 @@ class ImageToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.images.tools.recent(first)[0]['asset_id'],asset['id'])
         self.assertEqual(self.images.tools.recent(first)[0]['tool'],'send_library_image')
 
+    def pair(self):
+        old = self.images.save_asset(self.raw, scope='global')
+        raw = io.BytesIO(); Image.new('RGB', (20,20), 'green').save(raw, format='PNG')
+        new = self.images.save_asset(raw.getvalue(), scope='global')
+        for asset in (old, new):
+            self.images.edit_asset(asset['id'], dict(name='猫咪图片', description='一只可爱的猫', scenes='聊天发猫图'))
+        with self.store.lock, self.store.db:
+            self.store.db.execute('UPDATE picture_assets SET created=? WHERE id=?', (time.time()-86400, old['id']))
+        return old, new
+
+    def test_recent_duplicate_rotation_preserves_relevance_explicit_reuse_and_static_catalog(self):
+        old, new = self.pair()
+        first = self.message('发一张猫咪图片')
+        static = self.images.tools.static_prompt(first)
+        job = self.images.enqueue(kind='send', asset_id=old['id'], chat='private',
+                                  destination='chat', source_key='prior-send')
+        self.images.change(job, state='sent')
+        palette = self.images.candidates(first['content'], chat='private')
+        self.assertEqual(palette[0]['id'], new['id'])
+        self.assertEqual(next(a for a in palette if a['id']==old['id'])['sent_count'], 1)
+        self.assertEqual(self.images.tools.static_prompt(first), static)
+        result = self.execute(first, dict(tool='send_library_image', asset_id=old['id']))
+        self.assertEqual((result['selected_asset_ids'], result['rotated_count']), ([new['id']], 1))
+        repeated = self.execute(self.message('就刚才那张，再给我看看', 2),
+                                dict(tool='send_library_image', asset_id=old['id']))
+        self.assertEqual((repeated['selected_asset_ids'], repeated['rotated_count']), ([old['id']], 0))
+        self.assertEqual(self.images.generation_count(), 0)
+
+    def test_newest_addition_beats_unseen_older_image_even_if_previously_sent(self):
+        old, new = self.pair()
+        first = self.message('发一张猫咪图片')
+        job = self.images.enqueue(kind='send', asset_id=new['id'], chat='private',
+                                  destination='chat', source_key='earlier-send')
+        self.images.change(job, state='sent')
+        with self.store.lock, self.store.db:
+            self.store.db.execute('UPDATE picture_jobs SET updated=? WHERE id=?', (time.time()-3600, job))
+        palette = self.images.candidates(first['content'], chat='private')
+        self.assertEqual(palette[0]['id'], new['id'])
+        self.assertEqual(palette[0]['sent_count'], 1)
+        self.assertFalse(palette[0]['recently_sent'])
+        self.assertEqual(next(a for a in palette if a['id']==old['id'])['sent_count'], 0)
+        result = self.execute(first, dict(tool='send_library_image', asset_id=old['id']))
+        self.assertEqual((result['selected_asset_ids'], result['rotated_count']), ([new['id']], 1))
+
+    def test_recent_duplicate_uses_next_newest_even_if_it_was_sent_before(self):
+        old, new = self.pair()
+        for asset, age in ((old, 3600), (new, 60)):
+            job = self.images.enqueue(kind='send', asset_id=asset['id'], chat='private',
+                                      destination='chat', source_key=asset['id'])
+            self.images.change(job, state='sent')
+            with self.store.lock, self.store.db:
+                self.store.db.execute('UPDATE picture_jobs SET updated=? WHERE id=?', (time.time()-age, job))
+        result = self.execute(self.message('发一张猫咪图片'),
+                              dict(tool='send_library_image', asset_id=new['id']))
+        self.assertEqual((result['selected_asset_ids'], result['rotated_count']), ([old['id']], 1))
+
+    def test_multi_image_ids_are_unique_and_unrelated_fresh_images_do_not_replace_match(self):
+        old, new = self.pair()
+        self.images.edit_asset(new['id'], {'name':'海边', 'description':'蓝色的海水'})
+        job = self.images.enqueue(kind='send', asset_id=old['id'], chat='private',
+                                  destination='chat', source_key='prior-send')
+        self.images.change(job, state='sent')
+        result = self.execute(self.message('发一张猫咪图片'),
+                              dict(tool='send_library_image', asset_ids=[old['id']]*3))
+        self.assertEqual(result['selected_asset_ids'], [old['id']])
+        self.assertEqual(result['rotated_count'], 0)
+        self.assertEqual(self.count(), 2)
+
+    async def test_clear_library_order_does_not_send_repeated_clarification_or_add_model_call(self):
+        self.pair()
+        first = self.message('发一张猫咪图片')
+        self.store.insert(first); self.store.observe([first])
+        engine = await self.runtime.model()
+        engine.answers = [{'should_reply':True, 'actions':[{'type':'text','text':'你想要什么风格的呀？'}]}]
+        await self.runtime.process_next()
+        self.assertEqual(engine.calls, 1)
+        self.assertEqual(self.gateway.sent, [])
+        jobs = self.images.tools.recent(first)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]['tool'], 'send_library_image')
+        self.assertEqual(self.store.get(first['key'])['state'], 'handled')
+
+    def test_terse_followup_inherits_only_same_requesters_recent_topic(self):
+        self.pair()
+        first = self.message('发一张猫咪图片')
+        self.store.observe([first])
+        followup = self.message('直接发啊', 2)
+        _, context = self.images.tools.context(followup, [followup])
+        self.assertIn('猫咪', context['search_query'])
+        self.assertTrue(context['direct_library_request'])
+        self.assertIsNotNone(self.images.tools.direct_library_fallback(followup, context))
+        acknowledgement = self.message('好', 4)
+        _, quiet = self.images.tools.context(acknowledgement, [acknowledgement])
+        self.assertFalse(quiet['direct_library_request'])
+        self.assertIsNone(self.images.tools.direct_library_fallback(acknowledgement, quiet))
+        other = {**followup, 'sender':'bob', 'sender_id':'bob'}
+        _, isolated = self.images.tools.context(other, [other])
+        self.assertNotIn('猫咪', isolated['search_query'])
+        self.assertIsNone(self.images.tools.direct_library_fallback(other, isolated))
+        drawing = self.message('帮我画一张猫咪图片', 3)
+        _, context = self.images.tools.context(drawing, [drawing])
+        self.assertFalse(context['direct_library_request'])
+
+    def test_real_request_beats_copied_old_description_and_title_weight(self):
+        old, new = self.pair()
+        self.images.edit_asset(old['id'], {'name':'泳装少女旧图', 'description':'泳装少女在音响舞台上，手拿星星'})
+        self.images.edit_asset(new['id'], {'name':'夏日海边', 'description':'少女穿泳装在海边微笑'})
+        job = self.images.enqueue(kind='send', asset_id=old['id'], prompt='泳装少女在音响舞台手拿星星',
+                                  chat='private', destination='chat', source_key='prior-send')
+        self.images.change(job, state='sent')
+        source = self.message('还有泳装的图片吗')
+        self.store.observe([source])
+        palette = self.images.candidates(source['content'], chat='private')
+        self.assertEqual(palette[0]['id'], new['id'])
+        # The model copied the old image's details; grounding must remove that bias.
+        result = self.execute(source, dict(tool='send_library_image', asset_id=old['id'],
+                              search_query='泳装少女在音响舞台手拿星星'))
+        self.assertEqual(result['selected_asset_ids'], [new['id']])
+        followup = self.message('直接发啊', 2)
+        _, context = self.images.tools.context(followup, [followup])
+        self.assertEqual(context['search_query'], source['content'])
+
 
 if __name__=='__main__':unittest.main()

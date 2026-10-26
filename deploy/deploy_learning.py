@@ -16,10 +16,11 @@ from deploy_poll_receive import ASSETS, BASE, CONTAINER, DATA, api, command, dig
 FILES = {'whalegirl_linux/'+name for name in (
     'settings.py', 'runtime.py', 'learning.py', 'tieba_tools.py',
     'app.py', 'console.js', 'learning.js', 'web.html')}
+DEPLOYMENT = 'learning'
 
 
 def main():
-    lock = open(ASSETS/'learning-deploy.lock', 'a')
+    lock = open(ASSETS/(DEPLOYMENT+'-deploy.lock'), 'a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     manifest = json.loads(Path(sys.argv[2]).read_text(encoding='utf-8-sig'))
     old = (BASE/'current').resolve()
@@ -34,7 +35,7 @@ def main():
                 raise RuntimeError('Production source changed: '+name)
 
     def link(target, suffix):
-        pending = BASE/('current.learning-'+suffix)
+        pending = BASE/('current.'+DEPLOYMENT+'-'+suffix)
         if pending.exists() or pending.is_symlink():
             raise RuntimeError('Pending link exists')
         pending.symlink_to(target, target_is_directory=True)
@@ -52,7 +53,7 @@ def main():
         if name.endswith('.py'):
             compile(content, name, 'exec')
     stamp = time.strftime('%Y%m%d-%H%M%S')+'-'+str(time.time_ns() % 1_000_000_000)
-    release = BASE/'releases'/('learning-'+stamp)
+    release = BASE/'releases'/(DEPLOYMENT+'-'+stamp)
     shutil.copytree(old, release, symlinks=True, ignore=shutil.ignore_patterns('__pycache__', 'test-runs', '.git'))
     for source in (old, *old.rglob('*')):
         target = release/source.relative_to(old)
@@ -77,7 +78,7 @@ def main():
             raise RuntimeError('Core busy; staged release preserved')
         time.sleep(2)
     unchanged()
-    backup = ASSETS/('learning-before-'+stamp)
+    backup = ASSETS/(DEPLOYMENT+'-before-'+stamp)
     backup.mkdir(mode=0o700)
     for name in FILES:
         if (old/name).is_file():
@@ -92,7 +93,7 @@ def main():
         unchanged()
         if any(digest(DATA/name) != expected for name, expected in protected.items()):
             raise RuntimeError('Configuration changed during deployment')
-        # This deployment only adds new tables; all existing state remains in place.
+        # Core-only source update; all existing state remains in place.
         link(release, stamp)
         switched = True
         command('systemctl', 'start', 'whalegirl-linux.service')
@@ -122,7 +123,7 @@ def main():
                           'learning_enabled', 'learning_eagerness', 'learning_auto_accept',
                           'learning_default_ttl_days', 'learning_recall_limit')},
                       queue=learning['queued'], source_files=len(FILES), hashes=manifest['after'])
-        (ASSETS/'learning-deployment.json').write_text(json.dumps(report, ensure_ascii=False, indent=2))
+        (ASSETS/(DEPLOYMENT+'-deployment.json')).write_text(json.dumps(report, ensure_ascii=False, indent=2))
         print(json.dumps({k: v for k, v in report.items() if k != 'hashes'}, ensure_ascii=False), flush=True)
     except BaseException:
         if switched:
