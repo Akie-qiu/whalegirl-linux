@@ -65,8 +65,12 @@
     if($('memory-salience')) $('memory-salience').value='3';
     if($('memory-triggers')) $('memory-triggers').value='';
     text('memory-editor-title', '新增记忆'); text('memory-source', '网页手动新增，来源标为管理员');
+    if ($('memory-editor-summary')) text('memory-editor-summary', '✍️ 新增 / 编辑长期记忆');
   }
   function updateExpiry() {$('memory-joke-ttl-label').hidden=$('memory-kind').value!=='joke';}
+  function badge(txt, cls) {
+    const s = document.createElement('span'); s.className = 'ui-badge ' + cls; s.textContent = txt; return s;
+  }
   function render(result) {
     loaded = result.memories; const box = $('memory-list'); box.replaceChildren();
     if (!loaded.length) { const p = document.createElement('p'); p.className = 'hint'; p.textContent = '暂无匹配记忆。明确偏好或要求记住的内容会在这里显示。'; box.append(p); }
@@ -74,11 +78,22 @@
       self_stance:'机器人自身言行/Flag',shared_moment:'群内共同名场面'};
     for (const m of loaded) {
       const article = document.createElement('article'); article.className = 'record'; article.dataset.memoryId = m.id;
-      const stars = '★'.repeat(Math.max(1, Math.min(5, Number(m.salience || 3))));
-      const top = document.createElement('strong'); top.textContent = '#' + m.id + ' · ' + m.subject + ' · ' + (kinds[m.kind] || m.kind) + ' · ' + stars + ' · ' + (m.scope==='profile'?'共享人物档案':'本会话独立') + (m.archived ? ' · 已删除（可恢复）' : '');
+      const salienceNum = Math.max(1, Math.min(5, Number(m.salience || 3)));
+      const stars = '★'.repeat(salienceNum) + '☆'.repeat(5 - salienceNum);
+      const badges = document.createElement('div'); badges.className = 'badge-row';
+      badges.append(
+        badge('#' + m.id + ' · v' + m.version, 'badge-muted'),
+        badge(kinds[m.kind] || m.kind, m.kind === 'self_stance' || m.kind === 'shared_moment' ? 'badge-purple' : 'badge-info'),
+        badge(stars, 'badge-gold'),
+        badge(m.scope === 'profile' ? '共享人物档案' : '本会话独立', 'badge-teal')
+      );
+      if (m.archived) badges.append(badge('已删除（可恢复）', 'badge-danger'));
+      if (m.triggers) badges.append(badge('🔗 联想词：' + m.triggers, 'badge-purple'));
+      const top = document.createElement('strong');
+      top.textContent = m.subject + ' · ' + chatName(m.chat);
       const p = document.createElement('p'); p.className = 'message'; p.textContent = m.content;
-      const source = document.createElement('p'); source.className = 'hint'; source.textContent = chatName(m.chat) + ' · v' + m.version + ' · ' + (m.actor === 'model' ? 'AI 工具' : '管理员') + ' · 来源 ' + (m.source_key || '网页手动录入');
-      if(m.triggers) source.textContent += ' · 🔗 联想词：' + m.triggers;
+      const source = document.createElement('p'); source.className = 'hint';
+      source.textContent = (m.actor === 'model' ? '🤖 AI 工具整理' : '👤 管理员录入') + ' · 来源 ' + (m.source_key || '网页手动录入');
       if(m.expires_at) source.textContent+=' · '+(m.expires_at*1000<=Date.now()?'已到期，停止自动召回':'到期时间')+' '+new Date(m.expires_at*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'});
       const actions = document.createElement('div'); actions.className = 'row';
       actions.append(button('编辑', async () => {
@@ -89,6 +104,11 @@
         if($('memory-salience')) $('memory-salience').value=String(m.salience || 3);
         if($('memory-triggers')) $('memory-triggers').value=m.triggers || '';
         text('memory-editor-title', '编辑记忆 #' + m.id + ' · v' + m.version); text('memory-source', '原始来源：' + (m.source_key || '管理员'));
+        if ($('memory-editor-summary')) text('memory-editor-summary', '✍️ 正在编辑记忆 #' + m.id + ' · v' + m.version);
+        if ($('memory-editor-drawer')) {
+          $('memory-editor-drawer').open = true;
+          $('memory-editor-drawer').scrollIntoView({behavior:'smooth', block:'nearest'});
+        }
         $('memory-content').focus();
       }), button(m.archived ? '恢复' : '删除', async () => {
         if (!m.archived && !window.confirm('删除长期记忆 #' + m.id + '？\n来源：' + chatName(m.chat) +
@@ -98,11 +118,11 @@
         if (editing?.id === m.id) reset();
         await refresh(); notice(m.archived ? '记忆已恢复，下一轮可调用。' : '记忆已删除，不再参与长期记忆调用；可勾选“含已删除”恢复。');
       }));
-      article.append(top,p,source,actions); box.append(article);
+      article.append(badges,top,p,source,actions); box.append(article);
     }
     const revisions = $('memory-revisions'); revisions.replaceChildren();
     for (const r of result.revisions) {
-      const row = document.createElement('div'); row.className = 'record';
+      const row = document.createElement('article'); row.className = 'record';
       const p = document.createElement('p'); p.className = 'hint';
       const operation = {create:'新增',update:'修改',archive:'删除（可恢复）',restore:'恢复',undo:'撤销'}[r.operation] || r.operation;
       p.textContent = '#' + r.memory_id + ' · ' + operation + ' · ' + (r.actor==='model'?'AI':'管理员') + ' · ' + new Date(r.created*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'}) + (r.evidence_key ? ' · 依据 '+r.evidence_key : '');
@@ -151,6 +171,19 @@
   $('find-memory').onclick = () => action($('find-memory'),refresh);
   $('memory-show-archived').onchange = () => refresh().catch(e=>notice(e.message,true));
   $('new-memory').onclick = reset;
+  if ($('open-memory-editor')) {
+    $('open-memory-editor').onclick = () => {
+      reset();
+      if ($('memory-editor-drawer')) {
+        $('memory-editor-drawer').open = true;
+        $('memory-editor-drawer').scrollIntoView({behavior:'smooth', block:'nearest'});
+      }
+      $('memory-subject').focus();
+    };
+  }
+  window.addEventListener('hashchange', () => {
+    if (location.hash === '#memory-panel') refresh().catch(e => notice(e.message, true));
+  });
   $('memory-kind').onchange=updateExpiry;
   $('save-memory').onclick = () => action($('save-memory'),async () => {
     if (!$('memory-subject').value.trim() || !$('memory-content').value.trim()) throw new Error('请填写人物 ID 和记忆内容。');

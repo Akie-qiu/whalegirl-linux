@@ -85,14 +85,23 @@ flowchart TB
 
 ---
 
-## 🖥️ Web 管理后台与 API 接口升级
+## 🖥️ Web 管理后台与全端 Bento 工作区 UI/UX 升级
 
-| 面板锚点 | 前端脚本 | 新增管理能力 |
+### 1. 全端（桌面端 + 手机端）工作区骨架与交互重构（`console.css`、`console.js`、`web.html`）
+- **5 大工作区单面板切换路由 (`body.tabbed-workspace`)**：彻底告别 21 个面板堆叠在 15,000px 单页上下滚动的痛点，主工作区每次仅渲染当前激活的功能面板（`#overview` 首页展示微信登录、快捷控制与最近处理记录；`#model-panel` 并排展示模型设置与回复节奏）。
+- **子页面 1 行紧凑状态顶栏 (`.compact-status-bar`)**：在子页面顶部将原 4 张大尺寸统计卡自动浓缩为 1 行状态胶囊（微信连接、自动回复、实时小情绪活力值、最近耗时 + 返回概览/刷新按钮），释放首屏约 65% 的纵向空间。
+- **顶部同组胶囊子标签栏 (`#workspace-subtabs`) + 手机端底部固定 5 格大拇指导航栏 (`#mobile-bottom-nav`)**：桌面端通过左侧分组与顶部胶囊一键切换同组面板；手机端（`<= 768px`）提供底部固定 5 格导航栏（`🏠 概览连接`、`🐋 角色记忆`、`✨ 互动内容`、`🧠 模型搜索`、`📋 消息日志`）配合顶部横向滑动胶囊，单手大拇指即可切换全部 21 个面板。
+- **浮动吸底未保存提示条 (`#sticky-save-bar`)**：修改任意面板表单项后底部自动浮现「💾 一键保存当前页修改」胶囊条，无需滚回页面底部寻找保存按钮。
+- **移动端单列自适应修复**：在 `@media (max-width: 768px)` 下将 `.two-fields` 与 `.settings-grid` 全部切换为单列布局，彻底消除小屏双列挤压与横向溢出。
+
+### 2. 四大业务面板 Bento 卡片与彩色语义徽章升级
+
+| 面板锚点 | 前端脚本 | 新增管理与视觉能力 |
 | --- | --- | --- |
-| `#learning-panel` | `whalegirl_linux/learning.js` | 三档进化速率预设卡片、可折叠「后台异步自进化与防带偏护栏」抽屉、`🗣️ 本群黑话与别称` / `🛡️ 护栏已拦截` 筛选、多人共创进度徽章（`👥 N人提及 / 累计M次`）与一键 `拉黑词条` 按钮 |
-| `#affection-panel` | `whalegirl_linux/affection.js` | 每张人物卡片内置可展开「🪪 千人千面专属印象卡」编辑器（专属称呼、印象标签、相处指南、代表性记忆、印象卡锁定） |
-| `#habits-panel` | `whalegirl_linux/improvements.js` | 「🌊 真人感动态状态与去人机感引擎」实时监视器（按群查看情绪、生活小剧场、分群面具、反套路熔断词，支持一键重置情绪/随机切换小剧场/重置本群面具）与 6 项拟真开关 |
-| `#memory-panel` | `whalegirl_linux/habits.js`、`improvements.js` | 情绪刻骨度星级（1～5 星）、联想触发词输入与展示、`self_stance` / `shared_moment` 类型及自身 Flag 记忆开关 |
+| `#learning-panel` | `whalegirl_linux/learning.js` | 三档进化速率预设卡片、可折叠「学习积极性与基础召回设置」与「后台异步自进化与防带偏护栏」抽屉、`🗣️ 本群黑话与别称` / `🛡️ 护栏已拦截` 筛选、Bento 卡片网格 + 彩色胶囊徽章（`👥 N人提及 / 累计M次`、`🔔 已接入本群唤醒词`）与一键 `拉黑词条` 按钮 |
+| `#affection-panel` | `whalegirl_linux/affection.js` | 好感度计分规则收进折叠抽屉；人物列表升级为 Bento 名片卡片（含首字母圆形头像徽标、右侧大号好感度分值、彩色性格标签胶囊）与可展开「🪪 千人千面专属印象卡」编辑器 |
+| `#habits-panel` | `whalegirl_linux/improvements.js` | 面板首屏置顶 **4 格实时活人状态监视卡 (`.live-monitor-grid`)**（带活力进度条的实时小情绪、后台生活小剧场、分群性格面具、反套路熔断器），支持一键重置情绪/随机切换小剧场/重置本群面具；低频参数收进折叠抽屉 |
+| `#memory-panel` | `whalegirl_linux/habits.js`、`improvements.js` | 「新增 / 编辑长期记忆」移至列表上方可折叠抽屉（点击「＋ 新增记忆」或卡片「编辑」自动展开并平滑滚动聚焦）；记忆卡片升级为 Bento 网格 + 彩色胶囊徽章（类别、金色星级 `★★★★★`、共享范围、紫色联想词胶囊） |
 
 新增与扩展的后端 API（均受管理员 Bearer Token 鉴权保护）：
 - `GET /api/persona-state?chat=`：读取指定授权会话的实时小情绪、后台生活小剧场、反套路熔断状态与分群性格面具。
@@ -105,7 +114,9 @@ flowchart TB
 
 ## ✅ 测试与验证范围
 
-- **前端语法检查**：`node --check` 校验 `learning.js`、`affection.js`、`improvements.js`、`habits.js` 全部通过。
+- **前端语法与 Playwright 双视口自动化校验**：
+  - `node --check` 校验 `console.js`、`learning.js`、`affection.js`、`improvements.js`、`habits.js` 全部通过；
+  - Playwright 无头浏览器在桌面端（`1280px`）与移动端（`390px`）双视口下通过 `deploy/verify_learning_ui.cjs` 及全工作区 Bento UI 自动化校验（单面板切换、4 格实时活人状态卡、吸底一键保存条、胶囊子标签切换、手机底部 5 格导航栏、全部面板 `scrollWidth <= clientWidth + 3` 零横向溢出、零 `pageerror`）。
 - **专项自动化测试**：`tests/test_human_like_evolution.py`（6 项测试全部通过，覆盖情绪跃迁与半衰期衰减、反套路熔断与极简插话、联想触发词跨话题召回与自身 Flag 记忆、千人千面印象卡演化与防投毒、黑话多人共创自动转正与 `bot_alias` 唤醒联动、以及全部新增管理 API）。
 - **回归测试套件**：`test_learning.py`（6/6）、`test_chat_habits.py`（10/10）、`test_memory_recall.py`（8/8）、`test_affection.py`（8/8）、`test_conversation_upgrade.py`（9/9）、`test_chat_personality.py`（7/7）、`test_reply_expression.py`（4/4）共 **58 项测试全部通过**。
 

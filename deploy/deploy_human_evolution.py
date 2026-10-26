@@ -16,6 +16,7 @@ from deploy_poll_receive import ASSETS, BASE, CONTAINER, DATA, api, command, dig
 FILES = {'whalegirl_linux/' + name for name in (
     'settings.py', 'memory.py', 'affection.py', 'conversation.py',
     'learning.py', 'runtime.py', 'app.py',
+    'console.css', 'console.js',
     'learning.js', 'affection.js', 'improvements.js', 'habits.js', 'web.html',
 )}
 DEPLOYMENT = 'human-evolution'

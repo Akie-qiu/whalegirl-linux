@@ -10,21 +10,27 @@
   const enabledStatus=el('p','hint');enabledStatus.id='affection-enabled-status';enabledStatus.setAttribute('aria-live','polite');
   const privateStyle=el('select');for(const [v,t] of [['close','熟悉后可更亲近，跟随对方语气'],['warm','始终保持温暖朋友语气']]){const o=el('option','',t);o.value=v;privateStyle.append(o);}
   const privateLabel=el('label','','私聊表达');privateLabel.append(privateStyle);
-  const settingsBox=el('details','record');settingsBox.append(el('summary','','增长速度与初始值'));
+  const settingsBox=el('details','settings-drawer');settingsBox.append(el('summary','','⚙️ 好感度计分规则与私聊语气设置'));
+  const settingsGrid=el('div','two-fields');settingsGrid.style.marginTop='10px';
+  settingsGrid.append(privateLabel);
   const inputs={};for(const [name,title,min,max] of [
     ['affection_initial_score','未建立记录的新人物初始好感度',0,100],
     ['affection_daily_gain','每人每天最多增加',0,20],['affection_daily_loss','每人每天最多降低',0,20],
     ['affection_cooldown_seconds','同一人物互动计分最短间隔 / 秒',60,86400]]){
-    const label=el('label','',title),input=el('input');input.type='number';input.min=min;input.max=max;input.step=1;inputs[name]=input;label.append(input);settingsBox.append(label);
+    const label=el('label','',title),input=el('input');input.type='number';input.min=min;input.max=max;input.step=1;inputs[name]=input;label.append(input);settingsGrid.append(label);
   }
-  settingsBox.append(el('p','hint','只累计新发生的有效交流，不按消息条数刷分；离线和久未聊天不扣分。初始值只影响尚未建立记录的人物。'));
-  panel.append(enabledLabel,enabledStatus,privateLabel,settingsBox,button('保存好感度规则',async()=>{
+  const saveRuleBtn=button('保存好感度规则',async()=>{
     const values={affection_private_style:privateStyle.value};
     for(const [n,input] of Object.entries(inputs))values[n]=Number(input.value);
     await saveSubset(values);await load();notice('好感度规则已保存');
-  }));
+  });
+  saveRuleBtn.id='save-affection-rules';saveRuleBtn.className='primary';
+  const ruleFooter=el('div','panel-footer');
+  ruleFooter.append(el('span','hint','只累计有效交流，不按消息条数刷分；离线不扣分。'),saveRuleBtn);
+  settingsBox.append(settingsGrid,ruleFooter);
+  panel.append(enabledLabel,enabledStatus,settingsBox);
   const toolbar=el('div','chat-toolbar'),query=el('input');query.type='search';query.placeholder='搜索昵称或真实微信 ID';query.setAttribute('aria-label','搜索好感度人物');
-  toolbar.append(query,button('查询 / 刷新',load));const count=el('p','hint'),list=el('div');panel.append(toolbar,count,list);$('memory-panel').after(panel);
+  toolbar.append(query,button('查询 / 刷新',load));const count=el('p','hint'),list=el('div','bento-grid');list.id='affection-list';panel.append(toolbar,count,list);$('memory-panel').after(panel);
   const nav=el('a','','人物好感度');nav.href='#affection-panel';document.querySelector('nav').append(nav);
   let loaded=false,loading=false,toggling=false;
   function syncEnabled(){
@@ -58,21 +64,34 @@
       count.textContent='显示 '+r.people.length+' 位最近参与已授权会话的人物 · 好感度与千人千面印象卡跨群 / 私聊共用';
       for(const person of r.people){
         const card=el('article','record');
-        const nickBadge=person.nickname?` · 专属称呼「${person.nickname}」`:'';
         const tags=Array.isArray(person.vibe_tags)?person.vibe_tags:[];
-        const tagBadge=tags.length?' · 标签：'+tags.map(t=>'#'+t).join(' '):'';
-        card.append(el('strong','',person.name+' · '+person.stage+nickBadge),
-          el('p','hint',person.subject+' · 出现在 '+person.chat_count+' 个已授权会话'+tagBadge));
+        const head=el('div','person-card-head'),avatarGroup=el('div','person-avatar-group');
+        const avatarChar=Array.from(String(person.name||person.subject||'?').trim())[0]||'?';
+        const avatar=el('div','person-avatar',avatarChar);
+        const titleWrap=el('div');
+        titleWrap.append(el('strong','',person.name),el('p','hint',person.subject+' · 出现在 '+person.chat_count+' 个已授权会话'));
+        avatarGroup.append(avatar,titleWrap);
+        const scorePill=el('div','person-score-pill');
+        scorePill.append(el('strong','',String(person.score)),el('small','','/ 100 · '+person.stage));
+        head.append(avatarGroup,scorePill);
+        card.append(head);
+        const badges=el('div','badge-row');
+        badges.append(el('span','ui-badge badge-teal',person.stage));
+        if(person.nickname)badges.append(el('span','ui-badge badge-gold','🏷️ 称呼：'+person.nickname));
+        for(const t of tags)badges.append(el('span','ui-badge badge-purple','#'+t));
+        if(person.locked)badges.append(el('span','ui-badge badge-warning','🔒 分数锁定'));
+        if(person.profile_locked)badges.append(el('span','ui-badge badge-info','🛡️ 印象卡锁定'));
+        card.append(badges);
         if(person.interaction_rule || person.notable_events){
           const summaryLine=[];
-          if(person.interaction_rule)summaryLine.push('相处指南：'+person.interaction_rule);
-          if(person.notable_events)summaryLine.push('代表性记忆：'+person.notable_events);
-          card.append(el('p','message',summaryLine.join(' ｜ ')));
+          if(person.interaction_rule)summaryLine.push('🤝 相处指南：'+person.interaction_rule);
+          if(person.notable_events)summaryLine.push('✨ 代表性记忆：'+person.notable_events);
+          card.append(el('p','message',summaryLine.join('\n')));
         }
         const row=el('div','two-fields'),score=el('input');score.type='number';score.min=0;score.max=100;score.step=1;score.value=person.score;score.setAttribute('aria-label',person.name+'的好感度');
         const scoreLabel=el('label','','好感度 / 100');scoreLabel.append(score);
         const locked=el('input');locked.type='checkbox';locked.checked=!!person.locked;const lockLabel=el('label','check-label');lockLabel.append(locked,document.createTextNode('锁定分数，暂停自动变化'));row.append(scoreLabel,lockLabel);card.append(row);
-        const profileBox=el('details','record');profileBox.style.marginTop='8px';
+        const profileBox=el('details','settings-drawer');profileBox.style.marginTop='8px';
         profileBox.append(el('summary','','🪪 千人千面专属印象卡（称呼 / 标签 / 相处指南 / 共同名场面）'));
         const profileGrid=el('div','two-fields');profileGrid.style.marginTop='8px';
         const nickInput=el('input');nickInput.type='text';nickInput.maxLength=40;nickInput.placeholder='例如：老李 / 熬夜冠军（留空用原名）';nickInput.value=person.nickname||'';
@@ -103,6 +122,7 @@
     }finally{loading=false;}
   }
   nav.addEventListener('click',()=>load().catch(e=>notice(e.message,true)));
-  window.affection={populate,toggle,stateUpdated(){if(!loaded&&cfg&&location.hash==='#affection-panel')load().catch(e=>notice(e.message,true));}};
+  window.addEventListener('hashchange',()=>{if(location.hash==='#affection-panel')load().catch(e=>notice(e.message,true));});
+  window.affection={populate,toggle,load,stateUpdated(){if(!loaded&&cfg&&location.hash==='#affection-panel')load().catch(e=>notice(e.message,true));}};
   if(cfg)populate();
 })();

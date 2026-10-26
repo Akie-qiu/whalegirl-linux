@@ -11,14 +11,17 @@
       <button type="button" class="model-preset" data-evo-preset="aggressive" aria-pressed="false"><span class="model-preset-mark pro">速</span><span class="model-preset-copy"><strong>极速融梗</strong><small>≥1人提及2次 · 78%置信</small></span><span class="model-preset-check" aria-hidden="true">✓</span></button>
       <button type="button" class="model-preset" data-evo-preset="custom" aria-pressed="false"><span class="model-preset-mark custom">定</span><span class="model-preset-copy"><strong>自定义参数</strong><small>按下方细分项控制</small></span><span class="model-preset-check" aria-hidden="true">✓</span></button>
     </div>
-    <div class="two-fields">
-      <label class="check-label"><input id="learning-enabled" type="checkbox">启用聊天学习与经验召回</label>
-      <label class="check-label"><input id="learning-auto-accept" type="checkbox">自动采纳高置信度普通经验</label>
-      <label>学习积极性 <output id="learning-eagerness-value"></output><input id="learning-eagerness" type="range" min="0" max="100" step="1"></label>
-      <label>默认有效期 / 天<input id="learning-default-ttl-days" type="number" min="1" max="365"></label>
-      <label>每轮最多召回条数<input id="learning-recall-limit" type="number" min="1" max="8"></label>
-    </div>
-    <details class="record" id="evolution-guardrail-box" style="margin:10px 0">
+    <details class="settings-drawer" open>
+      <summary>⚙️ 学习积极性与基础召回设置</summary>
+      <div class="two-fields" style="margin-top:10px">
+        <label class="check-label"><input id="learning-enabled" type="checkbox">启用聊天学习与经验召回</label>
+        <label class="check-label"><input id="learning-auto-accept" type="checkbox">自动采纳高置信度普通经验</label>
+        <label>学习积极性 <output id="learning-eagerness-value"></output><input id="learning-eagerness" type="range" min="0" max="100" step="1"></label>
+        <label>默认有效期 / 天<input id="learning-default-ttl-days" type="number" min="1" max="365"></label>
+        <label>每轮最多召回条数<input id="learning-recall-limit" type="number" min="1" max="8"></label>
+      </div>
+    </details>
+    <details class="settings-drawer" id="evolution-guardrail-box">
       <summary>🛡️ 后台异步自进化与防带偏护栏（点击展开细项）</summary>
       <div class="two-fields" style="margin-top:10px">
         <label class="check-label"><input id="evolution-async-digest" type="checkbox">后台摘要顺带提取群黑话与印象演化（主链路零延迟）</label>
@@ -52,7 +55,7 @@
         <option value="blocked">🛡️ 护栏已拦截</option><option value="rejected">已拒绝</option><option value="revoked">已撤回</option><option value="expired">已过期</option>
       </select><button id="learning-search" class="secondary">搜索</button>
     </div>
-    <div id="learning-list" aria-live="polite"></div>
+    <div id="learning-list" class="bento-grid" aria-live="polite"></div>
     <dialog id="learning-editor" class="tieba-archive-dialog">
       <form id="learning-edit-form">
         <div class="section-top"><h3 id="learning-edit-title"></h3><button id="learning-close" type="button" class="secondary" aria-label="关闭">关闭</button></div>
@@ -169,16 +172,28 @@
         const entry = document.createElement('article'); entry.className = 'record';
         const active = row.state === 'accepted' && row.expires_at * 1000 > Date.now();
         const isSlang = row.kind === 'bot_alias' || row.kind === 'slang';
-        const aliasBadge = (row.kind === 'bot_alias' && active) ? ' · 🔔 已接入本群唤醒词' : '';
-        entry.append(node('strong', '#' + row.id + ' · ' + (states[row.state] || row.state) + (active ? ' · 可召回' : '') +
-          ' · ' + (kinds[row.kind] || row.kind) + aliasBadge + ' · ' + (row.scope === 'profile' ? '共享人物偏好/事实' : '仅来源会话')));
-        entry.append(node('p', row.content, 'message'));
         const userCount = Array.isArray(row.distinct_users_list) && row.distinct_users_list.length
           ? row.distinct_users_list.length : 1;
         const occCount = row.occurrences || 1;
-        const coCreateInfo = isSlang ? ` · 👥 ${userCount}人提及 / 累计${occCount}次` : '';
-        entry.append(node('p', chatName(row.chat) + ' · ' + row.subject + coCreateInfo + ' · 置信度 ' + Math.round(row.confidence * 100) +
-          '% · v' + row.version + ' · 注入上下文 ' + row.recall_count + ' 次 · 到期 ' + time(row.expires_at), 'hint'));
+        const badges = node('div', '', 'badge-row');
+        const stateCls = active ? 'badge-success' : row.state === 'pending' ? 'badge-warning'
+          : (row.state === 'blocked' || row.state === 'rejected') ? 'badge-danger' : 'badge-muted';
+        badges.append(
+          node('span', '#' + row.id + ' · v' + row.version, 'ui-badge badge-muted'),
+          node('span', (states[row.state] || row.state) + (active ? ' · 可召回' : ''), 'ui-badge ' + stateCls),
+          node('span', kinds[row.kind] || row.kind, 'ui-badge ' + (isSlang ? 'badge-purple' : 'badge-info')),
+          node('span', row.scope === 'profile' ? '共享人物偏好/事实' : '仅来源会话', 'ui-badge badge-teal')
+        );
+        if (row.kind === 'bot_alias' && active) {
+          badges.append(node('span', '🔔 已接入本群唤醒词', 'ui-badge badge-gold'));
+        }
+        if (isSlang) {
+          badges.append(node('span', `👥 ${userCount}人提及 / 累计${occCount}次`, 'ui-badge badge-purple'));
+        }
+        entry.append(badges);
+        entry.append(node('p', row.content, 'message'));
+        entry.append(node('p', chatName(row.chat) + ' · ' + row.subject + ' · 置信度 ' + Math.round(row.confidence * 100) +
+          '% · 注入上下文 ' + row.recall_count + ' 次 · 到期 ' + time(row.expires_at), 'hint'));
         if (row.guardrail_reason) {
           entry.append(node('p', '🛡️ 护栏拦截原因：' + row.guardrail_reason, 'error-text'));
         }
