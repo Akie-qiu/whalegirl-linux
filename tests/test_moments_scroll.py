@@ -192,3 +192,42 @@ class MomentsScrollTests(unittest.TestCase):
                 moments_ui.select_notification_comment({'text':'post'},target)
         click.assert_called_once_with(messages)
 
+    def test_friend_comment_opens_root_comment_popup_and_uses_native_composer(self):
+        post = {'id':'post','text':'friend post with 9 images'}
+        row = {'role':'list-item','name':'friend post with 9 images',
+               'bounds':{'x':366,'y':28,'width':548,'height':472}}
+        f = {'role':'frame','name':'Moments','bounds':{'x':365,'y':115,'width':550,'height':550},
+             'children':[{'role':'list','bounds':{'x':366,'y':156,'width':548,'height':508},'children':[row]}]}
+        comment_btn = {'role':'push-button','name':'Comment','bounds':{'x':723,'y':472,'width':131,'height':36}}
+        root = {'role':'application','name':'wechat','children':[f,{'role':'filler','children':[comment_btn]}]}
+        with patch.object(moments_ui,'frame',return_value=f),\
+             patch.object(moments_ui,'tree',return_value=root),\
+             patch.object(moments_ui,'activate_moments'),\
+             patch.object(moments_ui,'command') as command,\
+             patch.object(moments_ui,'click_node') as click,\
+             patch.object(moments_ui.time,'sleep'):
+            result = moments_ui.comment_editor(post,{'post':post},'comment_friend',{'posts':[post]})
+        self.assertEqual(result,{'native_comment':True})
+        click.assert_called_once_with(comment_btn)
+        self.assertIn(('/opt/tools/click','874','490'),[c.args for c in command.call_args_list])
+
+    def test_duplicate_comment_text_selects_exact_row_by_index_when_fully_visible(self):
+        c1 = {'id':'3','author':'a','name':'甲','text':'饿','created':10}
+        c2 = {'id':'35','author':'bot','name':'我','text':'夜宵没啦','created':20,'own':True}
+        c3 = {'id':'33','author':'b','name':'乙','text':'饿','created':30}
+        post = {'id':'post','text':'late night snack','comments':[c1,c2,c3]}
+        copy = {'role':'menu-item','name':'Copy'}
+        with patch.object(moments_ui,'comment_detail',return_value=(
+                 {'x':366,'y':300,'width':548,'height':111},
+                 {'x':366,'y':156,'width':548,'height':508})),\
+             patch.object(moments_ui,'capture_area'),\
+             patch.object(moments_layout,'timeline_comment_points',return_value=[17,49,78]),\
+             patch.object(moments_ui,'activate_moments'),\
+             patch.object(moments_ui,'clipboard'),\
+             patch.object(moments_ui,'wait_for',return_value=copy),\
+             patch.object(moments_ui,'click_node'),\
+             patch.object(moments_ui,'command',return_value=SimpleNamespace(stdout='饿'.encode())):
+            self.assertEqual(moments_ui.select_timeline_comment(post,c3),(526,378))
+            self.assertEqual(moments_ui.select_timeline_comment(post,c1),(526,317))
+
+

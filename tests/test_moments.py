@@ -581,6 +581,27 @@ class MomentsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(slot['done'])
         self.assertEqual(self.service.book.count('account', 'publish'), 1)
 
+    async def test_unescaped_inner_quotes_in_moments_json_are_recovered(self):
+        from whalegirl_linux.moments import parse_moments_json
+        raw = '{\n  "participate": true,\n  "text": "看到有人分析"为什么周一总是困"，困就是困啊",\n  "media_mode": "none"\n}'
+        parsed = parse_moments_json(raw)
+        self.assertTrue(parsed['participate'])
+        self.assertEqual(parsed['text'], '看到有人分析"为什么周一总是困"，困就是困啊')
+
+    async def test_timeout_generation_failure_can_auto_retry_and_manual_retry(self):
+        post = self.cached_comments()
+        comment = post['comments'][0]
+        payload = {'post': post, 'comment': comment}
+        failed_id = self.service.book.create('account', 'reply_own', 'post/1', payload)
+        self.service.book.change(failed_id, 'failed', text='', error='生成失败，未提交微信：请求超时 (20s)')
+        self.store.db.execute('UPDATE moments_actions SET updated=? WHERE id=?', (time.time() - 120, failed_id))
+        self.store.db.commit()
+        await self.service.tick()
+        row = self.service.book.get('account', failed_id)
+        self.assertEqual(row['state'], 'sent')
+        self.assertEqual(row['text'], '回复')
+        self.assertEqual(json.loads(row['payload']).get('gen_attempts'), 2)
+
 
 class MomentsQueueApiTests(unittest.TestCase):
     def test_click_publish_queues_and_edit_withdraws_request_without_deleting_draft(self):

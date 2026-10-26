@@ -254,7 +254,7 @@ def matching_post(snapshot, source, kind):
     return post
 
 
-def locate_post(post, snapshot, *, allow_partial=False):
+def locate_post(post, snapshot, *, allow_partial=False, allow_bottom=False):
     text = norm(post.get('text') or post.get('title'))
     if len(text) < 4:
         raise ValueError('Post has no unique readable text; do not guess an image-only target')
@@ -275,16 +275,21 @@ def locate_post(post, snapshot, *, allow_partial=False):
         area = lists[0]['bounds']
         rows = [n for n in lists[0].get('children', []) if n.get('role') == 'list-item'
                 and text in norm(n.get('name'))]
+        repeat = '3'
         if len(rows) == 1:
             b = rows[0]['bounds']
             if b['y'] >= area['y'] and b['y']+b['height'] <= area['y']+area['height']:
+                return rows[0]
+            if allow_bottom and area['y']+40 <= b['y']+b['height'] <= area['y']+area['height']:
                 return rows[0]
             if allow_partial and b['y'] < area['y']+area['height'] and b['y']+b['height'] > area['y']:
                 # A tall post cannot fit in one viewport. Its unique text still
                 # binds the following comment block; selection scrolls that block.
                 return rows[0]
+            if 0 < (b['y']+b['height']) - (area['y']+area['height']) <= 180:
+                repeat = '1'
         command('xdotool', 'mousemove', str(round(area['x']+area['width']/2)), str(round(area['y']+area['height']/2)),
-                'click', '--repeat', '3', '--delay', '40', '5')
+                'click', '--repeat', repeat, '--delay', '40', '5')
         time.sleep(.1)
     raise ValueError('Exact source post is not fully visible within bounded history')
 
@@ -384,8 +389,9 @@ def select_scrolling_comment(post,target):
 def select_timeline_comment(post, target):
     """Bind the source post first; use native Copy to identify its actual comment."""
     from moments_layout import timeline_comment_points
-    if sum(norm(c['text']) == norm(target['text']) for c in post['comments']) != 1:
-        raise ValueError('Duplicate comment text needs an unambiguous native row; no reply sent')
+    ordered = sorted(post['comments'], key=lambda c: (c['created'], int(c['id'])))
+    index = next(i for i, c in enumerate(ordered) if c['id'] == target['id'])
+    duplicate = sum(norm(c['text']) == norm(target['text']) for c in post['comments']) != 1
     seen = set()
     deadline = time.monotonic()+18
     expected_height = None
@@ -393,10 +399,18 @@ def select_timeline_comment(post, target):
         bounds, area = comment_detail(post, expected_height)
         if expected_height is None:
             expected_height = bounds['height']
+        if duplicate and bounds['height'] > area['height']:
+            raise ValueError('Duplicate comment text needs an unambiguous native row; no reply sent')
         top, bottom = max(bounds['y'], area['y']), min(bounds['y']+bounds['height'], area['y']+area['height'])
-        if bottom > top:
+        full_view = bounds['y'] >= area['y'] and bounds['y']+bounds['height'] <= area['y']+area['height']
+        if bottom > top and (not duplicate or full_view):
             clip = {'x': bounds['x'], 'y': top, 'width': bounds['width'], 'height': bottom-top}
-            for offset in timeline_comment_points(capture_area(clip, 'moments-timeline-comments')):
+            points = timeline_comment_points(capture_area(clip, 'moments-timeline-comments'))
+            if duplicate:
+                if len(points) != len(ordered):
+                    raise ValueError('Duplicate comment text needs an unambiguous native row; no reply sent')
+                points = [points[index]]
+            for offset in points:
                 if time.monotonic() > deadline:
                     raise ValueError('Exact source comment was not located within bounded scrolling')
                 x, y = bounds['x']+160, top+offset
@@ -461,6 +475,18 @@ def select_notification_comment(post, target):
         raise ValueError('Source notification is outside the visible popup')
     wait_for(lambda r: button(frame(r), 'Back'))
     bounds, area = comment_detail(post)
+    expected_height = bounds['height']
+    for _ in range(6):
+        if bounds['y'] >= area['y'] and bounds['y']+bounds['height'] <= area['y']+area['height']:
+            break
+        if bounds['height'] > area['height'] or bounds['y'] <= area['y']:
+            break
+        activate_moments()
+        repeat = '1' if (bounds['y']+bounds['height']) - (area['y']+area['height']) <= 140 else '2'
+        command('xdotool', 'mousemove', str(area['x']+area['width']//2),
+                str(area['y']+area['height']//2), 'click', '--repeat', repeat, '--delay', '20', '5')
+        time.sleep(.12)
+        bounds, area = comment_detail(post, expected_height)
     ordered = sorted(post['comments'], key=lambda c: (c['created'], int(c['id'])))
     index = next(i for i, c in enumerate(ordered) if c['id'] == target['id'])
     if bounds['y'] >= area['y'] and bounds['y']+bounds['height'] <= area['y']+area['height']:
@@ -520,7 +546,13 @@ def put_comment_text(text):
         raise ValueError('Native comment editor content did not match the reply')
     command('xdotool', 'key', '--clearmodifiers', 'ctrl+End')
     bounds = frame()['bounds']
-    box = reply_box(capture_area(bounds, 'moments-reply-composer'))
+    try:
+        box = reply_box(capture_area(bounds, 'moments-reply-composer'))
+    except ValueError:
+        command('xdotool', 'mousemove', str(bounds['x']+bounds['width']//2),
+                str(bounds['y']+bounds['height']//2), 'click', '--repeat', '2', '--delay', '20', '5')
+        time.sleep(.12)
+        box = reply_box(capture_area(bounds, 'moments-reply-composer'))
     return (bounds['x']+box['x']+box['width']-38,
             bounds['y']+box['y']+box['height']-24)
 
@@ -528,19 +560,13 @@ def put_comment_text(text):
 def comment_editor(post, source, kind, snapshot):
     if kind == 'reply_own':
         return reply_comment(post, source, snapshot=snapshot)
-    else:
-        row = locate_post(post, snapshot)
-        b = row['bounds']
-        # Measured on the pinned 4.1.1.8 layout; validate the named Comment menu next.
-        command('/opt/tools/click', str(round(b['x']+b['width']-40)), str(round(b['y']+b['height']-10)))
-        click_node(wait_for(lambda r: button(frame(r), 'Comment')))
-    def find(root):
-        f = frame(root)
-        values = editors(f)
-        if len(values) != 1:
-            raise ValueError('Moments comment editor is not unique')
-        return values[0]
-    return wait_for(find)
+    row = locate_post(post, snapshot, allow_bottom=True)
+    b = row['bounds']
+    activate_moments()
+    # Measured on the pinned 4.1.1.8 layout; popup is a top-level accessible under root.
+    command('/opt/tools/click', str(round(b['x']+b['width']-40)), str(round(b['y']+b['height']-10)))
+    click_node(wait_for(lambda r: button(r, 'Comment'), stage='Comment menu'))
+    return {'native_comment': True}
 
 
 def reply_navigation_summary(post, target):

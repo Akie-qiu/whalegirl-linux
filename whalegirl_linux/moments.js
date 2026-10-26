@@ -99,7 +99,8 @@
       if(row.error)card.append(el('p','hint',row.error));if(row.receipt)card.append(el('p','hint','确认记录：'+row.receipt));
       if(row.state==='awaiting_image')card.append(el('p','hint','等待期间可以继续聊天。任务进度与取消入口在“图片与生图”。'));
       if(row.state==='image_failed')card.append(btn('保留文字，恢复为草稿',()=>actionRow(row.id,'without_image')));
-      if(row.state==='failed'&&row.kind==='reply_own'&&row.text&&row.text.length<=100)card.append(btn('保留原文恢复草稿',()=>actionRow(row.id,'retry')));
+      if(row.state==='failed'&&(row.kind==='reply_own'||row.kind==='comment_friend')&&row.text&&row.text.length<=100)card.append(btn('保留原文恢复草稿',()=>actionRow(row.id,'retry')));
+      if(row.state==='failed'&&(row.kind==='reply_own'||row.kind==='comment_friend')&&!row.text&&(row.error||'').startsWith('生成失败，未提交微信'))card.append(btn('重新生成草稿',()=>actionRow(row.id,'retry')));
       if(row.state==='uncertain'){const buttons=el('div','row');buttons.append(btn('人工确认：已发出',()=>actionRow(row.id,'received')),btn('人工确认：未发出',()=>actionRow(row.id,'not_received')));card.append(buttons);}
       records.append(card);
     }
