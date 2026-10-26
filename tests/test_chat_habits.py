@@ -70,6 +70,25 @@ class ChatHabitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((counts['minute'],counts['text_hour'],counts['sticker_hour']),(3,2,1))
         self.assertEqual(engine.calls,1)
 
+    async def test_malformed_structured_json_gets_one_format_recovery_attempt(self):
+        e=self.event();self.queue(e);engine=await self.runtime.model()
+        answers=iter(['{broken',json.dumps({'should_reply':True,
+            'actions':[{'type':'text','text':'恢复好了'}]},ensure_ascii=False)])
+        calls=[]
+        async def reply(messages,**kwargs):
+            calls.append(messages);return next(answers)
+        engine.chat=reply
+        await self.runtime.process_next()
+        self.assertEqual(len(calls),2)
+        self.assertEqual(self.gateway.sent,[('text','恢复好了')])
+        metrics=self.store.db.execute('SELECT metrics FROM reply_metrics WHERE key=?',(e['key'],)).fetchone()
+        self.assertIn('"format_recovery": "format_retry"',metrics[0])
+
+    async def test_invalid_action_array_falls_back_to_valid_legacy_reply(self):
+        e=self.event();self.queue(e)
+        await self.answer([{'type':'unknown','value':'ignored'}],reply='兼容回复',sticker='f'*32)
+        self.assertEqual(self.gateway.sent,[('text','兼容回复')])
+
     async def test_uncertain_second_part_stops_third_and_preserves_ledger(self):
         self.queue(self.event());self.gateway.uncertain_at=2
         await self.answer([{'type':'text','text':'第一句'},{'type':'sticker','id':'a'*32},{'type':'text','text':'不得发送'}])

@@ -28,7 +28,23 @@ PROFILE_FIELDS = ('meaning','visual','text','emotion','tone','use_when','avoid_w
 
 
 def parse_json(text):
-    return json.loads(re.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip()))
+    text = str(text or '').strip().lstrip('\ufeff')
+    cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.I).strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as original:
+        # Some compatible endpoints add a short preamble/trailer even in JSON
+        # mode. Recover one complete top-level value if the model provided it.
+        decoder = json.JSONDecoder()
+        start = next((index for index, char in enumerate(cleaned) if char in '{['), None)
+        if start is not None:
+            try:
+                value, _ = decoder.raw_decode(cleaned[start:])
+                if isinstance(value, (dict, list)):
+                    return value
+            except json.JSONDecodeError:
+                pass
+        raise original
 
 
 def vision_image(data):

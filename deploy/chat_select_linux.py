@@ -298,21 +298,28 @@ def _send_native_sticker(job,path,root,name,is_group):
             known={n['native_ref']:i for i,n in enumerate(tiles)}
             first_index=0
             job['favorite_scroll']=[]
-            for _ in range(12):
+            stagnant=0
+            for _ in range(72):
                 before_index=first_index
+                before_refs=tuple(n.get('native_ref') for n in tiles)
                 run_process(['xdotool','mousemove',str(round(area['x']+area['width']/2)),str(round(area['y']+area['height']/2)),
-                    'click','--repeat','3','--delay','40','5'],check=True,timeout=3)
-                time.sleep(.1);root=tree();tiles,area=panel(root)
+                    'click','--repeat','1','--delay','20','5'],check=True,timeout=3)
+                time.sleep(.06);root=tree();tiles,area=panel(root)
                 offsets={known[n['native_ref']]-i for i,n in enumerate(tiles) if n.get('native_ref') in known}
-                if len(offsets)!=1 or any(not n.get('native_ref') for n in tiles):
-                    raise ValueError('Native favorite pages have no unique shared anchor')
-                first_index=offsets.pop()
-                for i,n in enumerate(tiles):known[n['native_ref']]=first_index+i
+                aligned=len(offsets)==1 and all(n.get('native_ref') for n in tiles)
+                if aligned:
+                    first_index=offsets.pop()
+                    for i,n in enumerate(tiles):known[n['native_ref']]=first_index+i
                 job['favorite_scroll'].append([before_index,first_index,len(tiles)])
                 relative=index-first_index
-                chosen=tiles[relative] if 0<=relative<len(tiles) else None
+                chosen=tiles[relative] if aligned and 0<=relative<len(tiles) else None
                 if clickable(chosen,area):break
-                if first_index==before_index and relative<0:break
+                after_refs=tuple(n.get('native_ref') for n in tiles)
+                stagnant=stagnant+1 if before_refs==after_refs and first_index==before_index else 0
+                # Virtualized pages can briefly expose no shared anchor while
+                # WeChat rebuilds its tile list. Continue one wheel notch at a
+                # time; never infer an index from an ambiguous page.
+                if stagnant>=3 or aligned and first_index==before_index and relative<0:break
         if not clickable(chosen,area):
             scroll(area,'5');root=tree();tiles,area=panel(root)
             tail_index=index-(len(order)-len(tiles))

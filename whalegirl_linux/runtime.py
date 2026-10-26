@@ -449,10 +449,13 @@ class Runtime:
                                  'search': timing.get('web_search') or {}})
         image_result = None
         if structured:
+            decision = {}
+            recovery_stage = 'parse'
             try:
                 decision=parse_json(reply)
                 if not isinstance(decision,dict):raise ValueError('Invalid reply decision')
                 collect_learning(decision)
+                recovery_stage = 'tools'
                 decision = await self.tieba.tools.resolve(engine, messages, system, decision, first, generation,
                                                          tieba_recall, settings.max_tokens+650)
                 collect_learning(decision)
@@ -571,6 +574,7 @@ class Runtime:
                         raise ValueError('Invalid image followup')
                     collect_learning(decision)
                     decision['image_request'] = None
+                recovery_stage = 'plan'
                 actions=plan_actions(decision,choices,settings)
                 actions,timing['sticker_pairing']=pair_sticker(decision,actions,choices,settings)
                 actions=self.tieba.tools.attach_share(decision,first,actions)
@@ -578,15 +582,51 @@ class Runtime:
                     for action in actions:
                         if action['type']=='text':action['quote_local_id']=0
                 timing['model_seconds']=round(time.monotonic()-model_started,3)
-            except (ValueError,TypeError,KeyError):
-                if natural:
-                    self.store.update(key,'failed',error='自然接话判断格式无效，未发送')
+            except (ValueError,TypeError,KeyError) as exc:
+                # Keep a usable user-facing action when an optional tool field
+                # or decoration is malformed. The old path discarded the
+                # entire reply and recorded "format invalid".
+                recovered = []
+                if isinstance(decision, dict):
+                    try:
+                        recovered = plan_actions(decision, choices, settings)
+                    except (ValueError,TypeError,KeyError):
+                        pass
+                if not recovered and recovery_stage == 'parse' and not image_keys:
+                    try:
+                        repaired = await engine.chat(
+                            messages + [{'role':'assistant','content':reply},
+                                {'role':'user','content':(
+                                    '请把刚才准备给群友的回答修正成有效JSON，不要增加工具调用或额外动作。'
+                                    '保留原先是否回复的判断及简短自然的回答原意；若原先应旁观，返回should_reply=false且actions=[]。'
+                                    '需要回复时格式为{"should_reply":true,"actions":[{"type":"text","text":"回复内容"}]}。')}],
+                            system_prompt=system,max_tokens=settings.max_tokens+180,
+                            response_format={'type':'json_object'})
+                        repaired_decision=parse_json(repaired)
+                        if isinstance(repaired_decision,dict):
+                            if repaired_decision.get('should_reply') is False:
+                                self.store.update(key,'ignored',error='格式恢复后模型选择旁观')
+                                return True
+                            recovered=plan_actions(repaired_decision,choices,settings)
+                            if recovered:
+                                decision=repaired_decision
+                                collect_learning(decision)
+                                recovery_stage='format_retry'
+                    except Exception:
+                        pass
+                if recovered:
+                    actions = recovered
+                    timing['format_recovery'] = recovery_stage
+                elif natural:
+                    self.store.update(key,'failed',error='自然接话判断格式无效，未发送（'+recovery_stage+'/'+type(exc).__name__+'）')
                     return True
-                if image_keys:raise
-                if reply.lstrip().startswith(('{','```')):
-                    self.store.update(key,'failed',error='回复动作格式无效，未发送')
+                elif image_keys:
+                    raise
+                elif not reply.lstrip().startswith(('{','```')):
+                    actions=plan_actions({'reply':reply},{},settings)
+                else:
+                    self.store.update(key,'failed',error='回复动作格式无效，未发送（'+recovery_stage+'/'+type(exc).__name__+'）')
                     return True
-                actions=plan_actions({'reply':reply},{},settings)
         else:
             actions=plan_actions({'reply':reply},{},settings)
         if not actions:

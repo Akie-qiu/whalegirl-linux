@@ -15,11 +15,17 @@ from whalegirl_linux.app import create_app
 from whalegirl_linux.runtime import Runtime
 from whalegirl_linux.settings import Settings
 from whalegirl_linux.sticker_library import StickerLibrary
-from whalegirl_linux.stickers import StickerCatalog
+from whalegirl_linux.stickers import StickerCatalog, parse_json
 from whalegirl_linux.store import Store
 
 
 class StickerStudioTests(unittest.IsolatedAsyncioTestCase):
+    def test_model_json_parser_recovers_object_from_short_preamble_and_trailer(self):
+        self.assertEqual(parse_json('Here is the response: {"ok":true,"items":[]} done'),
+                         {'ok':True,'items':[]})
+        with self.assertRaises(json.JSONDecodeError):
+            parse_json('{"broken":true,"nested":{"salvage":1} trailing')
+
     def setUp(self):
         root=Path(__file__).resolve().parents[1]/'test-runs'
         root.mkdir(exist_ok=True)

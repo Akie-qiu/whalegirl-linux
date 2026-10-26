@@ -22,8 +22,14 @@ def clean_text(text):
 def plan_actions(decision, choices, settings):
     """New plans plus compatibility with the existing single-reply format."""
     supplied = decision.get('actions')
-    if supplied is None:
-        supplied = ([{'type':'sticker','id':decision['sticker']}] if decision.get('sticker') else
+    usable = isinstance(supplied, list) and any(
+        isinstance(item, dict) and (
+            item.get('type') == 'text' and isinstance(item.get('text'), str) and item['text'].strip()
+            or item.get('type') == 'sticker' and isinstance(item.get('id'), str) and item['id'] in choices
+        ) for item in supplied)
+    if supplied is None or not usable:
+        legacy_sticker = decision.get('sticker')
+        supplied = ([{'type':'sticker','id':legacy_sticker}] if isinstance(legacy_sticker,str) and legacy_sticker in choices else
                     [{'type':'text','text':decision.get('reply',''),'quote_local_id':decision.get('quote_local_id',0)}])
     if not isinstance(supplied, list):
         raise ValueError('actions必须是数组')

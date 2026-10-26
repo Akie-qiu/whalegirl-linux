@@ -29,6 +29,34 @@ class NativeProcessTests(unittest.TestCase):
 
 
 class NativePopupTests(unittest.TestCase):
+    def test_sticker_scroll_recovers_from_ambiguous_virtual_page_without_guessing(self):
+        def page(indices):
+            tiles=[]
+            for position,index in enumerate(indices):
+                tiles.append({'role':'label','name':'Custom Stickers','native_ref':'tile:'+str(index),
+                    'bounds':{'x':position*70,'y':10,'width':60,'height':60}})
+            return {'role':'frame','children':[
+                {'role':'page-tab','name':'Custom Stickers'},
+                {'role':'list','bounds':{'x':0,'y':0,'width':400,'height':90},
+                 'children':tiles}]}
+        start=page(range(5))
+        ambiguous=page([0,1,2,2,4])
+        pages=iter([page(range(5)),ambiguous,page(range(3,8)),page(range(6,11))])
+        path=Path(tempfile.mkdtemp(prefix='sticker-scroll-'))/'job.json'
+        order=[f'{i:032x}' for i in range(1,16)]
+        job={'md5':order[8],'chat':'test'}
+        with patch.object(ui,'native_read',return_value={'stickers':[{'md5':v} for v in order]}),\
+             patch.object(ui,'tree',side_effect=lambda:next(pages)),\
+             patch.object(ui,'selected',return_value=True),\
+             patch.object(ui,'run_process') as command,\
+             patch.object(ui.time,'sleep'):
+            ui.send_native_sticker(job,path,start,'test',True)
+        self.assertEqual(job['state'],'submitted')
+        self.assertEqual(job['favorite_scroll'],[[0,0,5],[0,3,5],[3,6,5]])
+        clicks=[call.args[0] for call in command.call_args_list if call.args[0][0]=='/opt/tools/click']
+        self.assertEqual(len(clicks),1)
+        self.assertEqual(json.loads(path.read_text())['state'],'sending')
+
     def test_failed_sticker_always_closes_popup(self):
         with patch.object(ui,'_send_native_sticker',side_effect=ValueError('page')) as send,patch.object(ui,'run_process') as command:
             with self.assertRaisesRegex(ValueError,'page'):ui.send_native_sticker({},None,{},'name',False)
