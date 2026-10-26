@@ -219,6 +219,20 @@ class ImageToolTests(unittest.IsolatedAsyncioTestCase):
         ImageTools(self.images)
         self.assertEqual(self.images.asset(asset['id'])['scope'],'admin')
 
+    def test_chat_image_catalog_keeps_shared_tool_prefix_stable(self):
+        asset=self.images.save_asset(self.raw,scope='chat',scope_chat='private')
+        private={'account':'account','chat':'private'}
+        group={'account':'account','chat':'group@chatroom'}
+        private_shared=self.images.tools.static_prompt(private,include_catalog=False)
+        group_shared=self.images.tools.static_prompt(group,include_catalog=False)
+        private_catalog=self.images.tools.base_candidates(private)
+        group_catalog=self.images.tools.base_candidates(group)
+        self.assertEqual(private_shared,group_shared)
+        self.assertEqual([row['id'] for row in private_catalog],[asset['id']])
+        self.assertEqual(group_catalog,[])
+        self.assertIn(asset['id'],self.images.tools.catalog_prompt(private_catalog))
+        self.assertNotIn(asset['id'],self.images.tools.catalog_prompt(group_catalog))
+
     async def test_old_generated_picture_can_repeat_without_generation_or_send_quota(self):
         from whalegirl_linux.gateway import Receipt
         self.config.save(self.config.settings.model_copy(update={'image_per_day':0,'safety_per_minute':1,

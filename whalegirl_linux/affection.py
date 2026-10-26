@@ -263,7 +263,7 @@ class AffectionBook:
         score=self.get(account,subject,settings.affection_initial_score)['score']
         return 2 if score>=85 else 1 if score>=65 else 0
 
-    def static_prompt(self, first, settings):
+    def venue_prompt(self, first):
         group=first['chat'].endswith('@chatroom')
         # Public restraint also applies when the affinity feature is switched off.
         boundary=('当前是公开群聊：亲近体现为耐心、温柔、接梗和记得偏好；即使私聊很亲密，也只用适合公开场合的朋友语气。'
@@ -272,7 +272,10 @@ class AffectionBook:
             '例如私聊可温柔说“怎么啦 我陪你聊会儿”，群里用“咋了 要不要说说”；别在群里说“宝宝只许理我”。'
             '文字和表情都遵守这个边界，群里不用情侣示爱、亲吻或性暗示表情。'
             if group else '当前是私聊：可根据熟悉程度和对方当下语气更亲近、更温柔；不因熟悉就默认恋爱关系，不强行撒娇、占有或索取回应。')
-        text='\n【当前场合的表达边界】'+boundary
+        return '\n【当前场合的表达边界】'+boundary
+
+    def static_prompt(self, first, settings, *, include_venue=True):
+        text=self.venue_prompt(first) if include_venue else ''
         if not settings.affection_enabled:return text
         text+=('\n关系状态只用于内部调整语气，聊天中不主动向普通群友播报分数、等级、增减或内部判断规则；对方询问时只自然表达相处感受。'
             '亲近不改变唤醒条件、回复额度和记忆来源要求，也不要求每句都提旧事。'

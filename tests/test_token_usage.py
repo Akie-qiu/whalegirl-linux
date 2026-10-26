@@ -144,6 +144,56 @@ class EngineAccountingTests(unittest.IsolatedAsyncioTestCase):
             await real_builder.close()
             await runtime.close()
 
+    async def test_reply_mode_schema_is_a_suffix_after_shared_prompt_rules(self):
+        from whalegirl_linux.runtime import Runtime
+        from whalegirl_linux.settings import Config, Settings
+        from whalegirl_linux.upstream.ai_engine import AIEngine
+        from test_chat_habits import Engine, Gateway
+        runs=ROOT/'test-runs';runs.mkdir(exist_ok=True)
+        folder=Path(tempfile.mkdtemp(prefix='cache-mode-',dir=runs))
+        config=Config(folder)
+        config.save(Settings(enabled=True,account_id='account',allowed_chat_ids=['group@chatroom'],
+            context_messages=12,safety_enabled=False,stickers_enabled=False,images_chat_enabled=False,
+            learning_enabled=False,tieba_enabled=False,editable_memory_enabled=False,web_search_enabled=False,
+            affection_enabled=False,chat_habits_enabled=False,sticker_self_manage_enabled=False,
+            quote_replies_enabled=False,group_mentions_enabled=False,
+            debounce_single_seconds=0,debounce_burst_seconds=0,debounce_max_seconds=0),'test-key')
+        store=Store(folder/'state.sqlite3');gateway=Gateway()
+        runtime=Runtime(config,store,gateway,ROOT/'styles',engine_factory=Engine)
+        real_builder=AIEngine('https://api.deepseek.com/chat/completions','test',model='deepseek-flash')
+        prompts=[];formats=[]
+        try:
+            base_ts=time.time()-300
+            for idx in range(1,15):
+                row=Runtime.event('account','group@chatroom',{'serverId':idx,'localId':idx,'sender':f'u{idx%3}',
+                    'senderName':f'群友{idx%3}','type':1,'content':f'历史发言第{idx}句','isSelf':False,'timestamp':base_ts+idx})
+                store.observe([row])
+            engine=await runtime.model()
+            async def capture_chat(messages,**kwargs):
+                engine.calls+=1
+                prompts.append(kwargs['system_prompt'])
+                formats.append(kwargs.get('response_format'))
+                real_builder._build_payload(messages,kwargs.get('system_prompt',''),None,
+                                            response_format=kwargs.get('response_format'))
+                return json.dumps({'should_reply':True,'actions':[{'type':'text','text':'收到啦'}]},ensure_ascii=False)
+            engine.chat=capture_chat
+            for mid,trigger,text in [(15,'direct','鲸鱼娘 你好'),(16,'natural','大家好')]:
+                event=Runtime.event('account','group@chatroom',{'serverId':mid,'localId':mid,'sender':f'user{mid}',
+                    'senderName':f'群友{mid}','type':1,'content':text,'isSelf':False,'timestamp':time.time()})
+                event['trigger']=trigger;store.observe([event]);store.insert(event)
+                await runtime.process_next()
+            self.assertEqual(len(prompts),2)
+            self.assertEqual(engine.calls,2)
+            self.assertEqual(formats,[None,{'type':'json_object'}])
+            static_0=prompts[0].split('\n【本轮动态上下文】',1)[0]
+            static_1=prompts[1].split('\n【本轮动态上下文】',1)[0]
+            self.assertTrue(static_1.startswith(static_0))
+            self.assertNotIn('只输出JSON',static_0)
+            self.assertIn('只输出JSON',static_1[len(static_0):])
+        finally:
+            await real_builder.close()
+            await runtime.close()
+
 
 class UsageApiTests(unittest.TestCase):
     def test_authentication_and_period_validation(self):

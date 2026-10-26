@@ -86,6 +86,15 @@ class AffectionTests(unittest.TestCase):
         private=self.message(2,chat='alice')
         self.assertIn('避免暧昧',self.book.prompt(private,[private],self.settings))
 
+    def test_shared_affection_rules_can_precede_chat_specific_venue_rules(self):
+        group={'chat':'a@chatroom'}
+        private={'chat':'alice'}
+        group_shared=self.book.static_prompt(group,self.settings,include_venue=False)
+        private_shared=self.book.static_prompt(private,self.settings,include_venue=False)
+        self.assertEqual(group_shared,private_shared)
+        self.assertIn('公开群聊',self.book.venue_prompt(group))
+        self.assertIn('当前是私聊',self.book.venue_prompt(private))
+
     def test_high_affinity_recall_remains_bounded_and_scoped(self):
         book=MemoryBook(self.store);self.message(1)
         for chat,subject,scope,kind,content in [('a@chatroom','alice','profile','preference','不吃香菜'),

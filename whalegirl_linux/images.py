@@ -354,12 +354,16 @@ class ImageService:
             self.stage(asset_id, chat=chat if destination == 'chat' else '', admin=admin_authorized or destination == 'library')
         plan = {}
         if kind == 'generate':
-            # Only an explicit tool subject or an administrator's explicit character
-            # request selects self; appearance keywords never create paid jobs.
-            character = character or bool(admin_authorized and character_request(prompt))
-            variant = character_variant or s.image_character_variant
+            # Only an explicit tool subject, an administrator's explicit character
+            # request, or a Moments generation with configured character references
+            # selects self; appearance keywords never create paid jobs.
+            variant = character_variant or self.references.detect_variant(prompt, s.image_character_variant)
             if variant not in ('chibi', 'girl', 'mature') or mode not in ('auto', 'edit', 'remix'):
                 raise ValueError('无效角色版本或参考图处理方式')
+            if destination == 'moments':
+                character = bool(s.image_references_enabled and self.references.selected(variant))
+            else:
+                character = character or bool(admin_authorized and character_request(prompt))
             if character or reference_ids or chat_reference_plan and chat_reference_plan.get('sources'):
                 if not s.image_references_enabled:
                     raise ValueError('参考图功能已关闭，请在后台开启')
@@ -543,7 +547,7 @@ class ImageService:
                     raw=b''.join(chunks)
                 else:
                     raise GenerationUncertain('生成结果尚未包含图片，不自动重新调用')
-            public = bool(job['destination'] == 'library' and plan.get('character') and not plan.get('sources') and
+            public = bool(job['destination'] in ('library', 'moments') and plan.get('character') and not plan.get('sources') and
                           all(v.get('source') == 'character' for v in plan.get('inputs', [])))
             return await asyncio.to_thread(self.save_asset,raw,'generated',prompt=job['prompt'],model=s.image_model,account=job['account'],
                 scope='global' if public else 'chat' if job['chat'] else 'admin', scope_chat='' if public else job['chat'],

@@ -631,6 +631,8 @@ class MomentsService:
                                      'recently_used=true的图片仅供了解历史，不要重新选择；不合适时留空，不必强行配图。')
                 can_generate = False
                 if kind == 'publish':
+                    if s.image_references_enabled and hasattr(self.runtime.images, 'references'):
+                        style = style + self.runtime.images.references.self_prompt()
                     remaining = max(0, s.image_per_day - self.runtime.images.generation_count()) if s.moments_image_generate_enabled else 0
                     can_generate = bool(s.moments_image_generate_enabled and s.image_generation_enabled and
                         s.moments_image_generate_eagerness > 0 and remaining and not payload['assets'] and
@@ -644,6 +646,7 @@ class MomentsService:
                         '这不是随机概率，不要求每条都带图，也不必等图库完全没有图片才画新图。'
                         '高积极性且允许生图时，优先构思贴合本条内容的新画面；已有图明显更合适也可选图库。'
                         '选择generate时返回image_prompt，限500字，具体写主体、动作、背景与构图，并清空asset_ids；'
+                        '生图默认自动沿用后台提前设计的本人角色参考图（默认当前外观版本，也可返回character_variant指定chibi/girl/mature）；'
                         '配图必须和本条文案相符，不能每天重复上一张图的场景和姿势。'
                         '不得把私聊、群聊或未公开人物记忆写入配图提示；只描述公开可见的画面。')
                 # Own client prevents a console config change from closing an in-flight chat request.
@@ -695,8 +698,14 @@ class MomentsService:
                     self.book.change(identity, 'draft', text=text)
                     if wants_generation:
                         try:
-                            self.runtime.images.enqueue(kind='generate',prompt=image_prompt,
-                                destination='moments',moment_id=identity,source_key='moments:'+identity)
+                            variant = value.get('character_variant') if value.get('character_variant') in ('chibi', 'girl', 'mature') else ''
+                            enqueue_args = {'kind': 'generate', 'prompt': image_prompt,
+                                'destination': 'moments', 'moment_id': identity, 'source_key': 'moments:' + identity}
+                            if variant:
+                                enqueue_args['character_variant'] = variant
+                            if hasattr(self.runtime.images, 'references'):
+                                enqueue_args['character'] = True
+                            self.runtime.images.enqueue(**enqueue_args)
                             self.book.change(identity,'awaiting_image')
                         except ValueError:
                             self.book.change(identity, 'image_failed', error='配图任务未能提交，文案保留，可调整配图后发布')

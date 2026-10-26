@@ -134,6 +134,21 @@ class ReferenceLibrary:
         # Keep every source on disk; use a bounded set of views on each request.
         return items[:3]
 
+    def detect_variant(self, text='', default=None):
+        text = str(text or '')
+        variant = default or self.config.settings.image_character_variant
+        if re.search(r'(?:Q版|q版|二头身|三头身)', text) and self.selected('chibi'):
+            variant = 'chibi'
+        elif re.search(r'(?:偏年长|年长版|成熟版|御姐版)', text) and self.selected('mature'):
+            variant = 'mature'
+        elif re.search(r'少女版', text) and self.selected('girl'):
+            variant = 'girl'
+        if variant in VARIANTS and not self.selected(variant):
+            for candidate in ('girl', 'mature', 'chibi'):
+                if self.selected(candidate):
+                    return candidate
+        return variant
+
     def catalog_items(self, identities):
         result = []
         for identity in dict.fromkeys(identities):
