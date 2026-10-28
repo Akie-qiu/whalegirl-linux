@@ -75,6 +75,8 @@ class TokenLedger:
             summary=dict(self.store.db.execute('SELECT '+aggregates+' FROM model_token_usage WHERE '+where,args).fetchone())
             models=[dict(r) for r in self.store.db.execute('SELECT provider,model,operation,'+aggregates+
                 ' FROM model_token_usage WHERE '+where+' GROUP BY provider,model,operation ORDER BY COALESCE(sum(total_tokens),0) DESC',args)]
+            operations=[dict(r) for r in self.store.db.execute('SELECT operation,'+aggregates+
+                ' FROM model_token_usage WHERE '+where+' GROUP BY operation ORDER BY COALESCE(sum(total_tokens),0) DESC',args)]
             days=[dict(r) for r in self.store.db.execute("SELECT strftime('%Y-%m-%d',created,'unixepoch','+8 hours') AS day,"+
                 aggregates+' FROM model_token_usage WHERE '+where+' GROUP BY day ORDER BY day DESC LIMIT 30',args)]
         def finish(row):
@@ -83,6 +85,7 @@ class TokenLedger:
             row['average_ms']=round(row['average_ms']) if row['average_ms'] is not None else None
             return row
         result={'period':period,'timezone':'Asia/Shanghai','started_at':started,'since':since,
-                'summary':finish(summary),'models':[finish(r) for r in models],'days':[finish(r) for r in days]}
+                'summary':finish(summary),'models':[finish(r) for r in models],
+                'operations':[finish(r) for r in operations],'days':[finish(r) for r in days]}
         with self.store.lock:self._cache[key]=(time.monotonic(),result)
         return result

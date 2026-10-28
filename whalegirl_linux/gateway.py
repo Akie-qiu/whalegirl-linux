@@ -5,7 +5,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import uuid
 from urllib.parse import quote, urlsplit
@@ -24,6 +24,9 @@ class Receipt:
     quote_error: str = ""
     mentioned_ids: tuple[str, ...] = ()
     mention_error: str = ""
+    attempts: int = 1
+    retryable: bool = True
+    details: dict = field(default_factory=dict)
 
 
 class UIJobError(ValueError):
@@ -78,7 +81,9 @@ class AgentGateway:
         if value.get('ok') is not True:
             saved=json.loads(path.read_text())
             raise UIJobError(str(saved.get('error') or value.get('error') or 'Native UI job failed')[:200],saved.get('state',''))
-        return json.loads(path.read_text())
+        result = json.loads(path.read_text())
+        result['job_id'] = nonce
+        return result
 
     def warm_send_status(self):
         # One account observation overlaps model generation. Polling and the
@@ -247,71 +252,26 @@ class AgentGateway:
             return await self.ui_job('collect_sticker',chat,local_id=int(local_id),server_id=str(server_id),md5=md5)
 
     async def send_sticker(self, chat, md5):
-        before={outbound_identity(m) for m in await self.messages(chat)}
-        async def post_once():
-            async with self.ui_lock:
-                try:
-                    result=await self.ui_job('send_sticker',chat,md5=md5)
-                    return None if result.get('state')=='submitted' else Receipt(False,error='Native sticker did not submit')
-                except UIJobError as exc:
-                    return Receipt(False,error=str(exc),definite_failure=exc.state=='failed_before_send')
-                except (httpx.HTTPError, ValueError, OSError):
-                    return Receipt(False,error='Native sticker send was not confirmed')
-        request=asyncio.create_task(post_once());self.inflight_sends.add(request)
-        request.add_done_callback(self.inflight_sends.discard)
-        deadline=time.monotonic()+20
-        while time.monotonic()<deadline:
-            try:
-                rows=await self.messages(chat)
-            except (httpx.HTTPError,ValueError,OSError):
-                rows=[]
-            for item in rows:
-                if (item.get('isSelf') is True and item.get('type')==47 and
-                        (item.get('sticker') or {}).get('md5')==md5 and outbound_identity(item) not in before):
-                    if server_acknowledged(item):return Receipt(True,message_id(item))
-                    if item.get('nativeStatus')==5:
-                        return Receipt(False,error='微信报告表情发送失败，未获得服务器回执',definite_failure=True)
-            if request.done() and request.result():
-                return request.result()
-            await asyncio.sleep(.15)
-        return Receipt(False,error='Native sticker was not read back; do not resend automatically')
+        if not re.fullmatch(r'[0-9a-f]{32}',str(md5 or '')):
+            return Receipt(False,error='Invalid native sticker identity',definite_failure=True)
+        from .delivery import send_native
+        return await send_native(self, 'sticker', chat, md5=md5)
 
     async def send_image(self, chat, asset_id):
-        if not self.ui_jobs_directory or not re.fullmatch('[0-9a-f]{64}',str(asset_id)):
+        if not re.fullmatch('[0-9a-f]{64}',str(asset_id)):
             return Receipt(False,error='原生图片发送尚未配置',definite_failure=True)
-        async with self.ui_lock:
-            before={outbound_identity(m) for m in await self.messages(chat)}
-            try:
-                result=await self.ui_job('send_image',chat,asset_id=asset_id)
-            except UIJobError as exc:
-                return Receipt(False,error=str(exc),definite_failure=exc.state=='failed_before_send')
-            except (httpx.HTTPError, ValueError, OSError):
-                return Receipt(False,error='图片发送提交结果待核实，不自动重发')
-            if result.get('state')!='submitted':
-                return Receipt(False,error='原生图片未确认提交')
-            deadline=time.monotonic()+25
-            while time.monotonic()<deadline:
-                try:
-                    rows=await self.messages(chat)
-                except (httpx.HTTPError,ValueError,OSError):
-                    rows=[]
-                fresh=[m for m in rows if m.get('isSelf') is True and m.get('type')==3
-                       and outbound_identity(m) not in before]
-                if len(fresh)==1:
-                    item=fresh[0]
-                    if item.get('nativeStatus')==5:
-                        return Receipt(False,error='微信报告图片发送失败',definite_failure=True)
-                    if server_acknowledged(item):
-                        return Receipt(True,message_id(item))
-                elif len(fresh)>1:
-                    return Receipt(False,error='出现多条新图片，无法唯一确认，请人工核对')
-                await asyncio.sleep(.2)
-            return Receipt(False,error='未读到微信图片服务器回执，不自动重发')
+        from .delivery import send_native
+        return await send_native(self, 'image', chat, asset_id=asset_id)
 
     async def send(self, chat, text, *, quote_to=None, mentions=None):
         mentions = list(mentions or [])[:3] if chat.endswith('@chatroom') else []
         if mentions and not self.ui_jobs_directory:
             return Receipt(False,error='当前网关不支持原生@成员',definite_failure=True)
+        if self.ui_jobs_directory:
+            from .delivery import send_native
+            return await send_native(self, 'text', chat, text=text,
+                                     **({'quote_to': quote_to} if quote_to else {}),
+                                     **({'mentions': mentions} if mentions else {}))
         before = {outbound_identity(m) for m in await self.messages(chat)}
         submission = {}
         async def post_once():

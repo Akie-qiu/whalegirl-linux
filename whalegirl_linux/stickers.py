@@ -27,6 +27,26 @@ PRESETS = {
 PROFILE_FIELDS = ('meaning','visual','text','emotion','tone','use_when','avoid_when','example','persona_fit','intensity','usage_scope')
 
 
+def sticker_emotional_signal(profile=None, fallback=''):
+    """Return a compact chat signal; visual details stay out of ordinary context."""
+    profile = profile if isinstance(profile, dict) else {}
+    parts = []
+    for key in ('emotion', 'tone', 'intensity'):
+        value = str(profile.get(key) or '').strip()
+        if value and value not in parts:
+            parts.append(value[:80])
+    if parts:
+        return '；'.join(parts)[:180]
+    value = str(fallback or '').strip()
+    if '，' in value:
+        value = value.split('，', 1)[1]
+    elif ',' in value:
+        value = value.split(',', 1)[1]
+    if re.search(r'小人|角色|人物|发色|头顶|捂脸|闭眼|瞪眼|举手|动作|穿着|画面|图中文字|图上写', value):
+        return '含义未标注'
+    return value[:180]
+
+
 def parse_json(text):
     text = str(text or '').strip().lstrip('\ufeff')
     cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.I).strip()
@@ -69,11 +89,16 @@ class StickerCatalog:
         self.disabled=set()
         self.error=''
         self.refreshed=0
+        self.last_refresh_attempt=0
+        self.indexed=0
         self.lock=asyncio.Lock()
         self.retry_after={}
 
     def choices(self):
         return {md5:self.entries[md5] for md5 in self.available if md5 in self.entries and md5 not in self.disabled}
+
+    def chat_signal(self, md5):
+        return sticker_emotional_signal(self.profiles.get(md5), self.entries.get(md5, ''))
 
     def candidates(self,text,limit=8,used=()):
         available=self.choices()
@@ -108,11 +133,28 @@ class StickerCatalog:
         private_write(self.path,json.dumps(self.entries,ensure_ascii=False,indent=2))
         return profile
 
-    async def refresh(self,gateway,engine):
+    async def _refresh_available(self,gateway):
+        self.last_refresh_attempt=time.time()
+        value=await gateway.native_request('/stickers')
+        if not isinstance(value,dict) or not isinstance(value.get('stickers'),list):
+            raise ValueError('原生表情目录读取结果无效')
+        available=[r['md5'] for r in value['stickers']
+            if isinstance(r,dict) and isinstance(r.get('md5'),str) and re.fullmatch('[0-9a-f]{32}',r['md5'])]
+        self.available=list(dict.fromkeys(available))
+        self.refreshed=time.time()
+        self.error=''
+        return len(self.available)
+
+    async def refresh_available(self,gateway):
+        """Only a small SQLite-backed ID list; no media reads or model calls."""
+        async with self.lock:
+            return await self._refresh_available(gateway)
+
+    async def refresh(self,gateway,engine,*,refresh_catalog=True):
         async with self.lock:
             self.error=''
-            value=await gateway.native_request('/stickers')
-            self.available=[r['md5'] for r in value.get('stickers',[]) if re.fullmatch('[0-9a-f]{32}',r.get('md5',''))]
+            if refresh_catalog:
+                await self._refresh_available(gateway)
             pending=[m for m in self.available if m not in self.profiles and self.retry_after.get(m,0)<=time.time()][:4]
             content=[];ids=[]
             for md5 in pending:
@@ -134,11 +176,11 @@ class StickerCatalog:
                         '"tone":"真诚/反讽/撒娇等语用","use_when":"适用场景，要具体",'
                         '"avoid_when":"容易用错的场景，如安慰不能嘲笑、无语不等于害羞","example":"适合回应的一句群友话"}]}。'
                         '每项尽量20～60字，看不清的文字说看不清，不编造。'),
-                        max_tokens=1600,response_format={'type':'json_object'})
+                        max_tokens=1600,response_format={'type':'json_object'},operation='sticker')
                     for profile in parse_json(answer).get('profiles',[]):
                         if profile.get('id') in ids and profile['id'] not in self.profiles:self.edit(profile['id'],profile,actor='vision')
                 except Exception as exc:self.error=type(exc).__name__
                 for md5 in ids:
                     if md5 not in self.profiles:self.retry_after[md5]=time.time()+120
-            self.refreshed=time.time()
+            self.indexed=time.time()
             if not self.path.exists():private_write(self.path,json.dumps(self.entries,ensure_ascii=False,indent=2))

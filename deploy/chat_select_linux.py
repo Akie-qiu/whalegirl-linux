@@ -247,6 +247,7 @@ def send_native_sticker(job,path,root,name,is_group):
 
 
 def _send_native_sticker(job,path,root,name,is_group):
+    started=time.monotonic()
     md5=job.get('md5','')
     if not re.fullmatch(r'[0-9a-f]{32}',md5):raise ValueError('Invalid sticker identity')
     order=[r['md5'] for r in native_read('/stickers')['stickers']]
@@ -276,7 +277,27 @@ def _send_native_sticker(job,path,root,name,is_group):
         tabs=[n for n in walk(root) if n.get('role')=='page-tab' and n.get('name')=='Custom Stickers']
         if len(tabs)!=1:raise ValueError('Custom sticker tab is not unique')
         click_node(tabs[0]);time.sleep(.1);root=tree();tiles,area=panel(root)
-    if len(tiles)==len(order):
+    # Keep object-to-index anchors, never stale screen coordinates. A popup
+    # rebuilt by Qt or a reordered favorite list invalidates the cache.
+    cache_path=path.parent/'sticker-panel-anchors.cache'
+    panel_ref=next((n.get('native_ref') for n in walk(root) if n.get('role')=='list'
+                    and any(c.get('name')=='Custom Stickers' for c in n.get('children') or [])),None)
+    known={}
+    try:
+        cached=json.loads(cache_path.read_text())
+        if (panel_ref and cached.get('panel_ref')==panel_ref and cached.get('order')==order
+                and 0<=time.time()-cached.get('updated',0)<60):
+            known=cached.get('anchors') or {}
+    except (OSError,ValueError):pass
+    offsets={known[n['native_ref']]-i for i,n in enumerate(tiles) if n.get('native_ref') in known}
+    shared=sum(n.get('native_ref') in known for n in tiles)
+    offset=next(iter(offsets)) if len(offsets)==1 and shared>=2 else None
+    relative=index-offset if offset is not None else -1
+    chosen=tiles[relative] if 0<=relative<len(tiles) else None
+    if clickable(chosen,area):
+        job['favorite_cache']='anchor_hit'
+    elif len(tiles)==len(order):
+        known={n['native_ref']:i for i,n in enumerate(tiles) if n.get('native_ref')}
         # A full grid has an exact native index. Keep the current scroll position
         # when the desired tile is already visible instead of resetting it twice.
         chosen=tiles[index]
@@ -289,6 +310,8 @@ def _send_native_sticker(job,path,root,name,is_group):
         tail_first=index>=len(order)-20 and index>=20
         scroll(area,'5' if tail_first else '4');root=tree();tiles,area=panel(root)
         initial_index=index-(len(order)-len(tiles)) if tail_first else index
+        first_index=len(order)-len(tiles) if tail_first else 0
+        known={n['native_ref']:first_index+i for i,n in enumerate(tiles) if n.get('native_ref')}
         chosen=tiles[initial_index] if 0<=initial_index<len(tiles) else None
         if chosen is None and not tail_first:
             # Qt virtualizes this grid and accelerates wheel events. Align the
@@ -299,7 +322,8 @@ def _send_native_sticker(job,path,root,name,is_group):
             first_index=0
             job['favorite_scroll']=[]
             stagnant=0
-            for _ in range(72):
+            for _ in range(16):
+                if time.monotonic()-started>12:break
                 before_index=first_index
                 before_refs=tuple(n.get('native_ref') for n in tiles)
                 run_process(['xdotool','mousemove',str(round(area['x']+area['width']/2)),str(round(area['y']+area['height']/2)),
@@ -328,6 +352,7 @@ def _send_native_sticker(job,path,root,name,is_group):
     # Qt normally exposes the full grid even when most rows are outside the viewport.
     # With a full grid the native order gives an exact index for middle favorites too.
     for _ in range(8):
+        if time.monotonic()-started>12:break
         if len(tiles)!=len(order):break
         chosen=tiles[index];b=chosen['bounds']
         if clickable(chosen,area):break
@@ -341,6 +366,15 @@ def _send_native_sticker(job,path,root,name,is_group):
     current=[r['md5'] for r in native_read('/stickers')['stickers']]
     if current!=order:raise ValueError('Favorite sync changed the order before sending')
     if not selected(root,name,is_group):raise ValueError('Destination changed before sticker send')
+    if job.get('created') and time.time()-job['created']>=25:
+        raise ValueError('表情定位超时，任务已作废，尚未点击发送')
+    if panel_ref and known:
+        try:
+            fd=os.open(cache_path,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+            with os.fdopen(fd,'w') as stream:
+                json.dump({'panel_ref':panel_ref,'order':order,'updated':time.time(),'anchors':known},stream)
+        except OSError:pass
+    job['favorite_seconds']=round(time.monotonic()-started,3)
     job['state']='sending';path.write_text(json.dumps(job,ensure_ascii=False))
     # A favorite tile sends immediately as WeChat type 47; never paste an image instead.
     visible_top=max(b['y'],area['y']);visible_bottom=min(b['y']+b['height'],area['y']+area['height'])

@@ -89,13 +89,13 @@ class ChatHabitTests(unittest.IsolatedAsyncioTestCase):
         await self.answer([{'type':'unknown','value':'ignored'}],reply='兼容回复',sticker='f'*32)
         self.assertEqual(self.gateway.sent,[('text','兼容回复')])
 
-    async def test_uncertain_second_part_stops_third_and_preserves_ledger(self):
+    async def test_uncertain_second_part_continues_third_and_preserves_ledger(self):
         self.queue(self.event());self.gateway.uncertain_at=2
-        await self.answer([{'type':'text','text':'第一句'},{'type':'sticker','id':'a'*32},{'type':'text','text':'不得发送'}])
-        self.assertEqual(len(self.gateway.sent),2)
+        await self.answer([{'type':'text','text':'第一句'},{'type':'sticker','id':'a'*32},{'type':'text','text':'补充一句'}])
+        self.assertEqual(len(self.gateway.sent),3)
         self.assertEqual(self.store.get(self.event()['key'])['state'],'uncertain')
-        self.assertEqual([r['state'] for r in self.store.actions(self.event()['key'])],['sent','uncertain'])
-        self.assertTrue(self.runtime.paused_reason)
+        self.assertEqual([r['state'] for r in self.store.actions(self.event()['key'])],['sent','uncertain','sent'])
+        self.assertFalse(self.runtime.paused_reason)
 
     async def test_memory_tools_are_attributed_reversible_and_enforce_subject(self):
         e=self.event(content='记住 我喜欢猫');self.queue(e);book=self.runtime.memory_book
@@ -151,6 +151,116 @@ class ChatHabitTests(unittest.IsolatedAsyncioTestCase):
         await task
         self.assertEqual(len(batch),2)
         self.assertLess(time.monotonic()-started,.5)
+
+    async def test_followup_wait_releases_worker_and_merges_new_message(self):
+        first=self.event();self.queue(first)
+        other_chat='other@chatroom'
+        self.config.save(self.config.settings.model_copy(update={
+            'allowed_chat_ids':['group@chatroom',other_chat],
+            'followup_wait_enabled':True,'followup_wait_seconds':3,
+            'debounce_single_seconds':0,'debounce_burst_seconds':0,'debounce_max_seconds':0,
+        }))
+        engine=await self.runtime.model()
+        engine.api_style='openai';engine.stream_enabled=False
+        tool_calls=[]
+        async def chat_with_tools(messages,tools,**kwargs):
+            tool_calls.append(messages)
+            if len(tool_calls)==1:
+                return {'content':'','tool_calls':[{'function':{
+                    'name':'wait_for_next_message','arguments':'{"reason":"补充条件"}'}}]}
+            return {'content':json.dumps({'should_reply':True,'actions':[{'type':'text','text':'收到啦'}]}),
+                    'tool_calls':[]}
+        engine.chat_with_tools=chat_with_tools
+        await self.runtime.process_next()
+        self.assertEqual(self.store.get(first['key'])['state'],'waiting')
+        self.assertIn('group@chatroom',self.runtime.followup_waits)
+
+        other=self.event(10,content='另一个会话的消息');other.update(
+            chat=other_chat,key=f'account/{other_chat}/10',trigger='direct')
+        self.queue(other)
+        await self.runtime.process_next(exclude_chats={'group@chatroom'})
+        self.assertIn(('text','收到啦'),self.gateway.sent)
+
+        followup=self.event(2,content='还有一个条件');self.queue(followup)
+        await asyncio.sleep(.25)
+        self.assertEqual(self.store.get(first['key'])['state'],'queued')
+        self.assertEqual(self.runtime.followup_ready[first['key']]['reason'],'received')
+        captured=[]
+        async def chat(messages,**kwargs):
+            captured.extend(messages)
+            return json.dumps({'should_reply':True,'actions':[{'type':'text','text':'懂了'}]},ensure_ascii=False)
+        engine.chat=chat
+        await self.runtime.process_next()
+        self.assertIn('还有一个条件',str(captured))
+        self.assertIn(('text','懂了'),self.gateway.sent)
+        self.assertEqual(self.store.get(first['key'])['state'],'sent')
+
+    async def test_followup_tool_keeps_original_burst_and_returns_result_to_model(self):
+        first=self.event(content='我先说一下');self.queue(first)
+        previous=self.event(2,content='第一个条件是不加糖');self.queue(previous)
+        engine=await self.runtime.model();engine.api_style='openai';engine.stream_enabled=False
+        calls=[]
+        assistant={'role':'assistant','content':None,'tool_calls':[{
+            'id':'call_wait','type':'function','function':{
+                'name':'wait_for_next_message','arguments':'{}'}}]}
+        async def chat_with_tools(messages,tools,**kwargs):
+            calls.append((messages,kwargs))
+            if len(calls)==1:
+                return {'content':'','tool_calls':assistant['tool_calls'],'assistant_message':assistant}
+            return {'content':json.dumps({'should_reply':True,'actions':[{'type':'text','text':'听完啦'}]}),
+                    'tool_calls':[]}
+        engine.chat_with_tools=chat_with_tools
+        await self.runtime.process_next()
+        self.assertEqual(self.store.get(previous['key'])['state'],'merged')
+        followup=self.event(3,content='第二个条件是少冰');self.queue(followup)
+        # Direct callers also cannot consume the waiting chat prematurely.
+        self.assertFalse(await self.runtime.process_next())
+        await asyncio.sleep(.2)
+        await self.runtime.process_next()
+        resumed,options=calls[1]
+        self.assertIn('第一个条件是不加糖',str(resumed))
+        self.assertIn('第二个条件是少冰',str(resumed))
+        self.assertEqual([m['role'] for m in resumed[-2:]],['assistant','tool'])
+        self.assertEqual(resumed[-1]['tool_call_id'],'call_wait')
+        self.assertEqual(options['tool_choice'],'none')
+        self.assertEqual(self.gateway.sent,[('text','听完啦')])
+
+    async def test_disabling_followup_wait_restores_ordinary_reply(self):
+        first=self.event();self.queue(first)
+        engine=await self.runtime.model();engine.api_style='openai'
+        async def wait(*args,**kwargs):
+            return {'content':'','tool_calls':[{'function':{
+                'name':'wait_for_next_message','arguments':'{}'}}]}
+        engine.chat_with_tools=wait
+        await self.runtime.process_next()
+        self.config.save(self.config.settings.model_copy(update={'followup_wait_enabled':False}))
+        await asyncio.sleep(.2)
+        self.assertNotIn(first['chat'],self.runtime.followup_waits)
+        self.assertEqual(self.runtime.followup_ready[first['key']]['reason'],'disabled')
+        engine=await self.runtime.model()
+        engine.answers=[{'should_reply':True,'actions':[{'type':'text','text':'正常接话'}]}]
+        await self.runtime.process_next()
+        self.assertEqual(engine.calls,1)
+        self.assertEqual(self.gateway.sent,[('text','正常接话')])
+
+    async def test_followup_timeout_resumes_once_without_another_wait(self):
+        first=self.event();self.queue(first)
+        self.config.save(self.config.settings.model_copy(update={'followup_wait_seconds':3}))
+        self.store.update(first['key'],'waiting')
+        self.runtime._schedule_followup_wait(first,self.config.generation,'半句话',
+                                             (first['timestamp'],first['local_id']),0)
+        await asyncio.sleep(3.15)
+        self.assertEqual(self.runtime.followup_ready[first['key']]['reason'],'timeout')
+        captured=[];engine=await self.runtime.model();engine.api_style='openai'
+        async def chat(messages,**kwargs):
+            captured.append(kwargs['system_prompt'])
+            return json.dumps({'should_reply':True,'actions':[{'type':'text','text':'先按这句回应'}]})
+        async def must_not_wait(*args,**kwargs):raise AssertionError('重复等待')
+        engine.chat=chat;engine.chat_with_tools=must_not_wait
+        await self.runtime.process_next()
+        self.assertIn('没有收到后续消息',captured[0])
+        self.assertEqual(self.gateway.sent,[('text','先按这句回应')])
+        self.assertFalse(self.runtime.followup_waits)
 
 
 class MemoryApiTests(unittest.TestCase):

@@ -379,7 +379,7 @@ class StickerLibrary:
                             '"tone":"语气/反讽","use_when":"具体适用场景","avoid_when":"易误用场景",'
                             '"example":"适合回应的话","persona_fit":"与当前人设的契合点",'
                             '"usage_scope":"群聊/私聊/均可，具体边界"}}。各项不超过100字，不能辨认就说不能辨认。'),
-                            max_tokens=850,response_format={'type':'json_object'})
+                            max_tokens=850,response_format={'type':'json_object'},operation='sticker')
                         result=parse_json(answer)
                         profile=result.get('profile') or {}
                         if not isinstance(profile,dict) or not str(profile.get('meaning','')).strip():

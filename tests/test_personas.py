@@ -17,7 +17,7 @@ class PersonaTests(unittest.TestCase):
         self.library=PersonaLibrary(self.config,'原本的人设')
 
     def test_existing_prompt_is_preserved_without_config_save(self):
-        self.config.save(Settings(system_prompt_override='原有自定义人设\n保持原样',context_messages=40))
+        self.config.save(Settings(system_prompt_override='原有自定义人设\n保持原样',context_messages=20))
         generation=self.config.generation;before=self.config.path.read_bytes()
         snapshot=self.library.snapshot()
         self.assertEqual(snapshot['effective_prompt'],'原有自定义人设\n保持原样')
@@ -28,7 +28,7 @@ class PersonaTests(unittest.TestCase):
         self.assertEqual(len(PersonaLibrary(self.config,'原本的人设').snapshot()['cards']),5)
 
     def test_draft_save_does_not_activate_and_activation_only_changes_persona(self):
-        self.config.save(Settings(context_messages=40,quote_replies_enabled=True,moments_reply_own_enabled=True))
+        self.config.save(Settings(context_messages=20,quote_replies_enabled=True,moments_reply_own_enabled=True))
         before=self.config.settings.model_dump()
         spec=PersonaSpec(name='阿禾',identity='温柔的成年聊天伙伴',private_style='温柔亲近',group_style='公开场合有分寸')
         result=self.library.save(PersonaSaveRequest(card=spec))
@@ -88,7 +88,9 @@ class PersonaApiTests(unittest.TestCase):
             saved=client.post('/api/personas/save',headers=h,json={'card':spec})
             self.assertEqual(saved.status_code,200);identity=saved.json()['saved_id']
             self.assertEqual(client.post('/api/personas/'+identity+'/actions',headers=h,json={'op':'activate','revision':1}).status_code,200)
-            client.post('/api/config',headers=h,json={'settings':{'context_messages':40}})
+            saved_config=client.post('/api/config',headers=h,json={'settings':{'context_messages':35}})
+            self.assertEqual(saved_config.status_code,200)
+            self.assertEqual(app.state.config.settings.context_messages,35)
             self.assertEqual(app.state.config.settings.active_persona_id,identity)
             client.post('/api/prompt',headers=h,json={'system_prompt':'旧版入口手动改写'})
             state=client.get('/api/personas',headers=h).json()

@@ -404,6 +404,7 @@ class AIEngine:
         temperature: float | None = None,
         max_tokens: int | None = None,
         response_format: dict | None = None,
+        operation: str = "chat",
     ) -> str:
         """发送聊天请求，返回回复文本"""
         if not self._available:
@@ -484,7 +485,7 @@ class AIEngine:
                 last_error = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
                 logger.warning(f"AI 请求异常: {last_error} (attempt {attempt + 1}/{self.max_retries})")
             finally:
-                self.record_usage(raw_usage,started=started,created=created,status=outcome)
+                self.record_usage(raw_usage,started=started,created=created,status=outcome,operation=operation)
 
             # 指数退避
             if attempt < attempts - 1:
@@ -494,6 +495,91 @@ class AIEngine:
         logger.error(f"AI 请求最终失败: {last_error}")
         self.last_error = last_error or "模型返回空内容"
         return ""
+
+    async def chat_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        system_prompt: str = "",
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        response_format: dict | None = None,
+        operation: str = "chat",
+        tool_choice: str = "auto",
+    ) -> dict:
+        """Return a complete non-streamed tool decision with usage accounting."""
+        if not self._available:
+            return {"content": "", "tool_calls": [], "assistant_message": {}}
+        if self.api_style != "openai":
+            raise ValueError("工具调用仅支持 Chat Completions 接口")
+        if self.stream_enabled:
+            raise ValueError("接话等待工具需要关闭流式接收")
+
+        self.last_error = ""
+        self.last_first_token_ms = None
+        payload = self._build_payload(
+            messages,
+            system_prompt,
+            temperature,
+            stream=False,
+            max_tokens=max_tokens,
+            response_format=response_format,
+        )
+        payload["tools"] = tools
+        payload["tool_choice"] = tool_choice
+        started, created = time.monotonic(), time.time()
+        raw_usage = {}
+        outcome = "error"
+        try:
+            client = await self._get_client()
+            response = await client.post(self.api_url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            raw_usage = data.get("usage") or {}
+            choice = (data.get("choices") or [{}])[0]
+            if choice.get("finish_reason") in {"length", "content_filter"}:
+                raise IncompleteModelResponse("模型工具调用未完成：" + choice["finish_reason"])
+            message = choice.get("message") or {}
+            assistant_message = {
+                key: message[key] for key in ("role", "content", "tool_calls", "refusal", "reasoning_content")
+                if key in message
+            }
+            content = message.get("content")
+            if not isinstance(content, str):
+                content = ""
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                tool_calls = []
+            if any(not isinstance(call, dict) or not call.get("id")
+                   or not isinstance(call.get("function"), dict)
+                   or not isinstance(call["function"].get("arguments"), str)
+                   for call in tool_calls):
+                raise IncompleteModelResponse("模型工具调用格式不完整，未执行动作")
+            assistant_message.setdefault("role", "assistant")
+            outcome = "success"
+            if self.last_first_token_ms is None:
+                self.last_first_token_ms = round((time.monotonic() - started) * 1000)
+            return {
+                "content": content.strip(),
+                "tool_calls": tool_calls,
+                "assistant_message": assistant_message,
+            }
+        except IncompleteModelResponse as exc:
+            self.last_error = str(exc)
+        except httpx.TimeoutException:
+            self.last_error = f"请求超时 ({self.timeout}s)"
+        except httpx.HTTPStatusError as exc:
+            self.last_error = f"HTTP {exc.response.status_code}"
+            if exc.response.status_code == 404:
+                self.last_error += "（模型或接口不可用，请核对模型名称和接口地址）"
+            logger.warning("模型工具调用请求失败: " + self.last_error)
+        except (httpx.HTTPError, ValueError, KeyError, IndexError) as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            logger.warning("模型工具调用请求异常: " + self.last_error)
+        finally:
+            self.record_usage(raw_usage, started=started, created=created,
+                              status=outcome, operation=operation)
+        return {"content": "", "tool_calls": [], "assistant_message": {}}
 
     def record_usage(self,raw_usage=None, *, started,created,status='success',operation='chat'):
         """Accounting must never turn a completed model call into a retry."""
@@ -515,6 +601,7 @@ class AIEngine:
         temperature: float | None = None,
         max_tokens: int | None = None,
         response_format: dict | None = None,
+        operation: str = "chat",
     ) -> AsyncIterator[str]:
         """流式聊天请求，逐块返回"""
         if not self._available:
@@ -540,7 +627,7 @@ class AIEngine:
             self.last_error = str(e) if isinstance(e, IncompleteModelResponse) else "流式请求失败：" + type(e).__name__
             logger.error(self.last_error)
         finally:
-            self.record_usage(raw_usage,started=started,created=created,status=outcome)
+            self.record_usage(raw_usage,started=started,created=created,status=outcome,operation=operation)
 
     async def test_connection(self) -> tuple[bool, str]:
         """测试 API 连接"""

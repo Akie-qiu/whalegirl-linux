@@ -62,7 +62,7 @@ function populateSettings() {
   $('group-mentions-enabled').checked = cfg.group_mentions_enabled ?? true;
   $('global-memory').checked = cfg.global_memory;
   $('vision-enabled').checked = cfg.vision_enabled;
-  $('context-count').value = cfg.context_messages;
+  $('context-count').value = Math.max(10, Math.min(100, Number(cfg.context_messages) || 40));
   $('api-url').value = cfg.api_url; $('model').value = cfg.model;
   $('api-style').value = cfg.api_style || 'auto';
   $('reasoning-effort').value = cfg.reasoning_effort || 'default';
@@ -82,6 +82,7 @@ function populateSettings() {
   renderChats();
   if (window.habits) window.habits.populate();
   window.learning?.populate();
+  window.memoryHub?.populate();
   window.improvements?.populate();
   window.affection?.populate();
   window.stickerLibrary?.populate();
@@ -181,7 +182,7 @@ async function saveSubset(values, apiKey = '') {
   await update();
   return cfg;
 }
-const recordLabels = { queued: '等待处理', generating: '生成中', merged: '已合并', handled: '图片任务已受理，发送结果见图片任务', sending: '等待微信服务器回执', sent: '已获微信服务器回执', partial: '部分已发送，其余失败或被拦截', failed: '未发送', uncertain: '需要核对', skipped: '已跳过', blocked: '本地保护拦截', ignored: '安静旁观', baseline: '历史基线' };
+const recordLabels = { queued: '等待处理', waiting: '等待对方补充', generating: '生成中', merged: '已合并', handled: '图片任务已受理，发送结果见图片任务', sending: '正在提交微信', sent: '已确认发送', partial: '部分已发送，其余失败或被拦截', failed: '明确未发送', uncertain: '回执待核实 · 自动回复继续', skipped: '已跳过', blocked: '本地保护拦截', ignored: '安静旁观', baseline: '历史基线' };
 function renderRecords(rows) {
   const signature = JSON.stringify(rows);
   if (signature === recordsSignature) return;
@@ -203,11 +204,12 @@ function renderRecords(rows) {
       const message = document.createElement('div'); message.className = 'message' + (isReply ? ' reply' : ''); message.textContent = content; article.append(message);
     }
     for(const item of row.actions || []){
-      const detail=document.createElement('p');detail.className=item.state==='sent'?'hint':'error-text';
-      detail.textContent=(item.kind==='sticker'?'表情包':'文字')+'：'+(recordLabels[item.state] || item.state)+(item.error?' · '+item.error:'');
+      const detail=document.createElement('p');detail.className=['sent','uncertain','sending'].includes(item.state)?'hint':'error-text';
+      const d=item.delivery || {};
+      detail.textContent=(item.kind==='sticker'?'表情包':item.kind==='image'?'图片':'文字')+'：'+(recordLabels[item.state] || item.state)+(d.attempts?' · 尝试 '+d.attempts+' 次':'')+(d.confirmation==='native_poll'?' · 已由后续消息确认':'')+(item.error?' · '+item.error:'');
       article.append(detail);
     }
-    if (row.error) { const error = document.createElement('p'); error.className = ['ignored','baseline'].includes(row.state) ? 'hint' : 'error-text'; error.textContent = row.error; article.append(error); }
+    if (row.error) { const error = document.createElement('p'); error.className = ['ignored','baseline','uncertain'].includes(row.state) ? 'hint' : 'error-text'; error.textContent = row.error; article.append(error); }
     if (row.state === 'uncertain') {
       const actions = document.createElement('div'); actions.className = 'row';
       for (const [label, received] of [['微信已收到', true], ['确认未发送', false]]) {
@@ -223,6 +225,7 @@ function renderState(s) {
   state = s;
   if (window.habits) window.habits.stateUpdated(s);
   window.learning?.stateUpdated(s);
+  window.memoryHub?.stateUpdated(s);
   window.affection?.stateUpdated(s);
   window.stickerLibrary?.stateUpdated(s);
   window.proactiveChat?.refresh().catch(() => {});
@@ -237,7 +240,7 @@ function renderState(s) {
   text('side-status', online ? '微信在线' : '等待重新登录'); $('side-dot').className = 'online-dot' + (online ? ' online' : '');
   text('sync-status', '已同步 · ' + new Date().toLocaleTimeString('zh-CN', { hour12: false }));
   $('sync-status').className = 'pill online';
-  text('sent-count', s.counts.sent || 0); text('queue-count', (s.counts.queued || 0) + (s.counts.generating || 0)); text('uncertain-count', s.counts.uncertain || 0);
+  text('sent-count', s.counts.sent || 0); text('queue-count', (s.counts.queued || 0) + (s.counts.waiting || 0) + (s.counts.generating || 0)); text('uncertain-count', s.counts.uncertain || 0);
   text('paused', s.paused_reason); text('last-error', s.last_error);
   $('runtime-alert').hidden = !s.paused_reason && !s.last_error;
   const memory = s.memory || {};
@@ -246,7 +249,7 @@ function renderState(s) {
   const timing = s.last_reply_timing || {};
   text('reply-timing', timing.total_seconds == null ? '—' : timing.total_seconds.toFixed(1) + ' 秒');
   const memoryRecall = timing.long_term_memory;
-  const memoryNote = memoryRecall ? ' · 长期记忆 ' + memoryRecall.count + ' 条' + (memoryRecall.ids.length ? '（#' + memoryRecall.ids.join('、#') + '）' : '') : '';
+  const memoryNote = memoryRecall ? ' · 分级记忆 ' + memoryRecall.count + ' 条' + (memoryRecall.ids.length ? '（#' + memoryRecall.ids.join('、#') + '）' : '') + (memoryRecall.estimated_tokens != null ? ' · 记忆输入约 ' + memoryRecall.estimated_tokens + '/' + memoryRecall.budget + ' Token' : '') + (memoryRecall.skipped_for_budget ? ' · 预算未载入 ' + memoryRecall.skipped_for_budget + ' 条' : '') : '';
   text('timing-detail', timing.total_seconds == null ? '等待下一次实际回复，文字和表情的耗时会分别统计。' : '发现 ' + (timing.detected_after_seconds || 0).toFixed(1) + 's · 上下文 ' + (timing.context_seconds || 0).toFixed(1) + 's · 模型 ' + (timing.model_seconds || 0).toFixed(1) + 's · 发送确认 ' + (timing.send_readback_seconds || 0).toFixed(1) + 's' + memoryNote);
   if(timing.first_reply_seconds!=null)$('timing-detail').append(document.createTextNode(' · 首条确认 '+timing.first_reply_seconds.toFixed(1)+'s'));
   const stickers = s.stickers || {};
@@ -428,7 +431,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const sidebar=document.querySelector('.sidebar'),nav=sidebar.querySelector('nav');
   const groups=[
     ['connection','连接与会话','🏠','概览连接',['#login-panel','#chats','#send-limits-panel','#safety-panel']],
-    ['persona','角色与记忆','🐋','角色记忆',['#persona','#habits-panel','#memory-panel','#learning-panel','#affection-panel','#category-limits-panel']],
+    ['persona','角色与记忆','🐋','角色记忆',['#persona','#habits-panel','#memory-panel','#affection-panel','#category-limits-panel']],
     ['interaction','互动与内容','✨','互动内容',['#proactive-panel','#sticker-library-panel','#sticker-profile-panel','#images-panel','#moments-panel','#tieba-panel']],
     ['model','模型与用量','🧠','模型搜索',['#model-panel','#web-search-panel','#token-usage-panel']],
     ['activity','日志与记录','📋','消息日志',['#records-panel','#inbox-panel','#stability-panel']]
@@ -461,7 +464,7 @@ document.addEventListener('DOMContentLoaded', () => {
   mobileNav.setAttribute('aria-label','底部主工作区导航');
   $('dashboard').append(mobileNav);
 
-  const links=[...nav.querySelectorAll('a[href^="#"]')],byHref=new Map(links.map(a=>[a.getAttribute('href'),a]));
+  const links=[...nav.querySelectorAll('a[href^="#"]')].filter(a=>!a.hidden),byHref=new Map(links.map(a=>[a.getAttribute('href'),a]));
   const titleByHref=new Map([['#overview','运行概览']]);
   for(const a of links){const label=a.querySelector('span');if(label)a.textContent=label.textContent.trim();a.classList.add('nav-page');titleByHref.set(a.getAttribute('href'),a.textContent.trim());}
   nav.id='console-nav';nav.classList.add('console-nav');nav.setAttribute('aria-label','功能导航');
@@ -539,6 +542,7 @@ document.addEventListener('DOMContentLoaded', () => {
     'habits-panel':['save-style-settings','save-context-strategy','save-habits'],
     'category-limits-panel':['save-category-limits'],
     'learning-panel':['learning-save'],
+    'memory-panel':['hub-save-settings'],
     'affection-panel':['save-affection-rules']
   };
   let dirtyPanelId='';

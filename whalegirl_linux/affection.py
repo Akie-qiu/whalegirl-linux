@@ -137,6 +137,9 @@ class AffectionBook:
             (account,subject,chat,source_key,actor,reason,before_json,after_json,created) VALUES(?,?,?,?,?,?,?,?,?)''',
             (value['account'],value['subject'],chat,source_key,actor,reason,
              json.dumps(old,ensure_ascii=False),json.dumps(value,ensure_ascii=False),value['updated']))
+        hub=getattr(self.store,'memory_hub',None)
+        if hub:
+            hub.sync_profile(value,old,actor=actor,chat=chat,source_key=source_key)
         self.store.db.commit()
         return value
 
@@ -165,7 +168,7 @@ class AffectionBook:
             return self._save(old,value,actor='admin',reason=reason[:120])
 
     def evolve_profile(self, account, allowed, chat, subject, profile_data, settings, source_key=''):
-        if not settings.affection_enabled or not getattr(settings, 'evolution_profile_auto_accept', True):
+        if not settings.memory_enabled or not settings.memory_consolidation_enabled or not settings.affection_enabled or not getattr(settings, 'evolution_profile_auto_accept', True):
             return None
         if not isinstance(profile_data, dict) or not subject:
             return None
@@ -309,7 +312,8 @@ class AffectionBook:
                 profile_parts.append('相处方式：'+value['interaction_rule'])
             if value.get('notable_events'):
                 profile_parts.append('过往共同梗/黑历史（相关时可自然提起）：'+value['notable_events'])
-            if profile_parts:
+            # Text profiles now enter through the versioned, scoped memory budget.
+            if profile_parts and not getattr(self.store,'memory_hub',None):
                 style+=' 【千人千面印象卡】'+'；'.join(profile_parts)+'。'
             text+='\n针对人物 '+json.dumps(subject,ensure_ascii=False)+'：'+style
         text+='\n关系观察可用来源：'+json.dumps([{'source_key':m['key'],'subject':m.get('sender_id','')} for m in batch],ensure_ascii=False)

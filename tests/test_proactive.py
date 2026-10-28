@@ -208,13 +208,13 @@ class ProactiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.gateway.sent, [])
         self.assertTrue(self.service.quota(CHAT, time.time()))
 
-    async def test_uncertain_send_stops_later_actions(self):
+    async def test_uncertain_send_continues_later_independent_actions(self):
         self.gateway.confirmed = False
-        self.reply['actions'].append({'type':'text', 'text':'不应该发出'})
+        self.reply['actions'].append({'type':'text', 'text':'接着说一句'})
         await self.service.run_once()
-        self.assertEqual(len(self.gateway.sent), 1)
+        self.assertEqual(len(self.gateway.sent), 2)
         self.assertEqual(self.service.snapshot()['runs'][0]['state'], 'uncertain')
-        self.assertTrue(self.runtime.paused_reason)
+        self.assertFalse(self.runtime.paused_reason)
 
     async def test_strict_group_continuation_is_scoped_and_expires(self):
         self.configure(trigger_only_chat_ids=[CHAT], proactive_strict_chat_ids=[CHAT])

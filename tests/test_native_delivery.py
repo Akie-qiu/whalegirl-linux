@@ -29,6 +29,25 @@ class NativeProcessTests(unittest.TestCase):
 
 
 class NativePopupTests(unittest.TestCase):
+    def test_sticker_anchor_cache_reuses_visible_page_without_rescanning(self):
+        order=[f'{i:032x}' for i in range(1,65)]
+        listing={'role':'list','native_ref':'favorite-panel','bounds':{'x':0,'y':0,'width':600,'height':90},
+                 'children':[{'role':'label','name':'Custom Stickers','native_ref':f'tile:{i}',
+                    'bounds':{'x':i*70,'y':10,'width':60,'height':60}} for i in range(5)]}
+        root={'children':[{'role':'page-tab','name':'Custom Stickers'},listing]}
+        folder=Path(tempfile.mkdtemp(prefix='sticker-anchors-'));path=folder/'job.json'
+        import time
+        (folder/'sticker-panel-anchors.cache').write_text(json.dumps({'panel_ref':'favorite-panel',
+            'order':order,'updated':time.time(),'anchors':{f'tile:{i}':30+i for i in range(5)}}))
+        job={'md5':order[32],'chat':'test'}
+        with patch.object(ui,'native_read',return_value={'stickers':[{'md5':v} for v in order]}),\
+             patch.object(ui,'tree') as snapshot,patch.object(ui,'selected',return_value=True),\
+             patch.object(ui,'run_process') as command:
+            ui.send_native_sticker(job,path,root,'test',True)
+        self.assertEqual(job['state'],'submitted');self.assertEqual(job['favorite_cache'],'anchor_hit')
+        snapshot.assert_not_called()
+        self.assertEqual(sum(c.args[0][0]=='/opt/tools/click' for c in command.call_args_list),1)
+
     def test_sticker_scroll_recovers_from_ambiguous_virtual_page_without_guessing(self):
         def page(indices):
             tiles=[]

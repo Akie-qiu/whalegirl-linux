@@ -82,12 +82,14 @@ class LearningTests(unittest.IsolatedAsyncioTestCase):
         pending = self.book.change('account', self.config.settings.allowed_chat_ids, pending['id'],
                                    {'op': 'reject', 'version': 1})
         self.assertEqual(pending['state'], 'rejected')
-        expired = self.add(source, content='喜欢猫但不喜欢吵闹')
+        # A withdrawn source cannot silently recreate paraphrased preferences.
+        independent = event(2)
+        expired = self.add(independent, content='喜欢猫但不喜欢吵闹')
         with self.store.lock, self.store.db:
             self.store.db.execute('UPDATE learning_proposals SET expires_at=? WHERE id=?', (time.time()-1, expired['id']))
         self.assertEqual(self.book.recall(source, [source], '猫', self.config.settings), [])
         self.book.expire('account')
-        self.assertEqual(self.add(source, content='喜欢猫但不喜欢吵闹')['state'], 'expired')
+        self.assertEqual(self.add(independent, content='喜欢猫但不喜欢吵闹')['state'], 'expired')
 
     async def test_evidence_is_from_real_current_author_not_quotes_or_forwards(self):
         source = event(content='[当前发言] 我不养宠物\n[引用原话｜朋友] 我喜欢猫')
@@ -121,6 +123,22 @@ class LearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.book.recall(incoming, [incoming], '猫', self.config.settings), [])
         self.assertIn(profile['id'], [r['id'] for r in self.book.recall(source, [source], '猫', self.config.settings)])
         self.assertEqual(self.book.recall({**source, 'account': 'other'}, [source], '猫', self.config.settings), [])
+
+    async def test_chat_scoped_learning_does_not_recall_without_current_topic_overlap(self):
+        source=event(content='我们群里把周三晚上的联机活动叫水母夜')
+        self.store.observe([source])
+        row=self.book.propose(source,[source],{
+            'type':'slang','scope':'chat','subject':'person','source_key':source['key'],
+            'evidence':'周三晚上的联机活动叫水母夜','content':'水母夜指本群的周三联机活动',
+            'confidence':.99,'ttl_days':30,
+        },self.config.settings)
+        self.assertEqual(row['state'],'accepted')
+        current=event(2,content='服务器磁盘怎么扩容')
+        self.assertEqual(self.book.recall(current,[current],'服务器磁盘扩容',self.config.settings),[])
+        relevant=event(3,content='这周水母夜还开吗')
+        self.assertIn(row['id'],[item['id'] for item in self.book.recall(
+            relevant,[relevant],'水母夜联机活动',self.config.settings
+        )])
 
     async def test_disabled_and_zero_eagerness_stop_proposals_but_zero_keeps_recall(self):
         source = event()

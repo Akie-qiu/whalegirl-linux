@@ -56,8 +56,13 @@ class Settings(BaseModel):
     min_send_interval: float = Field(default=6, ge=3, le=120)
     chat_cooldown: float = Field(default=15, ge=5, le=300)
     poll_interval: float = Field(default=1, ge=0.25, le=60)
-    context_messages: int = Field(default=28, ge=10, le=150)
+    context_messages: int = Field(default=40, ge=10, le=100)
     global_memory: bool = True
+    memory_enabled: bool = True
+    memory_consolidation_enabled: bool = True
+    memory_token_budget: int = Field(default=1400, ge=400, le=6000)
+    memory_item_limit: int = Field(default=8, ge=2, le=30)
+    memory_cold_after_days: int = Field(default=30, ge=3, le=365)
     memory_scope_mode: Literal['shared_profiles', 'isolated'] = 'shared_profiles'
     memory_auto_capture: bool = True
     memory_recall_limit: int = Field(default=8, ge=2, le=20)
@@ -98,6 +103,8 @@ class Settings(BaseModel):
     debounce_single_seconds: float = Field(default=0.65, ge=0, le=3)
     debounce_burst_seconds: float = Field(default=1.6, ge=0, le=5)
     debounce_max_seconds: float = Field(default=4, ge=0, le=8)
+    followup_wait_enabled: bool = True
+    followup_wait_seconds: float = Field(default=10, ge=3, le=10)
     reply_max_parts: int = Field(default=3, ge=1, le=3)
     reply_part_interval: float = Field(default=0.8, ge=0.3, le=3)
     participation: Literal['quiet','balanced','active'] = 'balanced'
@@ -256,7 +263,14 @@ class Config:
         self.directory = directory
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = directory / "settings.json"
-        self.settings = Settings.model_validate_json(self.path.read_text("utf-8")) if self.path.exists() else Settings()
+        if self.path.exists():
+            saved = json.loads(self.path.read_text("utf-8"))
+            # Keep legacy settings within the configurable context window.
+            if isinstance(saved, dict) and isinstance(saved.get("context_messages"), int):
+                saved["context_messages"] = max(10, min(100, saved["context_messages"]))
+            self.settings = Settings.model_validate(saved)
+        else:
+            self.settings = Settings()
         self.admin_token = self._secret("admin.token", lambda: secrets.token_urlsafe(32))
         self.gateway_token = self._secret("gateway.token", lambda: secrets.token_hex(32))
         self.fernet = Fernet(self._secret("encryption.key", lambda: Fernet.generate_key().decode()).encode())

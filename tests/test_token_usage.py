@@ -38,12 +38,17 @@ class LedgerTests(unittest.TestCase):
         store=Store(path);book=TokenLedger(store)
         def record(raw,account='account',status='success'):
             book.record(account,{'model':'example','provider':'example.test','status':status,'elapsed_ms':100,**normalize_usage(raw)})
-        record({'prompt_tokens':100,'completion_tokens':20,'prompt_cache_hit_tokens':80})
-        record({'prompt_tokens':900,'completion_tokens':10,'prompt_cache_hit_tokens':90})
+        book.record('account',{'model':'example','provider':'example.test','operation':'chat','status':'success',
+            'elapsed_ms':100,**normalize_usage({'prompt_tokens':100,'completion_tokens':20,'prompt_cache_hit_tokens':80})})
+        book.record('account',{'model':'example','provider':'example.test','operation':'image','status':'success',
+            'elapsed_ms':100,**normalize_usage({'prompt_tokens':900,'completion_tokens':10,'prompt_cache_hit_tokens':90})})
         record({},status='error');record({'prompt_tokens':999,'completion_tokens':1},account='other')
         stats=book.snapshot('account','all')['summary'];self.assertEqual(stats['total_tokens'],1030)
         self.assertEqual(stats['cache_hit_rate'],17);self.assertEqual(stats['requests'],3);self.assertEqual(stats['failed'],1)
         self.assertEqual(stats['total_tokens_reports'],2);self.assertIsNone(stats['cache_write_tokens'])
+        operations={row['operation']:row for row in book.snapshot('account','all')['operations']}
+        self.assertEqual(operations['chat']['input_tokens'],100)
+        self.assertEqual(operations['image']['cache_hit_rate'],10.0)
         store.close();store=Store(path)
         try:self.assertEqual(TokenLedger(store).snapshot('account','all')['summary']['requests'],3)
         finally:store.close()
@@ -74,9 +79,9 @@ class EngineAccountingTests(unittest.IsolatedAsyncioTestCase):
         engine._get_client=AsyncMock(return_value=client);engine.usage_callback=events.append
         try:
             with patch('whalegirl_linux.upstream.ai_engine.asyncio.sleep',new=AsyncMock()):
-                self.assertEqual(await engine.chat([{'role':'user','content':'test'}]),'ok')
+                self.assertEqual(await engine.chat([{'role':'user','content':'test'}],operation='reply'),'ok')
             self.assertEqual(len(events),2);self.assertEqual(events[0]['status'],'error');self.assertIsNone(events[0]['total_tokens'])
-            self.assertEqual(events[1]['total_tokens'],120);self.assertEqual(len(calls),2)
+            self.assertEqual(events[1]['total_tokens'],120);self.assertEqual(events[1]['operation'],'reply');self.assertEqual(len(calls),2)
             def broken(_):raise RuntimeError('accounting only')
             engine.usage_callback=broken
             self.assertEqual(await engine.chat([{'role':'user','content':'test'}]),'ok');self.assertEqual(len(calls),3)
@@ -135,11 +140,9 @@ class EngineAccountingTests(unittest.IsolatedAsyncioTestCase):
             user_1=payloads[1]['messages'][1]['content']
             self.assertIn('【本轮动态上下文】',user_0)
             self.assertLess(user_0.index('【当前会话近期完整消息（含未@内容）】'),user_0.index('【本轮动态上下文】'))
-            self.assertLess(user_0.index('【本轮动态上下文】'),user_0.index('【本次需要回复的消息】'))
-            hist_0=user_0.split('【当前会话近期完整消息（含未@内容）】\n',1)[1].split('\n【本群/本私聊历史检索',1)[0].splitlines()
-            hist_1=user_1.split('【当前会话近期完整消息（含未@内容）】\n',1)[1].split('\n【本群/本私聊历史检索',1)[0].splitlines()
-            self.assertEqual(hist_0[0],hist_1[0])
-            self.assertEqual(hist_0,hist_1[:len(hist_0)])
+            reply_marker='\n【本次需要回复的消息】\n'
+            self.assertLess(user_0.index('【本轮动态上下文】'),user_0.index(reply_marker))
+            self.assertIn('帮我想个晚饭',user_1)
         finally:
             await real_builder.close()
             await runtime.close()

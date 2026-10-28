@@ -89,13 +89,19 @@ class MemoryRequest(BaseModel):
     version: int | None = None
     chat: str | None = Field(default=None,max_length=200)
     subject: str | None = Field(default=None,max_length=200)
-    kind: str | None = Field(default=None,pattern='^(fact|preference|impression|relationship|event|joke|self_stance|shared_moment)$')
+    kind: str | None = Field(default=None,pattern='^(fact|preference|impression|relationship|event|joke|self_stance|shared_moment|chat_style|meme_usage|tool_learning|expression|persona|bot_alias|slang|nickname|interaction_rule)$')
     scope: str | None = Field(default=None,pattern='^(chat|profile)$')
     content: str | None = Field(default=None,max_length=700)
-    source_key: str = Field(default='',max_length=700)
+    source_key: str | None = Field(default=None,max_length=700)
     ttl_days: int | None = Field(default=None,ge=1,le=90)
     triggers: str | list[str] | None = None
     salience: int | None = Field(default=None,ge=1,le=5)
+    tier: str | None = Field(default=None,pattern='^(core|stable|ordinary|cold)$')
+    status: str | None = Field(default=None,pattern='^(active|pending|superseded|forgotten|expired|rejected|blocked)$')
+    locked: bool | None = None
+    venue: str | None = Field(default=None,pattern='^(any|group|private)$')
+    property_key: str | None = Field(default=None,max_length=80)
+    derived_from: list[int] | None = Field(default=None,max_length=8)
 
 
 class AffectionRequest(BaseModel):
@@ -366,6 +372,10 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     @app.get('/learning.js')
     async def learning_script():
         return FileResponse(root/'whalegirl_linux'/'learning.js', media_type='text/javascript')
+
+    @app.get('/memory-hub.js')
+    async def memory_hub_script():
+        return FileResponse(root/'whalegirl_linux'/'memory-hub.js',media_type='text/javascript')
 
     @app.get('/improvements.js')
     async def improvements_js():
@@ -833,7 +843,7 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
             runtime.moments.settings_changed(previous_settings, settings)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-        if not store.stats().get("uncertain"):
+        if runtime.paused_reason in ('模型凭据无效','模型账户余额不足','模型接口权限不足'):
             runtime.paused_reason = ""
         return config.public()
 
@@ -860,7 +870,8 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
         engine = await runtime.model()
         limit = max(128, config.settings.max_tokens) if engine.api_style == "responses" else 32
         started = time.monotonic()
-        text = await engine.chat([{"role": "user", "content": "只回复：连接正常"}], max_tokens=limit)
+        text = await engine.chat([{"role": "user", "content": "只回复：连接正常"}], max_tokens=limit,
+                                 operation='connection_test')
         return {"ok": bool(text), "message": text[:100] if text else engine.last_error or "模型未返回内容",
                 "api_style": engine.api_style, "stream_enabled": engine.stream_enabled,
                 "reasoning_effort": engine.reasoning_effort,
@@ -888,8 +899,6 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     async def resume_safety():
         result = await runtime.check_safety()
         auth = runtime.gateway_state
-        if store.stats().get('uncertain'):
-            raise HTTPException(409,'仍有发送结果不确定的记录，请先在处理记录中核对')
         if result['check_error']:
             raise HTTPException(503,'暂时无法检查微信客户端，请稍后再恢复')
         if auth.get('status')!='logged_in' or auth.get('loggedInUser')!=config.settings.account_id:
@@ -1093,6 +1102,26 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
         return {'memories':rows,
                 'revisions':runtime.memory_book.revisions(s.account_id,s.allowed_chat_ids),'ai_editing':s.editable_memory_enabled}
 
+    @app.get('/api/memory-hub')
+    def memory_hub_list(q: str='',chat: str='',subject: str='',tier: str='',status: str='',kind: str='',view: str='',before: int=0):
+        try:
+            return runtime.memory_hub.snapshot(config.settings,query=q[:200],chat=chat,subject=subject,
+                tier=tier,status=status,kind=kind,view=view,before=before)
+        except ValueError as exc:raise HTTPException(400,str(exc)) from exc
+
+    @app.get('/api/memory-hub/{identity}')
+    def memory_hub_detail(identity: int):
+        s=config.settings
+        result=runtime.memory_hub.detail(s.account_id,s.allowed_chat_ids,identity)
+        if not result:raise HTTPException(404,'记忆不存在或会话未授权')
+        return result
+
+    @app.post('/api/memory-hub')
+    def memory_hub_change(body: MemoryRequest):
+        s=config.settings
+        try:return runtime.memory_book.change(s.account_id,s.allowed_chat_ids,body.model_dump(exclude_none=True),actor='admin')
+        except ValueError as exc:raise HTTPException(409,str(exc)) from exc
+
     @app.get('/api/memory/subjects')
     def memory_subjects():
         s=config.settings
@@ -1135,8 +1164,6 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
                      receipt="manual_confirmation" if body.received else "", error="人工核对：未发送" if not body.received else "")
         if body.received and not actions:
             store.remember(event, event["reply"])
-        if not store.stats().get("uncertain"):
-            runtime.paused_reason = ""
         return {"ok": True, "automatic_resend": False}
 
     return app

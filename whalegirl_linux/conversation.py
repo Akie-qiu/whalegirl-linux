@@ -6,6 +6,7 @@ import re
 import time
 import unicodedata
 from .search import strip_search_citations
+from .stickers import sticker_emotional_signal
 
 
 def canonical(text):
@@ -280,6 +281,11 @@ def get_group_mask(store, account, chat):
         'SELECT * FROM persona_group_masks WHERE account=? AND chat=?', (account, chat)
     ).fetchone()
     if row:
+        hub=getattr(store,'memory_hub',None)
+        if hub:
+            view=hub.mask_view(account,chat)
+            if view:return view
+            return {**dict(row),'teasing_delta':0,'banter_delta':0,'guard_level':'normal','vibe_summary':'','locked':0}
         return dict(row)
     return {
         'account': account, 'chat': chat, 'teasing_delta': 0, 'banter_delta': 0,
@@ -287,8 +293,8 @@ def get_group_mask(store, account, chat):
     }
 
 
-def evolve_group_mask(store, settings, account, chat, mask_data):
-    if not getattr(settings, 'evolution_group_mask_auto_accept', True) or not isinstance(mask_data, dict):
+def evolve_group_mask(store, settings, account, chat, mask_data, *, source_keys=()):
+    if not settings.memory_enabled or not settings.memory_consolidation_enabled or not getattr(settings, 'evolution_group_mask_auto_accept', True) or not isinstance(mask_data, dict):
         return None
     ensure_persona_tables(store)
     old = get_group_mask(store, account, chat)
@@ -310,6 +316,9 @@ def evolve_group_mask(store, settings, account, chat, mask_data):
             teasing_delta=excluded.teasing_delta,banter_delta=excluded.banter_delta,
             guard_level=excluded.guard_level,vibe_summary=excluded.vibe_summary,updated=excluded.updated''',
             (account, chat, t_delta, b_delta, guard, vibe, old['locked'], now))
+        if getattr(store,'memory_hub',None):
+            store.memory_hub.sync_mask({'account':account,'chat':chat,'teasing_delta':t_delta,'banter_delta':b_delta,
+                'guard_level':guard,'vibe_summary':vibe,'locked':old['locked'],'updated':now},source_keys=source_keys)
         store.db.commit()
     return get_group_mask(store, account, chat)
 
@@ -375,6 +384,10 @@ def admin_persona_state_action(store, settings, account, allowed, data, *, tieba
             store.db.commit()
     else:
         raise ValueError('不支持的状态操作')
+    if op in ('reset_group_mask','save_group_mask') and getattr(store,'memory_hub',None):
+        with store.lock,store.db:
+            row=dict(store.db.execute('SELECT * FROM persona_group_masks WHERE account=? AND chat=?',(account,chat)).fetchone())
+            store.memory_hub.sync_mask(row,actor='admin')
     return {
         'chat': chat,
         'mood': current_mood_state(store, settings, account, chat, now=now),
@@ -486,17 +499,48 @@ def sticker_static_prompt(settings):
         '不能因为严肃场景强行找表情，不用随机或情绪相反的候选；群聊仍不选亲吻、情侣示爱或性暗示。'
         '若已有sticker动作则不另加；打算给搭配候选时文字动作最多 '+str(max(0,capacity-1))+' 个，为一个表情保留名额。'
         if settings.sticker_after_text!='off' and capacity>=2 and settings.sticker_pair_probability>0 else '')
-    return ('\n每轮最多一个原生表情，actions可按文字→表情→补一句排列；表情单独占一个动作，不写成文字描述，ID只能来自目录。明确要表情时优先合适表情。'
+    return ('\n原生表情包是聊天里的非语言表达，优先把它当作情绪、语气或态度来理解和回应，不要把它当成需要介绍的图片。'
+        '普通聊天中不要描述人物外观、动作、画面或图中文字，不要解释“这个表情表示什么”，也不要用“你发的这个表情……”起头；直接接当前话题，像真人用表情回应一样。'
+        '只有对方明确问这张表情是什么、图上写了什么或画面内容时，才使用可用的画面资料作答；资料不全就说明看不清，不猜。'
+        '每轮最多一个原生表情，actions可按文字→表情→补一句排列；表情单独占一个动作，不写成文字描述，ID只能来自目录。明确要表情时优先合适表情。'
         '按情绪、画面和对方语气选，不贴切就不硬发；开心微笑不能代替安慰，尴尬不是害羞，反讽不是赞同，严肃求助先给有用回答，不塞卖萌表情。'
         '\n原生表情积极性：'+preference+'\n文字后配表情：'+pairing+
         '这只调节搭配意愿，不增加消息条数上限，不绕过重复冷却、发送额度或群聊表达边界。'+suggestion)
 
 
-def sticker_dynamic_prompt(choices, details):
+def asks_sticker_content(text):
+    return bool(re.search(
+        r'(?:这|这个|那|这张).{0,8}(?:是什么|是啥|什么表情|啥表情)|'
+        r'(?:表情包|原生表情).{0,8}(?:是什么|是啥|怎么理解|啥含义|什么意思|啥意思)|'
+        r'(?:这个|这|刚发的|上面那个|那张).{0,8}(?:原生)?表情(?:包)?.{0,8}'
+        r'(?:什么|啥|意思|含义|表达|表示|画面|内容|图上|写了|谁|角色|人物|看一下|看下|描述)|'
+        r'(?:表情包|原生表情).{0,8}(?:什么意思|啥意思|什么含义|表示什么|表达什么|画面|内容|图上|写了什么|是谁|什么样)|'
+        r'(?:识别|描述|看一下|看下).{0,6}(?:这个|这张|刚发的)?.{0,4}(?:表情包|原生表情)',
+        str(text or ''), re.I,
+    ))
+
+
+def sticker_dynamic_prompt(choices, details, *, include_visual=False):
     if not choices:
         return ''
-    return ('\n可调用的微信原生收藏表情（ID:含义）：'+json.dumps(choices,ensure_ascii=False)+
-        '\n相关表情的详细语义档案：'+json.dumps(details,ensure_ascii=False))
+    catalog={}
+    for md5,meaning in choices.items():
+        profile=details.get(md5,{}) if isinstance(details,dict) else {}
+        if not isinstance(profile,dict):
+            profile={}
+        signal=sticker_emotional_signal(profile,meaning)
+        value={'表达倾向':signal or '情绪标签尚未整理，按当前聊天语境谨慎理解'}
+        if profile.get('use_when'):value['适合场景']=str(profile['use_when'])[:160]
+        if profile.get('avoid_when'):value['避免误用']=str(profile['avoid_when'])[:160]
+        if include_visual:
+            for key,label in (('visual','画面'),('text','图中文字')):
+                if profile.get(key):value[label]=str(profile[key])[:160]
+            if not profile and meaning:value['已有标签']=str(meaning)[:160]
+        catalog[md5]=value
+    mode=('这是用户明确询问的表情内容，可参考画面资料回答。'
+          if include_visual else '这些标签只用于选择合适的非语言情绪反应，不要把标签改写成回复内容。')
+    return ('\n可调用的微信原生收藏表情ID与语气目录：'+mode+
+        '\n'+json.dumps(catalog,ensure_ascii=False))
 
 
 def sticker_prompt(settings, choices, details):

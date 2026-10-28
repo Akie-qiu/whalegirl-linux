@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class MomentsReferenceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        (ROOT/'test-runs').mkdir(exist_ok=True)
         self.path = Path(tempfile.mkdtemp(prefix='moments-ref-', dir=ROOT/'test-runs'))
         self.config = Config(self.path)
         self.config.save(Settings(
@@ -96,21 +97,9 @@ class MomentsReferenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(plan['inputs']), 2, 'Should include 2 girl references')
         self.assertTrue(all(v['source'] == 'character' for v in plan['inputs']))
 
-    def test_moments_generation_without_references_skips_character(self):
-        """Moments generation should not enable character when no references are configured."""
-        # No references added
-        identity = self.service.enqueue(
-            kind='generate',
-            prompt='一张风景图',
-            destination='moments',
-            moment_id='test-moment'
-        )
-
-        job = self.service.get(identity)
-        plan = json.loads(job['reference_json'])
-
-        self.assertFalse(plan.get('character', False), 'Should not enable character without references')
-        self.assertEqual(plan.get('inputs', []), [])
+    def test_moments_generation_requires_character_references(self):
+        with self.assertRaisesRegex(ValueError,'角色参考图'):
+            self.service.enqueue(kind='generate',prompt='一张风景图',destination='moments',moment_id='test-moment')
 
     def test_chat_generation_does_not_auto_attach_character(self):
         """Chat generation should not auto-attach character references (requires explicit request)."""
@@ -127,6 +116,20 @@ class MomentsReferenceTests(unittest.IsolatedAsyncioTestCase):
         plan = json.loads(job['reference_json'])
 
         self.assertFalse(plan.get('character', False), 'Chat should not auto-enable character')
+
+    def test_chat_character_generation_uses_default_variant_and_keeps_one_job(self):
+        self.service.references.add(self.make_image(), 'girl', '少女图', '角色参考')
+        request = dict(kind='generate', prompt='画一张你自己的少女版',
+                       destination='chat', chat='allowed', character=True,
+                       source_key='account/allowed/1')
+        identity = self.service.enqueue(**request)
+        plan = json.loads(self.service.get(identity)['reference_json'])
+        self.assertTrue(plan['character'])
+        self.assertEqual(plan['variant'], 'girl')
+        self.assertEqual(len(plan['inputs']), 1)
+        self.assertEqual(plan['inputs'][0]['source'], 'character')
+        self.assertEqual(self.service.enqueue(**request), identity)
+        self.assertEqual(self.service.generation_count(), 1)
 
     def test_variant_detection_in_moments_enqueue(self):
         """Moments enqueue should detect variant from prompt and use the right references."""
@@ -187,17 +190,8 @@ class MomentsReferenceTests(unittest.IsolatedAsyncioTestCase):
         self.service.references.add(self.make_image(), 'girl', '少女图', '参考')
         self.config.save(self.config.settings.model_copy(update={'image_references_enabled': False}))
 
-        identity = self.service.enqueue(
-            kind='generate',
-            prompt='窗边看雨',
-            destination='moments',
-            moment_id='test'
-        )
-
-        job = self.service.get(identity)
-        plan = json.loads(job['reference_json'])
-
-        self.assertFalse(plan.get('character', False), 'Should not enable when references are disabled')
+        with self.assertRaisesRegex(ValueError,'角色参考图'):
+            self.service.enqueue(kind='generate',prompt='窗边看雨',destination='moments',moment_id='test')
 
 
 if __name__ == '__main__':

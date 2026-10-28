@@ -231,6 +231,13 @@ class ReferenceLibrary:
     async def materialize(self, plan, store, gateway, account, chat):
         import base64
         references = list(plan.get('inputs', []))
+        for item in references:
+            if item.get('source')=='character_generated':
+                asset=store.db.execute("""SELECT id FROM picture_assets WHERE id=? AND account=?
+                    AND source='generated' AND scope='global' AND character_id='whalegirl'
+                    AND character_variant=? AND enabled=1 AND deleted_at=0""",
+                    (item.get('asset_id'),account,plan.get('variant'))).fetchone()
+                if not asset:raise ValueError('此前生成的角色参考图已不可用，未发起生图请求')
         for source in plan.get('sources', []):
             row = source
             if source.get('unresolved'):
@@ -277,7 +284,10 @@ class ReferenceLibrary:
                              '角色外观图仅在要求画大肥鱼时约束角色；不要拿角色设定图当被编辑的底图。')
             else:
                 lines.append('【处理方式】以参考图提供的特征、动作或构图重新创作，不要求逐像素复制。')
-            if plan.get('character') and any(v['source'] != 'character' for v in references):
+            if any(v['source']=='character_generated' for v in references):
+                lines.append('此前生成的本人图用于延续脸型、发型与画风，原始角色参考图确定身份。'
+                             '本次要创作新的动作、服装、背景和构图，不能照搬此前朋友圈的画面。')
+            if plan.get('character') and any(v['source'] not in ('character','character_generated') for v in references):
                 lines.append('角色图确定大肥鱼的身份与基础外观；聊天图片按用户明确要求提供动作、服装、场景或构图。'
                              '若用户明确指定覆盖某个外观细节，以本次要求为准。')
         if plan.get('context'):
@@ -288,7 +298,12 @@ class ReferenceLibrary:
         """Actual PNG bytes, never a text-only substitute for a visual reference."""
         parts = []
         for index, item in enumerate(references):
-            path = self.path(item['id'])
+            if item.get('source')=='character_generated':
+                if not re.fullmatch(r'[0-9a-f]{64}',str(item.get('asset_id',''))):
+                    raise ValueError('生成角色参考图身份无效')
+                path=self.config.directory/'pictures'/'generated'/(item['asset_id']+'.png')
+            else:
+                path = self.path(item['id'])
             if not path.is_file():
                 raise ValueError('参考图文件不可用，未发起付费请求')
             parts.append(('image[]', (f'reference-{index + 1}.png', path.read_bytes(), 'image/png')))

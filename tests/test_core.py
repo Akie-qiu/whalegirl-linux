@@ -159,20 +159,25 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.stats().get("failed"), 1)
 
     async def test_worker_send_exception_becomes_uncertain(self):
+        self.config.settings.debounce_single_seconds=0
+        self.config.settings.debounce_burst_seconds=0
+        self.config.settings.debounce_max_seconds=0
         await self.runtime.poll_once()
         self.gateway.rows = [raw()]
         await self.runtime.poll_once()
 
+        reached_send=asyncio.Event()
         async def broken_send(*args):
+            reached_send.set()
             raise RuntimeError("模拟发送期间连接断开")
 
         self.gateway.send = broken_send
         worker = asyncio.create_task(self.runtime._worker_loop())
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(reached_send.wait(),2)
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
         self.assertEqual(self.store.stats().get("uncertain"), 1)
-        self.assertTrue(self.runtime.paused_reason)
+        self.assertFalse(self.runtime.paused_reason)
 
     async def test_402_pauses_without_sending(self):
         await self.runtime.poll_once()
@@ -194,7 +199,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         await self.runtime.process_next()
         self.assertEqual(len(self.gateway.sent), 1)
         self.assertEqual(self.store.stats().get("uncertain"), 1)
-        self.assertTrue(self.runtime.paused_reason)
+        self.assertFalse(self.runtime.paused_reason)
 
     async def test_burst_messages_merged(self):
         await self.runtime.poll_once()

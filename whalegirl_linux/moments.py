@@ -360,7 +360,7 @@ class MomentsService:
                 plan.get('per_day') != per_day or
                 plan.get('start_hour') != int(s.moments_start_hour) or
                 plan.get('end_hour') != int(s.moments_end_hour) or
-                not isinstance(plan.get('slots'), list) or len(plan['slots']) != per_day):
+                not isinstance(plan.get('slots'), list) or not per_day <= len(plan['slots']) <= per_day*2):
             plan = self._build_publish_plan(s, now)
             saved['publish_plan'] = plan
 
@@ -399,13 +399,60 @@ class MomentsService:
             for r in rows:
                 src = r['source'] or ''
                 is_slot_src = (src == prefix or src.startswith(prefix + '/'))
-                if r['state'] in occupied_states and (is_slot_src or slot['start'] <= r['created'] < slot['end']):
+                named_slot=bool(re.fullmatch(re.escape(day)+r'/\d+(?:/r\d+)?',src))
+                if r['state'] in occupied_states and (is_slot_src or not named_slot and slot['start'] <= r['created'] < slot['end']):
                     slot['done'] = True
                     break
                 if is_slot_src and r['state'] == 'skipped' and '无需发言' in (r['error'] or ''):
                     slot['done'] = True
                     break
+        self._recover_failed_publish_slots(s,plan,rows,now,last_active_ts)
         return plan, last_active_ts
+
+    def _recover_failed_publish_slots(self,s,plan,rows,now,last_active_ts):
+        """Give a definite technical failure one later slot, never replay an unknown send."""
+        if s.moments_mode!='auto' or not s.moments_publish_enabled:
+            return
+        occupied={'sent','sending','uncertain','draft','generating','awaiting_image','image_failed'}
+        pending=sum(not slot.get('done') for slot in plan['slots'])
+        available=s.moments_publish_per_day-sum(r['state'] in occupied for r in rows)-pending
+        if available<=0:return
+        recovered={slot.get('recovery_for') for slot in plan['slots'] if 'recovery_for' in slot}
+        originals=[slot for slot in plan['slots'] if 'recovery_for' not in slot]
+        dt=datetime.fromtimestamp(now,TZ)
+        day_start=dt.replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
+        active_seconds=sum(end-start for start,end in self._active_intervals(s))
+        gap=min(3600.0,active_seconds/max(1,s.moments_publish_per_day)*.35) if s.moments_publish_per_day>1 else 0.0
+        busy=[float(slot['target']) for slot in plan['slots'] if not slot.get('done')]
+        for original in originals:
+            if available<=0:break
+            if not original.get('done') or original['index'] in recovered:continue
+            prefix=f"{plan['day']}/{original['index']}"
+            own=[r for r in rows if r['source']==prefix or (r['source'] or '').startswith(prefix+'/')]
+            if not own or any(r['state'] in occupied or r['state']=='skipped' for r in own):continue
+            failed=max(own,key=lambda r:r['updated'])
+            if failed['state']!='failed':continue
+            earliest=max(now+300,failed['updated']+max(300,s.moments_poll_minutes*60),last_active_ts+gap if last_active_ts else 0)
+            target=end=None
+            for start_offset,end_offset in self._active_intervals(s):
+                candidate=max(earliest,day_start+start_offset)
+                for reserved in sorted(busy):
+                    if abs(candidate-reserved)<gap:candidate=reserved+gap
+                if candidate<day_start+end_offset-60:
+                    target,end=candidate,day_start+end_offset;break
+            if target is None:continue
+            index=max(slot['index'] for slot in plan['slots'])+1
+            plan['slots'].append({'index':index,'start':round(target,1),'end':round(end,1),
+                'target':round(target,1),'attempts':0,'done':False,
+                'recovery_for':original['index'],'min_gap':gap})
+            busy.append(target);available-=1
+
+    @staticmethod
+    def _publish_slot_expiry(slots,slot):
+        if 'recovery_for' in slot:return slot['end']
+        next_start=min((other['start'] for other in slots if 'recovery_for' not in other
+                        and other['start']>slot['start']),default=slot['end']+900)
+        return min(next_start,max(slot['end'],slot['target']+900))
 
     def due_publish_slot(self, s, saved, now=None):
         now = time.time() if now is None else now
@@ -415,23 +462,23 @@ class MomentsService:
             return None
         plan, last_active_ts = self.ensure_publish_plan(s, saved, now)
         slots = plan.get('slots', [])
-        for i, slot in enumerate(slots):
+        due=[]
+        for slot in slots:
             if slot.get('done'):
                 continue
-            next_start = slots[i + 1]['start'] if i + 1 < len(slots) else slot['end'] + 900.0
-            expiry = min(next_start, max(slot['end'], slot['target'] + 900.0))
+            expiry = self._publish_slot_expiry(slots,slot)
             if now >= expiry:
                 slot['done'] = True
                 continue
             seg_len = max(1.0, slot['end'] - slot['start'])
-            min_gap = min(3600.0, seg_len * 0.35) if s.moments_publish_per_day > 1 else 0.0
+            min_gap = slot.get('min_gap',min(3600.0, seg_len * 0.35) if s.moments_publish_per_day > 1 else 0.0)
             effective_target = max(slot['target'], last_active_ts + min_gap if last_active_ts > 0 else 0.0)
             if effective_target >= expiry:
                 slot['done'] = True
                 continue
             if now >= effective_target:
-                return slot
-        return None
+                due.append((effective_target,slot['index'],slot))
+        return min(due,key=lambda value:value[:2])[2] if due else None
 
     def next_publish_time(self, s, saved, now=None):
         now = time.time() if now is None else now
@@ -445,19 +492,19 @@ class MomentsService:
         if s.account_id and before != after:
             self.book.save_state(s.account_id, saved)
         slots = plan.get('slots', [])
-        for i, slot in enumerate(slots):
+        candidates=[]
+        for slot in slots:
             if slot.get('done'):
                 continue
-            next_start = slots[i + 1]['start'] if i + 1 < len(slots) else slot['end'] + 900.0
-            expiry = min(next_start, max(slot['end'], slot['target'] + 900.0))
+            expiry = self._publish_slot_expiry(slots,slot)
             if now >= expiry:
                 continue
             seg_len = max(1.0, slot['end'] - slot['start'])
-            min_gap = min(3600.0, seg_len * 0.35) if s.moments_publish_per_day > 1 else 0.0
+            min_gap = slot.get('min_gap',min(3600.0, seg_len * 0.35) if s.moments_publish_per_day > 1 else 0.0)
             effective_target = max(slot['target'], last_active_ts + min_gap if last_active_ts > 0 else 0.0)
             if effective_target < expiry:
-                return round(max(now, effective_target), 1)
-        return None
+                candidates.append(round(max(now, effective_target), 1))
+        return min(candidates) if candidates else None
 
     async def run_publish_slot(self, s, saved, slot, now=None):
         now = time.time() if now is None else now
@@ -655,9 +702,11 @@ class MomentsService:
                     reasoning_effort=s.reasoning_effort, stream_enabled=s.model_stream_enabled,
                     model=s.model, max_tokens=1000 if kind == 'publish' else 320,
                     temperature=.85 if kind == 'publish' else .7, timeout=45, max_retries=2)
+                engine.usage_callback = lambda event: self.runtime.token_ledger.record(s.account_id, event)
                 try:
                     answer = await engine.chat([{'role': 'user', 'content': json.dumps(data, ensure_ascii=False)}],
-                        system_prompt=style + '\n' + public_rules, response_format={'type': 'json_object'})
+                        system_prompt=style + '\n' + public_rules, response_format={'type': 'json_object'},
+                        operation='moments')
                 finally:
                     await engine.close()
                 if not answer or not answer.strip():
@@ -698,7 +747,7 @@ class MomentsService:
                     self.book.change(identity, 'draft', text=text)
                     if wants_generation:
                         try:
-                            variant = value.get('character_variant') if value.get('character_variant') in ('chibi', 'girl', 'mature') else ''
+                            variant = s.image_character_variant
                             enqueue_args = {'kind': 'generate', 'prompt': image_prompt,
                                 'destination': 'moments', 'moment_id': identity, 'source_key': 'moments:' + identity}
                             if variant:

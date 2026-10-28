@@ -133,6 +133,44 @@ class StreamedChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await engine.chat([]), '{"ok":true}')
         self.assertEqual(len(self.requests), 1)
 
+class ToolCallTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_completions_returns_tool_call_and_usage(self):
+        events=[]
+        body={
+            "choices":[{
+                "message":{
+                    "role":"assistant","content":None,"reasoning_content":"internal only",
+                    "tool_calls":[{
+                        "id":"call_wait_1","type":"function",
+                        "function":{"name":"wait_for_next_message","arguments":"{}"},
+                    }],
+                },
+                "finish_reason":"tool_calls",
+            }],
+            "usage":{"prompt_tokens":20,"completion_tokens":3,"total_tokens":23},
+        }
+        engine=AIEngine("https://example.test/chat/completions","test",model="deepseek-flash",api_style="openai")
+        requests=[]
+        engine._clients[id(asyncio.get_running_loop())]=httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request:(requests.append(request) or httpx.Response(200,json=body))
+            )
+        )
+        engine.usage_callback=events.append
+        result=await engine.chat_with_tools([{"role":"user","content":"我先说一下"}],[{
+            "type":"function","function":{"name":"wait_for_next_message","parameters":{"type":"object","properties":{}}}
+        }],system_prompt="只输出 JSON")
+        payload=json.loads(requests[0].content)
+        self.assertEqual(payload["tool_choice"],"auto")
+        self.assertEqual(payload["tools"][0]["function"]["name"],"wait_for_next_message")
+        self.assertFalse(payload.get("stream",False))
+        self.assertEqual(result["tool_calls"][0]["id"],"call_wait_1")
+        self.assertEqual(result["assistant_message"]["reasoning_content"],"internal only")
+        self.assertEqual(result["content"],"")
+        self.assertEqual(events[0]["output_tokens"],3)
+        self.assertEqual(events[0]["status"],"success")
+        await engine.close()
+
 
 if __name__ == "__main__":
     unittest.main()

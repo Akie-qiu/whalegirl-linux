@@ -248,7 +248,7 @@ class ProactiveService:
         key = 'proactive:'+identity
         self.execute('INSERT INTO proactive_runs(id,account,chat,state,created,updated) VALUES(?,?,?,?,?,?)',
                      (identity, s.account_id, chat, 'planning', now, now))
-        recent = self.store.conversation(s.account_id, chat, min(s.context_messages, 24))
+        recent = self.store.conversation(s.account_id, chat, s.context_messages)
         muted = self.muted_people(chat, now)
         humans = [row for row in recent if row['is_self'] == 0 and row['sender_id'] not in muted]
         if not humans:
@@ -265,7 +265,10 @@ class ProactiveService:
             query = '\n'.join(row['content'][:350] for row in humans[-6:])
             recall = {}
             memory_static, memory_dynamic, _ = memory_parts(r.memory_book, s, first, humans[-6:], r.affection, recall)
-            unused, image_context = r.images.tools.context(first, [first], query=query)
+            base_image_catalog = r.images.tools.base_candidates(first)
+            unused, image_context = r.images.tools.context(
+                first, [first], query=query, base_candidates=base_image_catalog)
+            base_image_ids = {item['id'] for item in base_image_catalog}
             used = set(self.store.used_stickers(s.account_id, chat, s.sticker_cooldown_seconds)) | r.sticker_library.excluded(s.account_id, chat)
             choices = r.stickers.candidates(query, s.sticker_candidate_limit, used) if s.stickers_enabled else {}
             mentions_enabled = s.proactive_mentions_enabled and s.group_mentions_enabled and chat.endswith('@chatroom')
@@ -279,11 +282,11 @@ class ProactiveService:
                     pass
             source_ids = {m['key'] for m in recent} | {'memory:'+str(i) for i in recall.get('ids', [])+recall.get('joke_ids', [])}
             tieba_evidence = {}
-            tieba_prompt = r.tieba.prompt(query, tieba_evidence, chat=chat)
             system = ((s.system_prompt_override.strip() or r.styles.get_active().system_prompt)
                 + habit_static_prompt(s) + warmth_prompt(s) + memory_static
                 + r.affection.static_prompt(first, s) + r.affection.dynamic_prompt(first, humans[-6:], s)
-                + r.images.tools.static_prompt(first) + sticker_static_prompt(s)
+                + r.images.tools.static_prompt(first, include_catalog=False)
+                + r.images.tools.catalog_prompt(base_image_catalog) + sticker_static_prompt(s)
                 + r.tieba.tools.static_prompt()
                 + mention_prompt(mentions, mentions_enabled)
                 + '\n【主动聊天】你现在有一次自主发起聊天的机会，并没有人刚向你提问。'
@@ -306,7 +309,7 @@ class ProactiveService:
                     'recent_messages': [{**{k: v.get(k) for k in ('key', 'sender_id', 'sender', 'is_self', 'timestamp')},
                                          'content': v['content'][:600], 'description': v.get('description', '')[:240]}
                                         for v in recent]}
-            dynamic = (memory_dynamic + tieba_prompt + r.images.tools.dynamic_prompt(image_context)
+            dynamic = (memory_dynamic + r.images.tools.dynamic_prompt(image_context, base_image_ids)
                        + sticker_dynamic_prompt(choices, r.stickers.details(choices)))
             # Separate bounded request: a slow opener cannot occupy the regular reply worker.
             engine = r.engine_factory(api_url=s.api_url, api_key=self.config.api_key(), model=s.model,
@@ -316,7 +319,8 @@ class ProactiveService:
             engine.usage_callback = lambda event: r.token_ledger.record(s.account_id, event)
             tool_messages = [{'role':'user', 'content':json.dumps(data, ensure_ascii=False)+dynamic}]
             raw = await asyncio.wait_for(engine.chat(tool_messages,
-                system_prompt=system, max_tokens=s.max_tokens+400, response_format={'type':'json_object'}), timeout=15)
+                system_prompt=system, max_tokens=s.max_tokens+400, response_format={'type':'json_object'},
+                operation='proactive'), timeout=15)
             if not raw or not raw.strip():
                 raise ValueError(getattr(engine, 'last_error', '') or '模型未返回内容')
             decision = parse_json(raw or '')
@@ -381,7 +385,8 @@ class ProactiveService:
                         for action in self.store.actions(key):
                             if action['state'] == 'sending':
                                 self.store.action_finish(action['id'], 'uncertain', error='主动发送中断，需核对')
-                        r.paused_reason = '主动发送结果不确定，请人工核对'
+                        r.safety.record(first['account'],'send_receipt_pending',
+                            '主动发送结果已留档待核实，后续聊天继续，不自动重发',chat=first['chat'],level='info')
                     self.finish(identity, terminal, error='主动任务中断')
                     raise
                 finally:

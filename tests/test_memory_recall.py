@@ -51,9 +51,11 @@ class MemoryRecallTests(unittest.TestCase):
         rows = self.book.recall('account',self.allowed,'alice','你好',chat='a@chatroom',limit=8)
         self.assertEqual(rows[0]['id'],fact['id'])
 
-    def test_current_chat_admin_fact_is_available_without_keyword_hit(self):
-        fact=self.remember('测试中的管理员修正',person='legacy-label')
-        rows=self.book.recall('account',self.allowed,'alice','你好',chat='a@chatroom')
+    def test_chat_scoped_admin_fact_requires_a_relevant_current_topic(self):
+        fact=self.remember('测试中的管理员修正：服务器回复要先检查磁盘空间',person='legacy-label')
+        rows=self.book.recall('account',self.allowed,'alice','贴吧梗是什么意思',chat='a@chatroom')
+        self.assertNotIn(fact['id'],[r['id'] for r in rows])
+        rows=self.book.recall('account',self.allowed,'alice','服务器磁盘空间怎么检查',chat='a@chatroom')
         self.assertEqual([r['id'] for r in rows],[fact['id']])
 
     def test_mentioned_person_preference_is_not_lost_to_main_speakers_events(self):

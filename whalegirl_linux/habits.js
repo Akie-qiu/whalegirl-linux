@@ -30,12 +30,13 @@
     nav.insertBefore(a, nav.querySelector('[href="#stability-panel"]'));
   }
   let editing = null, loaded = [], lastFetch = 0;
-  const numeric = ['debounce_single_seconds','debounce_burst_seconds','debounce_max_seconds','reply_max_parts',
+  const numeric = ['debounce_single_seconds','debounce_burst_seconds','debounce_max_seconds','followup_wait_seconds','reply_max_parts',
     'reply_part_interval','quiet_start_hour','quiet_end_hour','text_per_hour','text_per_day','sticker_per_hour','sticker_per_day'];
   const field = name => $(name.replaceAll('_','-'));
   function populate() {
     for (const name of numeric) field(name).value = cfg[name];
     $('chat-habits-enabled').checked = cfg.chat_habits_enabled;
+    $('followup-wait-enabled').checked = cfg.followup_wait_enabled ?? true;
     $('editable-memory-enabled').checked = cfg.editable_memory_enabled;
     $('web-search-enabled').checked = cfg.web_search_enabled;
     $('web-search-result-count').value = cfg.web_search_result_count ?? 5;
@@ -150,7 +151,9 @@
     window.improvements?.stateUpdated(s);
   }
   $('save-habits').onclick = () => action($('save-habits'),async () => {
-    const values={chat_habits_enabled:$('chat-habits-enabled').checked,participation:$('participation').value,
+    const values={chat_habits_enabled:$('chat-habits-enabled').checked,
+      followup_wait_enabled:$('followup-wait-enabled').checked,
+      participation:$('participation').value,
       interest_keywords:$('interest-keywords').value.split('\n').map(x=>x.trim()).filter(Boolean),repeat_probability:Number($('repeat-probability').value)/100};
     for (const name of numeric.filter(n=>!n.includes('_per_'))) values[name]=Number(field(name).value);
     await saveSubset(values);notice('聊天习惯已保存，下一轮生效。');

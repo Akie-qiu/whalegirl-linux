@@ -153,11 +153,13 @@ class SafetyGuard:
                 return
             if not receipt.definite_failure or not settings.safety_enabled:
                 return
-            state['consecutive_failures']=state.get('consecutive_failures',0)+1
+            attempts=max(1,min(2,int(getattr(receipt,'attempts',1) or 1)))
+            state['consecutive_failures']=state.get('consecutive_failures',0)+attempts
             self._save(account,state)
-            self.record(account,'send_failed','发送在提交前失败，未自动重试')
-            if state['consecutive_failures'] >= 3:
-                self.hold(account,'failure_circuit','连续3次发送失败，已停止发送，请核对微信和服务状态后人工恢复')
+            self.record(account,'send_failed',
+                        f'发送在提交前失败；本次明确失败尝试 {attempts} 次')
+            if state['consecutive_failures'] >= 2:
+                self.hold(account,'failure_circuit','连续2次明确发送失败，已暂停回复，请核对微信和服务状态后恢复')
 
     def login_request(self, account, settings):
         if not settings.safety_enabled:

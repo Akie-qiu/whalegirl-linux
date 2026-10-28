@@ -148,7 +148,7 @@ class HumanLikeEvolutionTests(unittest.IsolatedAsyncioTestCase):
             'vibe_tags': ['嘴硬心软', '夜猫子'],
             'interaction_rule': '熟人互损模式，不用客套',
             'notable_events': '一起在群里抢过深夜烧烤券',
-        }, s)
+        }, s, source_key='account/a@chatroom/1')
         self.assertEqual(updated['nickname'], '夜宵搭子阿泽')
         self.assertIn('嘴硬心软', updated['vibe_tags'])
 
@@ -162,11 +162,13 @@ class HumanLikeEvolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current['nickname'], '夜宵搭子阿泽')
         self.assertEqual(current['interaction_rule'], '熟人互损模式，不用客套')
 
-        # Dynamic prompt contains the relationship profile card
+        # Versioned text enters through the unified budget, not the old profile prompt.
         m2 = make_msg(2, sender='u1', sender_name='阿泽', content='哈哈')
         self.store.observe([m2])
         prompt = aff.dynamic_prompt(m2, [m2], s)
-        self.assertIn('千人千面印象卡', prompt)
+        self.assertNotIn('夜宵搭子阿泽', prompt)
+        from whalegirl_linux.memory import memory_prompt
+        prompt,_ = memory_prompt(self.runtime.memory_book,s,m2,[m2],aff)
         self.assertIn('夜宵搭子阿泽', prompt)
 
     async def test_slang_co_creation_bot_alias_wakeup_and_anti_poisoning(self):

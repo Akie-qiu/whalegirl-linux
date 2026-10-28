@@ -7,9 +7,10 @@ import unittest
 
 from fastapi.testclient import TestClient
 from whalegirl_linux.app import create_app
-from whalegirl_linux.conversation import habit_prompt, sticker_prompt, warmth_prompt, pair_sticker, plan_actions
+from whalegirl_linux.conversation import asks_sticker_content, habit_prompt, sticker_dynamic_prompt, sticker_prompt, warmth_prompt, pair_sticker, plan_actions
 from whalegirl_linux.runtime import Runtime
 from whalegirl_linux.settings import Config, Settings
+from whalegirl_linux.stickers import StickerCatalog
 from whalegirl_linux.store import Store
 from test_chat_habits import Gateway, Engine
 
@@ -34,12 +35,43 @@ class ReplyExpressionTests(unittest.TestCase):
         self.assertIn('只能选择文字或表情',sticker_prompt(settings.model_copy(update={'reply_max_parts':1}),choices,{}))
         self.assertIn('平和简洁',warmth_prompt(settings.model_copy(update={'reply_warmth':'low'})))
 
+    def test_sticker_context_uses_emotional_intent_and_hides_visuals_by_default(self):
+        choices={'a'*32:'蓝发小人捂脸，害羞、被夸后脸红'}
+        details={'a'*32:{'visual':'蓝发小人捂脸','text':'嘿嘿','emotion':'害羞、开心',
+                         'tone':'撒娇式回应','use_when':'被夸或轻松打趣',
+                         'avoid_when':'严肃安慰时不要用'}}
+        prompt=sticker_dynamic_prompt(choices,details)
+        self.assertIn('害羞、开心',prompt)
+        self.assertIn('撒娇式回应',prompt)
+        self.assertNotIn('蓝发小人',prompt)
+        self.assertNotIn('嘿嘿',prompt)
+        self.assertIn('不要把标签改写成回复内容',prompt)
+        visual=sticker_dynamic_prompt(choices,details,include_visual=True)
+        self.assertIn('蓝发小人捂脸',visual)
+        self.assertIn('嘿嘿',visual)
+        self.assertTrue(asks_sticker_content('这个表情包是什么意思'))
+        self.assertTrue(asks_sticker_content('这是什么表情'))
+        self.assertFalse(asks_sticker_content('哈哈这个梗笑死'))
+
+    def test_received_sticker_becomes_a_social_signal_not_a_caption(self):
+        directory=folder('sticker-signal-')
+        catalog=StickerCatalog(directory)
+        md5='b'*32
+        catalog.entries={md5:'白发小人头顶乱线，烦恼、无语、头疼、抓狂'}
+        catalog.profiles={md5:{'visual':'白发小人头顶乱线','emotion':'无语、烦躁',
+                              'tone':'轻度吐槽','text':'算了'}}
+        signal=catalog.chat_signal(md5)
+        self.assertIn('无语、烦躁',signal)
+        self.assertIn('轻度吐槽',signal)
+        self.assertNotIn('白发小人',signal)
+        self.assertNotIn('算了',signal)
+
     def test_console_save_roundtrips_without_resetting_conversation_settings(self):
         directory=folder('expression-api-')
         app=create_app(directory,gateway=Gateway(),engine_factory=Engine,run_background=False)
         c=app.state.config
         c.save(Settings(account_id='account',allowed_chat_ids=['group@chatroom'],
-            trigger_only_chat_ids=['group@chatroom'],context_messages=40,sticker_aggressiveness='high'))
+            trigger_only_chat_ids=['group@chatroom'],context_messages=20,sticker_aggressiveness='high'))
         with TestClient(app) as client:
             h={'Authorization':'Bearer '+c.admin_token}
             body={'reply_warmth':'normal','sticker_after_text':'off','sticker_cooldown_seconds':90,'sticker_pair_probability':35}
@@ -47,7 +79,7 @@ class ReplyExpressionTests(unittest.TestCase):
             self.assertEqual(response.status_code,200,response.text)
             saved=client.get('/api/config',headers=h).json()
             self.assertEqual({k:saved[k] for k in body},body)
-            self.assertEqual((saved['context_messages'],saved['sticker_aggressiveness']),(40,'high'))
+            self.assertEqual((saved['context_messages'],saved['sticker_aggressiveness']),(20,'high'))
             self.assertEqual(saved['trigger_only_chat_ids'],['group@chatroom'])
             persisted=Config(directory).settings
             self.assertEqual((persisted.reply_warmth,persisted.sticker_after_text),('normal','off'))

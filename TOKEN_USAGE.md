@@ -16,6 +16,7 @@ Sources inspected on 2026-10-22. Provider usage fields are read from actual API 
 - DeepSeek cache hits/misses and OpenAI-compatible cached input are normalized. Anthropic input adds its separately reported cache read/creation amounts exactly once.
 - Unreported usage/cache-write/reasoning stays NULL and displays as unavailable. Failed requests without a usage receipt are not assumed free. Cache hit rate is token-weighted and uses only input requests whose cache-read fields were reported.
 - Model calls across chat, vision, memory and Moments are captured by the shared engine. Search/fetch HTTP calls are counted separately, with tokens included only if the endpoint reports them. Streaming totals are recorded once from the final usage data, including an empty-choices usage chunk.
+- Model usage is grouped by operation (`chat`, `tool_followup`, `image`, `tieba`, `moments`, `proactive`, and related operations) so input, cache hits, output, and reported cache hit rate can be compared by feature.
 - Today / last 7 days / last 30 days / all-time views use Beijing calendar days. Model and daily breakdowns are available. Switching models or restarting does not erase the ledger.
 - Accounting starts with this deployment. Earlier cache usage cannot be reconstructed reliably. No prices or monetary savings are invented.
 - Authenticated endpoint: `GET /api/token-usage?period=today|7d|30d|all`. No reset or delete operation is exposed.

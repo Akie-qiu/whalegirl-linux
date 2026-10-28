@@ -10,9 +10,10 @@ import unittest
 from PIL import Image
 from whalegirl_linux.store import Store
 from whalegirl_linux.memory import MemoryBook
-from whalegirl_linux.settings import Settings
+from whalegirl_linux.settings import Config, Settings
 from whalegirl_linux.context import build_context
 from whalegirl_linux.runtime import Runtime
+from whalegirl_linux.topic_relevance import is_followup, related_topic, select_topic_history
 from whalegirl_linux.visible_media import locate_image, token
 from whalegirl_linux.media_locator import locate_image as native_locate_image
 
@@ -89,6 +90,84 @@ class UpgradeTests(unittest.IsolatedAsyncioTestCase):
         for i in range(2,18):self.message(i)
         _,keys,_=await build_context(self.store,None,Settings(context_messages=10),photo,[photo],{})
         self.assertEqual(keys,[photo['key']])
+
+    async def test_native_sticker_is_not_loaded_as_an_image_unless_asked_about(self):
+        sticker=self.message(80,kind=47,content='',sticker={'md5':'a'*32})
+        sticker['content']='[原生表情包] 表达：无语、疑惑'
+        self.store.observe([sticker]);self.store.insert(sticker);self.image(sticker)
+        _,keys,_=await build_context(self.store,None,Settings(),sticker,[self.store.get(sticker['key'])],{})
+        self.assertEqual(keys,[])
+        current=self.message(81,kind=1,content='这个表情包是什么意思')
+        current['trigger']='direct';self.store.insert(current)
+        _,keys,_=await build_context(self.store,None,Settings(),current,[self.store.get(current['key'])],{})
+        self.assertEqual(keys,[sticker['key']])
+
+    async def test_complete_recent_history_keeps_other_topic_without_injecting_old_digest(self):
+        old=self.message(1,content='昨天贴吧猫猫梗又被顶上来了')
+        self.store.save_digest('account',old['chat'],'贴吧最近在聊猫猫梗，之前的帖子还挺有趣',old)
+        current=self.message(2,content='鲸鱼娘帮我看看服务器磁盘空间')
+        current['trigger']='direct'
+        self.store.insert(current)
+        messages,_,counts=await build_context(
+            self.store,None,Settings(vision_enabled=False),current,[self.store.get(current['key'])],{}
+        )
+        prompt=messages[0]['content']
+        self.assertIn('服务器磁盘空间',prompt)
+        self.assertNotIn('贴吧最近在聊猫猫梗',prompt)
+        self.assertIn('昨天贴吧猫猫梗',prompt)
+        self.assertFalse(counts['digest_included'])
+        self.assertEqual(counts['selected_history_messages'],1)
+        self.assertEqual(counts['context_mode'],'complete_recent')
+
+    async def test_related_current_topic_keeps_matching_history_and_digest(self):
+        old=self.message(1,content='缓存命中率昨天掉到一半了')
+        bot={**old,'key':'account/a@chatroom/2','local_id':2,'sender':'bot','sender_id':'bot',
+             'senderName':'机器人','is_self':True,'content':'我记得缓存命中率下降了，先看看磁盘读写'}
+        self.store.observe([bot])
+        self.store.save_digest('account',old['chat'],'缓存命中率下降，正在排查磁盘读写',old)
+        current=self.message(3,content='那缓存命中呢')
+        current['trigger']='direct'
+        self.store.insert(current)
+        messages,_,counts=await build_context(
+            self.store,None,Settings(vision_enabled=False),current,[self.store.get(current['key'])],{}
+        )
+        prompt=messages[0]['content']
+        self.assertIn('缓存命中率昨天掉到一半了',prompt)
+        self.assertIn('缓存命中率下降',prompt)
+        self.assertIn('正在排查磁盘读写',prompt)
+        self.assertGreaterEqual(counts['selected_history_messages'],1)
+        self.assertTrue(counts['digest_included'])
+
+    async def test_context_history_obeys_configured_message_limit(self):
+        for i in range(1,116):
+            self.message(i,content=f'当前讨论话题第{i}句')
+        current=self.message(116,content='鲸鱼娘继续说一下')
+        current['trigger']='direct';self.store.insert(current)
+        _,_,counts=await build_context(self.store,None,Settings(context_messages=100,vision_enabled=False),
+                                       current,[self.store.get(current['key'])],{})
+        self.assertEqual(counts['current_messages'],100)
+
+    def test_saved_context_limit_is_clamped_to_supported_range(self):
+        folder=self.root/'legacy-settings';folder.mkdir()
+        data=Settings().model_dump();data['context_messages']=128
+        (folder/'settings.json').write_text(json.dumps(data),encoding='utf-8')
+        self.assertEqual(Config(folder).settings.context_messages,100)
+        self.assertEqual(Settings(context_messages=28).context_messages,28)
+        with self.assertRaises(ValueError):
+            Settings(context_messages=101)
+
+    def test_topic_helpers_require_content_overlap_or_an_explicit_followup(self):
+        self.assertTrue(related_topic('服务器磁盘空间', '服务器磁盘占用上涨'))
+        self.assertFalse(related_topic('服务器磁盘空间', '贴吧猫猫梗又出现了'))
+        self.assertTrue(is_followup('那缓存呢'))
+        self.assertFalse(is_followup('今天问一下服务器'))
+        now=time.time()
+        rows=[{'key':'old','timestamp':now-30,'local_id':1,'content':'贴吧猫猫梗','is_self':0},
+              {'key':'recent','timestamp':now-5,'local_id':2,'content':'服务器磁盘读写','is_self':0}]
+        fresh={'key':'new','content':'鲸鱼娘 服务器磁盘占用','timestamp':now,'trigger':'direct'}
+        chosen,mode=select_topic_history(rows,[fresh],'direct',now=now,wake_words=['鲸鱼娘'])
+        self.assertEqual([row['key'] for row in chosen],['recent'])
+        self.assertEqual(mode,'topic_match')
 
     async def test_group_image_alignment_supports_quoted_bubbles_and_unique_sequences(self):
         raw=[{'localId':1,'serverId':11,'type':1,'content':'看看'}, {'localId':2,'serverId':12,'type':3},

@@ -176,6 +176,63 @@ class ImageToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.execute(first, dict(tool='send_library_image', asset_id=red['id']))['ok'])
         self.assertEqual(self.images.get(self.images.tools.recent(first)[0]['id'])['kind'], 'send')
 
+    def test_stable_catalog_is_newest_twenty_but_explicit_lookup_finds_older_match(self):
+        assets=[]
+        now=time.time()
+        for index in range(25):
+            stream=io.BytesIO()
+            Image.new('RGB',(22,20),(index,30,100)).save(stream,format='PNG')
+            asset=self.images.save_asset(stream.getvalue(),'uploaded',scope='global')
+            name='素材'+str(index);description='普通场景'
+            if index==0:
+                name='挽昼红色礼服'
+                description='挽昼穿红色礼服站在海边'
+            self.images.edit_asset(asset['id'],{'name':name,'description':description})
+            with self.store.lock,self.store.db:
+                self.store.db.execute('UPDATE picture_assets SET created=? WHERE id=?',
+                                      (now-(24-index)*60,asset['id']))
+            assets.append(asset)
+        first=self.message('你好')
+        catalog=self.images.tools.base_candidates(first)
+        self.assertEqual(len(catalog),20)
+        self.assertNotIn(assets[0]['id'],{row['id'] for row in catalog})
+        _,context=self.images.tools.context(first,[first],include_prompt=False)
+        self.assertEqual([row['id'] for row in context['candidates']],
+                         [row['id'] for row in catalog])
+        self.assertFalse(context['explicit_lookup'])
+        request=self.message('帮我发挽昼红色礼服图片',2)
+        _,found=self.images.tools.context(request,[request],include_prompt=False)
+        self.assertTrue(found['explicit_lookup'])
+        self.assertIn(assets[0]['id'],{row['id'] for row in found['candidates']})
+        fallback=self.images.tools.direct_library_fallback(request,found)
+        self.assertEqual(fallback['asset_ids'],[assets[0]['id']])
+
+    def test_recent_twenty_match_wins_before_a_better_older_match(self):
+        assets=[]
+        now=time.time()
+        for index in range(25):
+            stream=io.BytesIO()
+            Image.new('RGB',(22,20),(index,50,100)).save(stream,format='PNG')
+            asset=self.images.save_asset(stream.getvalue(),'uploaded',scope='global')
+            description='普通场景'
+            name=f'素材{index}'
+            if index in (0,24):
+                name='挽昼红色礼服海边图' if index==0 else '挽昼海边'
+                description=('挽昼穿红色礼服站在海边，背景有海浪、灯光与花朵' if index==0
+                             else '挽昼穿红色礼服站在海边')
+            self.images.edit_asset(asset['id'],{'name':name,'description':description})
+            with self.store.lock,self.store.db:
+                self.store.db.execute('UPDATE picture_assets SET created=? WHERE id=?',
+                                      (now-(24-index)*60,asset['id']))
+            assets.append(asset)
+        request=self.message('帮我发挽昼红色礼服海边图片')
+        _,context=self.images.tools.context(request,[request],include_prompt=False)
+        chosen={row['id'] for row in context['candidates']}
+        self.assertIn(assets[24]['id'],chosen)
+        self.assertNotIn(assets[0]['id'],chosen)
+        fallback=self.images.tools.direct_library_fallback(request,context)
+        self.assertEqual(fallback['asset_ids'],[assets[24]['id']])
+
     async def test_rejected_tool_replaces_success_ack_with_model_explanation(self):
         first=self.message('那你画一张')
         self.store.insert(first);self.store.observe([first])
@@ -232,6 +289,80 @@ class ImageToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(group_catalog,[])
         self.assertIn(asset['id'],self.images.tools.catalog_prompt(private_catalog))
         self.assertNotIn(asset['id'],self.images.tools.catalog_prompt(group_catalog))
+
+    def test_explicit_tieba_request_uses_only_newest_tieba_asset(self):
+        self.config.save(self.config.settings.model_copy(update={'tieba_enabled':True,'tieba_images_enabled':True}))
+        uploaded=self.images.save_asset(self.raw,'uploaded',scope='global')
+        generated_raw=io.BytesIO();Image.new('RGB',(21,20),'red').save(generated_raw,format='PNG')
+        generated=self.images.save_asset(generated_raw.getvalue(),'generated',scope='global')
+        tieba_raw=io.BytesIO();Image.new('RGB',(22,20),'green').save(tieba_raw,format='PNG')
+        tieba_old=self.images.save_asset(tieba_raw.getvalue(),'tieba',scope='global')
+        tieba_new_raw=io.BytesIO();Image.new('RGB',(23,20),'yellow').save(tieba_new_raw,format='PNG')
+        tieba_new=self.images.save_asset(tieba_new_raw.getvalue(),'tieba',scope='global')
+        for asset,name in ((uploaded,'贴吧图片旧上传'),(generated,'贴吧图片旧生成'),
+                           (tieba_old,'贴吧梗图'),(tieba_new,'贴吧新梗图')):
+            self.images.edit_asset(asset['id'],{'name':name,'description':'有趣的贴吧猫咪图片'})
+        with self.store.lock,self.store.db:
+            self.store.db.execute('UPDATE picture_assets SET created=? WHERE id=?',(time.time()-86400,tieba_old['id']))
+        first=self.message('分享贴吧图片给我')
+        _,context=self.images.tools.context(first,[first])
+        self.assertEqual(context['requested_source'],'tieba')
+        self.assertTrue(context['direct_library_request'])
+        self.assertEqual({asset['source'] for asset in context['candidates']},{'tieba'})
+        request=self.images.tools.direct_library_fallback(first,context)
+        self.assertEqual(request['tool'],'send_library_image')
+        self.assertEqual(request['asset_ids'],[tieba_new['id']])
+        self.assertNotIn(uploaded['id'],request['asset_ids'])
+        self.assertNotIn(generated['id'],request['asset_ids'])
+        self.assertEqual(self.execute(first,{'tool':'send_library_image','asset_id':uploaded['id']})['code'],'no_match')
+        self.assertEqual(self.execute(self.message('再分享贴吧图片给我',2),
+                                      {'tool':'generate_image','scene_prompt':'生成一张图片'})['code'],'library_source_only')
+
+    def test_gallery_source_is_only_locked_when_user_requests_a_picture(self):
+        from whalegirl_linux.image_tools import requested_library_source
+        self.assertEqual(requested_library_source('贴吧图片还挺有意思'),'')
+        self.assertEqual(requested_library_source('分享贴吧图片给我'),'tieba')
+        self.assertEqual(requested_library_source('把之前生成的图发我'),'generated')
+        self.assertEqual(requested_library_source('把我上传的图片发我'),'uploaded')
+
+    def test_explicit_generated_gallery_request_is_library_retrieval(self):
+        asset=self.images.save_asset(self.raw,'generated',scope='global')
+        self.images.edit_asset(asset['id'],{'name':'之前生成的海边图','description':'海边少女插画'})
+        first=self.message('把生成图库里的图发我')
+        _,context=self.images.tools.context(first,[first])
+        self.assertEqual(context['requested_source'],'generated')
+        self.assertTrue(context['direct_library_request'])
+        self.assertEqual({candidate['source'] for candidate in context['candidates']},{'generated'})
+        request=self.images.tools.direct_library_fallback(first,context)
+        self.assertEqual((request['tool'],request['asset_ids']),('send_library_image',[asset['id']]))
+
+    async def test_direct_tieba_order_overrides_a_model_generation_choice(self):
+        self.config.save(self.config.settings.model_copy(update={'tieba_enabled':True,'tieba_images_enabled':True}))
+        uploaded=self.images.save_asset(self.raw,'uploaded',scope='global')
+        tieba_raw=io.BytesIO();Image.new('RGB',(23,20),'yellow').save(tieba_raw,format='PNG')
+        tieba=self.images.save_asset(tieba_raw.getvalue(),'tieba',scope='global')
+        for asset,name in ((uploaded,'贴吧图上传库'),(tieba,'贴吧图片')):
+            self.images.edit_asset(asset['id'],{'name':name,'description':'有趣的贴吧图片'})
+        first=self.message('分享贴吧图片给我')
+        self.store.insert(first);self.store.observe([first])
+        engine=await self.runtime.model()
+        engine.answers=[{'should_reply':True,'image_request':{
+            'tool':'generate_image','subject_type':'other','scene_prompt':'重新画一个贴吧图片'},
+            'actions':[{'type':'text','text':'我给你画一张'}]}]
+        await self.runtime.process_next()
+        jobs=self.store.db.execute('SELECT kind,asset_id FROM picture_jobs ORDER BY created').fetchall()
+        self.assertEqual([(row['kind'],row['asset_id']) for row in jobs],[('send',tieba['id'])])
+        self.assertEqual(self.images.tools.decisions()[0]['decision'],'send_library_image')
+        self.assertNotEqual(tieba['id'],uploaded['id'])
+
+    def test_fuzzy_selection_ranks_latest_library_addition_first(self):
+        old,new=self.pair()
+        first=self.message('随便分享一张图片')
+        _,context=self.images.tools.context(first,[first])
+        self.assertEqual(context['requested_source'],'')
+        self.assertEqual(context['candidates'][0]['id'],new['id'])
+        request=self.images.tools.direct_library_fallback(first,context)
+        self.assertEqual(request['asset_ids'],[new['id']])
 
     async def test_old_generated_picture_can_repeat_without_generation_or_send_quota(self):
         from whalegirl_linux.gateway import Receipt

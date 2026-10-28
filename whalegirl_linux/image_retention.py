@@ -66,6 +66,11 @@ class ImageRetention:
                 AND state IN ('queued','generating','ready','sending','uncertain') LIMIT 1""",
                 (asset['account'], asset['id'])).fetchone():
             return '图片有待处理或待核实任务，请先取消任务或核实发送结果'
+        if self.store.db.execute("""SELECT 1 FROM picture_jobs j,json_each(j.reference_json,'$.inputs') r
+                WHERE j.account=? AND j.state IN ('queued','generating','ready','sending','uncertain')
+                AND json_extract(r.value,'$.asset_id')=? LIMIT 1""",
+                (asset['account'],asset['id'])).fetchone():
+            return '图片被待处理生图任务作为角色参考，请先处理该任务'
         for row in self.store.db.execute("""SELECT payload FROM moments_actions WHERE account=?
                 AND state NOT IN ('sent','cancelled','skipped')""", (asset['account'],)):
             payload = json.loads(row[0])

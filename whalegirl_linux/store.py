@@ -6,6 +6,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from .topic_relevance import topic_terms
 
 
 class Store:
@@ -75,12 +76,16 @@ class Store:
                 value=row[0].rsplit('/local:',1)[-1]
                 if value.isdigit():self.db.execute('UPDATE inbox SET local_id=? WHERE key=?',(int(value),row[0]))
         self.db.execute('CREATE INDEX IF NOT EXISTS inbox_native_id ON inbox(account,chat,local_id)')
+        if 'details_json' not in {r[1] for r in self.db.execute('PRAGMA table_info(outbound_actions)')}:
+            self.db.execute("ALTER TABLE outbound_actions ADD COLUMN details_json TEXT NOT NULL DEFAULT '{}'")
+        self.db.execute('CREATE INDEX IF NOT EXISTS outbound_pending ON outbound_actions(account,chat,state,sent_at)')
         if 'trigger' not in {r[1] for r in self.db.execute('PRAGMA table_info(inbox)')}:
             self.db.execute("ALTER TABLE inbox ADD COLUMN trigger TEXT NOT NULL DEFAULT ''")
         # An interrupted UI send can already have reached WeChat. Never resend it.
         self.db.execute("UPDATE inbox SET state='uncertain',error='进程在发送阶段中断，请人工核对' WHERE state='sending'")
         self.db.execute("UPDATE outbound_actions SET state='uncertain',error='发送阶段中断，请人工核对' WHERE state='sending'")
         self.db.execute("UPDATE inbox SET state='queued',error='' WHERE state='generating'")
+        self.db.execute("UPDATE inbox SET state='queued',error='等待期间服务重启，已按普通流程恢复' WHERE state='waiting'")
         self.db.commit()
 
     def observe(self, events, *, commit=True):
@@ -120,9 +125,28 @@ class Store:
             self.db.commit()
 
     def conversation(self, account, chat, limit=60):
-        rows = self.db.execute("SELECT * FROM message_log WHERE account=? AND chat=? ORDER BY timestamp DESC,local_id DESC LIMIT ?",
-                               (account, chat, limit)).fetchall()
-        return [dict(r) for r in reversed(rows)]
+        # A pending native row is seen again under its server ID after upload.
+        # Count that message once, without merging real repeated messages.
+        grouped = {}
+        rows = self.db.execute("SELECT * FROM message_log WHERE account=? AND chat=? "
+                               "ORDER BY timestamp DESC,local_id DESC,key DESC", (account, chat))
+        for raw in rows:
+            row = dict(raw)
+            identity = ('local', row['local_id']) if (row.get('local_id') or 0) > 0 else ('key', row['key'])
+            if identity not in grouped:
+                if len(grouped) >= limit:
+                    break
+                grouped[identity] = {**row, 'alias_keys': [row['key']]}
+                continue
+            previous = grouped[identity]
+            aliases = previous['alias_keys'] + [row['key']]
+            if '/local:' in previous['key'] and '/local:' not in row['key']:
+                row['description'] = row.get('description') or previous.get('description') or ''
+                grouped[identity] = {**row, 'alias_keys': aliases}
+            else:
+                previous['alias_keys'] = aliases
+                previous['description'] = previous.get('description') or row.get('description') or ''
+        return sorted(grouped.values(), key=lambda r: (r['timestamp'], r.get('local_id') or 0, r['key']))
 
     def find_message(self, account, chat, server_id):
         row=self.db.execute('SELECT * FROM message_log WHERE key=? AND account=? AND chat=?',
@@ -216,11 +240,12 @@ class Store:
         marks = ','.join('?' for _ in allowed_chats)
         rows = self.db.execute(f"SELECT * FROM message_log WHERE account=? AND chat IN ({marks}) AND is_self=0 ORDER BY timestamp DESC LIMIT 12000",
                                (account, *allowed_chats)).fetchall()
-        words = set(re.findall(r'[A-Za-z0-9_]{3,}', question.casefold()))
-        common = {'什么','怎么','你好','一下','这个','那个','可以','不能','目前','看到','消息','记录','全部','记得','之前','我们','你们'}
-        for phrase in re.findall(r'[\u3400-\u9fff]{2,}', question):
-            words.update(phrase[i:i+2] for i in range(len(phrase)-1) if phrase[i:i+2] not in common)
+        words = topic_terms(question)
+        if not words:
+            return []
         omitted = set(exclude)
+        if getattr(self,'memory_hub',None):
+            omitted.update(self.memory_hub.suppressed_sources(account,allowed_chats))
         scored = []
         for i, row in enumerate(rows):
             r = dict(row)
@@ -231,8 +256,10 @@ class Store:
             same_person = bool(sender_id and sender_id == r['sender_id'])
             # Source messages are durable memory; no model-invented facts are stored.
             fact = bool(re.search(r'记住|我叫|生日|我喜欢|我不喜欢|我是|我的名字|我的职业|我住', content))
+            # Identity can rank a relevant source, but must never make an
+            # unrelated old topic relevant by itself.
             score = hits * 5 + same_person * 2 + (same_person and fact) * 5
-            if score > 0:
+            if hits > 0 and score > 0:
                 scored.append((score, -i, r))
         best = [r for _, _, r in sorted(scored, key=lambda x:(x[0],x[1]), reverse=True)[:limit]]
         return sorted(best, key=lambda r:r['timestamp'])
@@ -305,12 +332,31 @@ class Store:
             self.db.execute("INSERT OR IGNORE INTO baselines VALUES(?,?)", (account, chat))
             self.db.commit()
 
-    def queue(self):
-        row = self.db.execute("SELECT * FROM inbox WHERE state='queued' ORDER BY timestamp,key LIMIT 1").fetchone()
+    def queue(self, exclude_chats=()):
+        exclude_chats=tuple(exclude_chats or ())
+        sql="SELECT * FROM inbox WHERE state='queued'"
+        args=[]
+        if exclude_chats:
+            sql+=' AND chat NOT IN ('+','.join('?' for _ in exclude_chats)+')'
+            args.extend(exclude_chats)
+        row = self.db.execute(sql+" ORDER BY timestamp,key LIMIT 1",args).fetchone()
         return dict(row) if row else None
 
     def queued_chat(self, account, chat):
         return [dict(r) for r in self.db.execute("SELECT * FROM inbox WHERE state='queued' AND account=? AND chat=? ORDER BY timestamp,key LIMIT 15", (account, chat))]
+
+    def messages_after(self, account, chat, after_time, after_id, *, received_after=0, limit=15):
+        """Return newly received incoming messages after a wait anchor."""
+        rows=self.db.execute("""SELECT m.*,COALESCE(i.trigger,'natural') AS trigger,
+                COALESCE(i.state,'ignored') AS state,COALESCE(i.error,'') AS inbox_error,
+                COALESCE(i.updated,m.timestamp) AS received_at
+            FROM message_log m LEFT JOIN inbox i ON i.key=m.key
+            WHERE m.account=? AND m.chat=? AND m.is_self=0
+              AND (m.timestamp>? OR (m.timestamp=? AND COALESCE(m.local_id,0)>?))
+              AND COALESCE(i.updated,m.timestamp)>=?
+            ORDER BY m.timestamp,m.local_id,m.key LIMIT ?""",
+            (account,chat,after_time,after_time,after_id,received_after,max(1,min(30,int(limit))))).fetchall()
+        return [dict(row) for row in rows]
 
     def action_start(self, key, event, index, action):
         action_id=f'{key}#part-{index}'
@@ -320,10 +366,13 @@ class Store:
             self.db.commit()
         return action_id
 
-    def action_finish(self, action_id, state, receipt='', error=''):
+    def action_finish(self, action_id, state, receipt='', error='', *, details=None):
         with self.lock:
             self.db.execute('UPDATE outbound_actions SET state=?,receipt=?,error=? WHERE id=?',
                             (state,receipt,error[:300],action_id))
+            if details is not None:
+                self.db.execute('UPDATE outbound_actions SET details_json=? WHERE id=?',
+                                (json.dumps(details,ensure_ascii=False),action_id))
             self.db.commit()
 
     def actions(self, key):
@@ -360,7 +409,12 @@ class Store:
         order = 'timestamp DESC,updated DESC' if include_ignored else 'updated DESC'
         rows=[dict(r) for r in self.db.execute('SELECT key,chat,sender,content,state,reply,error,updated,timestamp '
                                              'FROM inbox '+where+' ORDER BY '+order+' LIMIT 50')]
-        for row in rows:row['actions']=self.actions(row['key'])
+        for row in rows:
+            row['actions']=self.actions(row['key'])
+            for action in row['actions']:
+                details=json.loads(action.pop('details_json','{}') or '{}')
+                action['delivery']={k:details[k] for k in ('attempts','initial_result','final_result',
+                    'ui_seconds','ui_lock_seconds','ui_timing','confirmed_at','confirmation') if k in details}
         return rows
 
     def stats(self):

@@ -360,7 +360,8 @@ class TiebaService:
             api_style=s.api_style,
             reasoning_effort=s.reasoning_effort, stream_enabled=s.model_stream_enabled,
             model=s.model, max_tokens=4000, temperature=.65, timeout=35, max_retries=1)
-        engine.usage_callback = lambda event: self.runtime.token_ledger.record(account, {**event, 'operation': 'tieba'})
+        engine.usage_callback = lambda event: self.runtime.token_ledger.record(
+            account, {**event, 'operation': event.get('operation') if event.get('operation') != 'chat' else 'tieba'})
         return engine
 
     def current(self, account):
@@ -467,7 +468,8 @@ class TiebaService:
                             {'interests': s.tieba_interests, 'interest_sensitivity': s.tieba_interest_sensitivity,
                              'posts': [{**screening_excerpt(p), 'interest_evidence': interest_hits(p, s.tieba_interests)}
                                        for p in candidates]}, ensure_ascii=False)}],
-                            system_prompt=style + instruction, response_format={'type': 'json_object'})
+                            system_prompt=style + instruction, response_format={'type': 'json_object'},
+                            operation='tieba')
                         result = parse_json(answer)
                         if not isinstance(result, dict) or not isinstance(result.get('posts'), list):
                             raise ValueError('贴吧筛选模型未返回有效结果，本轮保留记录，稍后再试')
@@ -727,7 +729,7 @@ class TiebaService:
                     {'sender': v['sender'], 'self': bool(v['is_self']), 'text': v['content'][:500]} for v in recent],
                     'local_sources': candidates}, ensure_ascii=False)}]
                 raw = await asyncio.wait_for(engine.chat(messages, system_prompt=system,
-                    max_tokens=1200, response_format={'type': 'json_object'}), timeout=18)
+                    max_tokens=1200, response_format={'type': 'json_object'}, operation='tieba'), timeout=18)
                 decision = parse_json(raw or '')
                 if not isinstance(decision, dict) or not decision.get('should_reply'):
                     return False

@@ -94,6 +94,31 @@ class TiebaToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(not after or after[0]['score'] < before)
         self.assertTrue(self.t.rank_memes('摸鱼是物种优势是什么意思', first['chat']))
 
+    async def test_ordinary_chat_exposes_tieba_tool_but_not_saved_content(self):
+        first = self.event(content='今天有点累')
+        self.store.observe([first])
+        self.store.insert(first)
+        engine = await self.r.model()
+        engine.answers = [{'should_reply': True, 'actions': [{'type': 'text', 'text': '辛苦啦'}]}]
+        captured = []
+        original_chat = engine.chat
+
+        async def capture_chat(messages, **kwargs):
+            captured.append((messages, kwargs))
+            return await original_chat(messages, **kwargs)
+
+        engine.chat = capture_chat
+        await self.r.process_next()
+
+        self.assertEqual(engine.calls, 1)
+        self.assertEqual(len(captured), 1)
+        user_content = json.dumps(captured[0][0], ensure_ascii=False)
+        system_prompt = captured[0][1]['system_prompt']
+        self.assertIn('search_tieba', system_prompt)
+        self.assertNotIn('保存全部正文。', user_content)
+        self.assertNotIn('摸鱼是物种优势', user_content)
+        self.assertNotIn('摸鱼是物种优势', system_prompt)
+
     async def test_share_checks_actual_passages_and_authorized_switches(self):
         first = self.event()
         request = {'tid': '123', 'excerpts': [{'pid': '11', 'text': '不存在的编造正文'}]}
@@ -178,12 +203,13 @@ class TiebaToolTests(unittest.IsolatedAsyncioTestCase):
         engine = await self.r.model()
         meme = self.t.memes()[0]
         engine.answers = [
+            {'should_reply': True, 'actions': [], 'tieba_request': {'tool': 'search_tieba', 'query': '工作划水'}},
             {'should_reply': True, 'actions': [], 'tieba_request': {'tool': 'read_tieba', 'tid': '123', 'offset': 4500}},
             {'should_reply': True, 'actions': [{'type': 'text', 'text': '就是给自己偷懒找个正经理由呗'}],
              'tieba_used_meme_ids': [meme['id']]}]
         await self.r.process_next()
         self.assertEqual(self.store.get(first['key'])['state'], 'sent')
-        self.assertEqual(engine.calls, 2)
+        self.assertEqual(engine.calls, 3)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM tieba_meme_usage').fetchone()[0], 1)
 
     async def test_background_detail_enrichment_preserves_admin_text(self):
