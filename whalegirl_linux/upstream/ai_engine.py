@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 import httpx
 from loguru import logger
 from ..token_usage import normalize_usage
-from ..time_context import CLOCK_RULE, clock_messages
+from ..time_context import CLOCK_RULE, clock_messages, user_context_block
 
 
 class IncompleteModelResponse(ValueError):
@@ -242,47 +242,16 @@ class AIEngine:
             payload["thinking"] = {"type": "disabled"}
 
         dynamic_marker = "\n【本轮动态上下文】"
-        reply_marker = "\n【本次需要回复的消息】\n"
         # A tiny live input, after the reusable system prefix. All reply/tool
         # paths use the server clock, including Responses and proactive chat.
-        if dynamic_marker in system_prompt:
-            prefix, suffix = system_prompt.split(dynamic_marker, 1)
-            system_prompt = prefix + CLOCK_RULE + dynamic_marker + suffix
-        else:
-            system_prompt += CLOCK_RULE
-        effective_system = system_prompt
+        effective_system = system_prompt + CLOCK_RULE
         effective_messages = messages
-        if (
-            dynamic_marker in system_prompt
-            and messages
-            and messages[0].get("role") == "user"
-        ):
+        if dynamic_marker in system_prompt:
             static_part, dynamic_part = system_prompt.split(dynamic_marker, 1)
             dynamic_block = dynamic_marker + dynamic_part
-            first_msg = messages[0]
-            content = first_msg.get("content")
-            if isinstance(content, str) and reply_marker in content:
-                before_reply, after_reply = content.split(reply_marker, 1)
-                new_content = before_reply + dynamic_block + reply_marker + after_reply
-                effective_system = static_part
-                effective_messages = [{"role": "user", "content": new_content}, *messages[1:]]
-            elif (
-                isinstance(content, list)
-                and content
-                and isinstance(content[0], dict)
-                and content[0].get("type") == "text"
-                and reply_marker in str(content[0].get("text") or "")
-            ):
-                before_reply, after_reply = content[0]["text"].split(reply_marker, 1)
-                new_first_block = {
-                    **content[0],
-                    "text": before_reply + dynamic_block + reply_marker + after_reply,
-                }
-                effective_system = static_part
-                effective_messages = [
-                    {"role": "user", "content": [new_first_block, *content[1:]]},
-                    *messages[1:],
-                ]
+            effective_messages,moved = user_context_block(messages,dynamic_block)
+            effective_system = static_part + CLOCK_RULE
+            if not moved:effective_system += dynamic_block
 
         effective_messages = clock_messages(effective_messages)
 

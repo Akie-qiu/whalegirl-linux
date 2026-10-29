@@ -420,6 +420,13 @@ def memory_static_prompt(settings):
         + ('\n当前禁止AI修改记忆，仅可读取。' if not settings.editable_memory_enabled else ''))
 
 
+def consolidation_data(previous_summary, messages, memories):
+    """Put unchanged facts first; keep every selected fact, source and message."""
+    fields=('id','version','chat','subject','kind','scope','content','triggers','salience')
+    stable=[{key:row.get(key) for key in fields} for row in sorted(memories,key=lambda row:row['id'])]
+    return {'existing_memories':stable,'messages':messages,'previous_summary':previous_summary}
+
+
 def memory_parts(book,settings,first,batch,affection=None,diagnostics=None):
     from .memory_hub import token_estimate
     if not settings.memory_enabled:
