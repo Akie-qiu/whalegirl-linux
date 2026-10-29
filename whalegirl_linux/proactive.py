@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 from .conversation import anti_formula_check, habit_static_prompt, pair_sticker, plan_actions, sticker_dynamic_prompt, sticker_static_prompt, warmth_prompt
 from .memory import memory_parts
-from .mentions import apply_mentions, mention_options, mention_prompt
+from .mentions import apply_mentions, mention_dynamic_prompt, mention_options, mention_static_prompt
 from .stickers import parse_json
 from .resources import native_pressure
 from .context import build_context, vision_reply
@@ -294,11 +294,10 @@ class ProactiveService:
             tieba_evidence = {}
             system = ((s.system_prompt_override.strip() or r.styles.get_active().system_prompt)
                 + habit_static_prompt(s) + warmth_prompt(s) + memory_static + search_static_prompt(s)
-                + r.affection.static_prompt(first, s) + r.sticker_library.static_prompt(s)
+                + r.affection.static_prompt(first, s, include_venue=False) + r.sticker_library.static_prompt(s)
                 + r.images.tools.static_prompt(first, include_catalog=False)
-                + r.images.tools.catalog_prompt(base_image_catalog) + sticker_static_prompt(s)
+                + sticker_static_prompt(s)
                 + r.tieba.tools.static_prompt()
-                + mention_prompt(mentions, mentions_enabled)
                 + '\n【主动聊天】你现在有一次自主发起聊天的机会，并没有人刚向你提问。'
                   '结合人设、关系、当前北京时间和真实话题决定是否值得开口；没具体想说的就沉默。'
                   '可分享有依据的兴趣、接续尚未解决的话题、关心近况或找一个具体群友聊天。'
@@ -322,6 +321,11 @@ class ProactiveService:
                   'image_descriptions仅记录本轮实际附件的key与真实可见description，截图里的人物或对白不当作发图者的真实经历。'
                   'image_request使用既有send_library_image/generate_image格式；沉默时actions=[]且image_request=null。')
             system += r.autonomy.static_prompt()
+            # Chat-specific catalog and venue belong after all common rules;
+            # changing the roster must not split the reusable system prefix.
+            system += r.affection.venue_prompt(first)
+            if chat.endswith('@chatroom'):system += mention_static_prompt(mentions_enabled)
+            system += r.images.tools.catalog_prompt(base_image_catalog)
             data = {'chat': r.chat_labels.get(chat, chat), 'initiative': s.proactive_level,
                     'do_not_address': sorted(muted),
                     'last_human_age_seconds': round(max(0,now-humans[-1]['timestamp'])),
@@ -331,6 +335,7 @@ class ProactiveService:
                        + sticker_dynamic_prompt(choices, r.stickers.details(choices)))
             dynamic += r.autonomy.dynamic_prompt(first)
             dynamic += r.affection.dynamic_prompt(first, humans[-6:], s)
+            dynamic += mention_dynamic_prompt(mentions,mentions_enabled)
             if s.anti_formula_guard_enabled:
                 dynamic += anti_formula_check(self.store,s.account_id,chat)['prompt']
             # Offer real recent sticker sources without embedding the full
