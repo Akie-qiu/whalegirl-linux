@@ -64,3 +64,8 @@
 - `7875449` 中 `trim_memory()` 会删除 UI 任务目录下所有超过 10 分钟的 `*.json`，误删了常驻授权文件 `authorized-chats.json`。容器内 `native_image_send.py` 校验授权时报 `No such file or directory: '/data/whalegirl-jobs/authorized-chats.json'`，18:56 起图库发送与生图后发送失败；原生消息读取、群成员和朋友圈同样依赖该文件。
 - 修复：清理范围收窄为仅匹配 `^[0-9a-f]{32}\.json$` 的临时任务文件；授权写入抽取为 `Config.sync_authority()`，`Runtime.ensure_authority_files()` 在启动与每轮清理后自愈重建 `authorized-chats.json` / `image-assets.json`。
 - 新增回归测试 `test_trim_memory_keeps_authority_files_and_self_heals`；远端 52 项测试通过，重启后容器内授权文件可读（`chat_enabled=True`、`images_chat_enabled=True`、8 个授权会话）。
+
+
+## 2026-10-29 发送界面自动恢复与统一入口
+
+连续两次明确发送失败后，服务器先返回微信聊天主界面并刷新表情位置；恢复后仍失败才暂停。相关操作集中在所有管理页顶部。已自动恢复原发送暂停，微信及读取进程保持。另修正存档脚本与实际挂载脚本不一致的问题。实现、验证和回滚信息见 [UI_RECOVERY_20261029.md](UI_RECOVERY_20261029.md)。

@@ -36,6 +36,7 @@ class Settings(BaseModel):
     quote_replies_enabled: bool = True
     group_mentions_enabled: bool = True
     safety_enabled: bool = True
+    send_auto_recovery_enabled: bool = True
     safety_send_limits_enabled: bool = True
     safety_per_minute: int = Field(default=8, ge=0, le=60)
     safety_per_hour: int = Field(default=120, ge=0, le=1200)

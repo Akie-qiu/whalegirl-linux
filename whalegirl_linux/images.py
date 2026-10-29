@@ -707,7 +707,7 @@ class ImageService:
         receipt=await self.runtime.gateway.send_image(job['chat'],job['asset_id'])
         state='sent' if receipt.confirmed else 'failed' if receipt.definite_failure else 'uncertain'
         self.store.action_finish(action_id,state,receipt.message_id,receipt.error)
-        self.runtime.safety.outcome(s.account_id,receipt,s)
+        self.runtime.safety.outcome(s.account_id,receipt,s,chat=job['chat'])
         self.runtime.last_send=time.time()
         self.change(job['id'],state=state,receipt=receipt.message_id,error=receipt.error)
 
@@ -830,7 +830,7 @@ class ImageService:
                 self.store.action_finish(action_id,state,receipt.message_id,receipt.error)
                 self.change(job['id'],notice_state=state)
                 self.runtime.last_send=time.time()
-                self.runtime.safety.outcome(s.account_id,receipt,s)
+                self.runtime.safety.outcome(s.account_id,receipt,s,chat=job['chat'])
             except asyncio.CancelledError:
                 raise
             except Exception:

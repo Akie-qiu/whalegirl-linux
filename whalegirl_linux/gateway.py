@@ -326,6 +326,17 @@ class AgentGateway:
         result = request.result() if request.done() and not request.cancelled() else None
         return result or Receipt(False, error="网关返回成功，但未读回新消息；请人工核对，不自动重发")
 
+    async def reset_ui(self, chat, account):
+        """Navigate only: never submit a chat, restart WeChat or request login."""
+        if not self.ui_jobs_directory:
+            raise ValueError('当前网关未配置微信界面恢复')
+        async with self.ui_lock:
+            result = await self.ui_job('reset_ui', chat, account_id=account)
+            self._members_cache.clear()
+            self._status_cache = None
+            self._status_at = 0.0
+            return result
+
     async def start_login(self):
         if self.login_task and not self.login_task.done():
             if not self.control_directory:

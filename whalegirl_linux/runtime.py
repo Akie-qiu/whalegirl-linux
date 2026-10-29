@@ -32,6 +32,7 @@ from .tieba import TiebaService
 from .resources import native_pressure
 from .message_payload import incoming_content
 from .search import DeepSeekSearch, search_dynamic_prompt, search_prompt, search_static_prompt
+from .recovery import RecoveryService
 from .upstream.ai_engine import AIEngine
 from .token_usage import TokenLedger
 from .mentions import mention_dynamic_prompt, mention_options, mention_prompt, mention_static_prompt, apply_mentions
@@ -115,6 +116,7 @@ class Runtime:
         self.tieba = TiebaService(self)
         self.proactive = ProactiveService(self)
         self.autonomy = AutonomyService(self)
+        self.recovery = RecoveryService(self)
         self.ensure_authority_files()
 
     async def start(self):
@@ -126,7 +128,7 @@ class Runtime:
                       asyncio.create_task(self.images.metadata_loop()),asyncio.create_task(self.images.notice_loop()),
                       asyncio.create_task(self.tieba.browse_loop()),asyncio.create_task(self.tieba.dispatch_loop()),
                       asyncio.create_task(self.proactive.loop()),asyncio.create_task(self.learning.loop()),
-                      asyncio.create_task(self.autonomy.loop())]
+                      asyncio.create_task(self.autonomy.loop()), asyncio.create_task(self.recovery.loop())]
 
     async def close(self):
         wait_tasks = list(self.followup_waits.values())
@@ -208,7 +210,9 @@ class Runtime:
                 return chat, exc
 
         reads = [asyncio.create_task(read_result(chat)) for chat in settings.allowed_chat_ids]
-        safety_held = self.safety.held(account) or self.paused_reason or not settings.enabled
+        # New messages can queue while the UI is being recovered. Only dispatch
+        # waits; a short recovery must not turn incoming messages into history.
+        safety_held = self.safety.state(account).get('hold_reason') or self.paused_reason or not settings.enabled
         try:
             for finished in asyncio.as_completed(reads):
                 chat, result = await finished
@@ -268,9 +272,10 @@ class Runtime:
                         '后续消息轮询已确认发送结果：'+settled['state'],chat=chat,level='info')
                     if settled['state']=='sent' and settled['kind']=='sticker':
                         self.store.record_sticker(account,chat,settled['details'].get('md5',''))
-                    if settled['state']=='failed':
+                    if settled['state'] in ('failed', 'sent'):
                         from .gateway import Receipt
-                        self.safety.outcome(account,Receipt(False,definite_failure=True),settings)
+                        self.safety.outcome(account, Receipt(settled['state']=='sent',
+                            definite_failure=settled['state']=='failed', details=settled.get('details') or {}), settings, chat=chat)
                 for event in inserted:
                     if not first_read and 0 <= time.time()-event['timestamp'] <= 90:
                         self.proactive.observe(event, raw_events[event['key']])
@@ -1176,11 +1181,7 @@ class Runtime:
                     mentions_confirmed=len(getattr(receipt,'mentioned_ids',())),
                     mention_error=getattr(receipt,'mention_error',''))
             outcomes.append(result)
-            self.safety.outcome(first['account'],receipt,settings)
-            if (action['type']=='sticker' and not receipt.confirmed and receipt.definite_failure
-                    and getattr(receipt,'attempts',1)>=MAX_SEND_ATTEMPTS):
-                self.safety.hold(first['account'],'sticker_retry_exhausted',
-                    '原生表情连续尝试2次仍明确失败，已暂停自动回复，请检查微信界面后在控制台恢复')
+            self.safety.outcome(first['account'],receipt,settings,chat=first['chat'])
             if receipt.confirmed:
                 self.store.action_finish(action_id,'sent',receipt.message_id,details=details)
                 if action['type']=='sticker':self.store.record_sticker(first['account'],first['chat'],action['id'])
@@ -1529,6 +1530,7 @@ class Runtime:
                 "memory":{**self.store.memory_status(),'global':self.config.settings.global_memory,'archive_error':self.archive_error},
                 "last_reply_timing":self.last_timing,
                 "web_search":{'enabled':self.config.settings.web_search_enabled,'last':self.web_search.last},
+                "recovery":self.recovery.snapshot(),
                 "learning": self.learning.status(),
                 "autonomy": {'enabled':self.autonomy.active(),'busy':self.autonomy.busy,
                              'last_error':self.autonomy.last_error},

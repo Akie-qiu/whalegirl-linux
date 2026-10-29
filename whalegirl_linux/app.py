@@ -37,6 +37,16 @@ class ReviewRequest(BaseModel):
     received: bool
 
 
+class RecoveryRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    resume: bool = True
+
+
+class RecoveryConfigRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    enabled: bool
+
+
 class AutonomyIntentRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
     op: str = Field(pattern='^cancel$')
@@ -322,6 +332,14 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
         supplied = request.headers.get('authorization','').removeprefix('Bearer ')
         config.console_logout(supplied)
         return {'ok':True}
+
+    @app.get('/recovery.js')
+    async def recovery_script():
+        return FileResponse(Path(__file__).parent / 'recovery.js', media_type='application/javascript')
+
+    @app.get('/recovery.css')
+    async def recovery_styles():
+        return FileResponse(Path(__file__).parent / 'recovery.css', media_type='text/css')
 
     @app.get("/console.js")
     async def console_script():
@@ -904,6 +922,35 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
         if not runtime.safety.login_request(config.settings.account_id,config.settings):
             raise HTTPException(429,'本地登录保护：10分钟内最多请求7次登录，请稍后再试')
         return await transport.start_login()
+
+    @app.get('/api/recovery')
+    async def recovery_status():
+        return runtime.recovery.snapshot()
+
+    @app.post('/api/recovery/run')
+    async def recovery_run(body: RecoveryRequest):
+        if runtime.recovery.busy:
+            raise HTTPException(409, '微信界面正在恢复，请稍候')
+        try:
+            return await runtime.recovery.run(manual=True, resume=body.resume)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post('/api/recovery/config')
+    async def recovery_config(body: RecoveryConfigRequest):
+        config.save(config.settings.model_copy(update={'send_auto_recovery_enabled':body.enabled}))
+        runtime.recovery.event.set()
+        return runtime.recovery.snapshot()
+
+    @app.get('/api/recovery/issues')
+    def recovery_issues():
+        columns = 'key,chat,sender,content,reply,state,error,updated'
+        pending = store.db.execute('SELECT ' + columns + " FROM inbox WHERE account=? AND state='uncertain' ORDER BY updated DESC LIMIT 20",
+                                  (config.settings.account_id,)).fetchall()
+        failed = store.db.execute('SELECT key,chat,state,error,updated FROM inbox WHERE account=? '
+                                 "AND state IN ('failed','partial') AND error!='' ORDER BY updated DESC LIMIT 10",
+                                 (config.settings.account_id,)).fetchall()
+        return {'pending':[dict(row) for row in pending], 'failed':[dict(row) for row in failed]}
 
     @app.get('/api/safety')
     async def get_safety():

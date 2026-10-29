@@ -64,11 +64,17 @@ class SafetyGuard:
             self.record(account,code,reason,level='danger')
 
     def held(self, account):
-        return self.state(account).get('hold_reason','')
+        state = self.state(account)
+        return state.get('hold_reason','') or (
+            '正在恢复微信界面，完成后继续回复'
+            if state.get('recovery_status') in ('pending', 'recovering') else '')
 
     def resume(self, account):
         with self.store.lock:
-            self._save(account,{'consecutive_failures':0})
+            state = self.state(account)
+            state.update(consecutive_failures=0, recovery_used=False,
+                         recovery_status='idle', hold_reason='', hold_code='', hold_since=None)
+            self._save(account,state)
             self.record(account,'manual_resume','已人工确认恢复发送',level='info')
 
     def activity(self, account, now=None, chat=None):
@@ -143,23 +149,51 @@ class SafetyGuard:
                             'retry_at':row['sent_at']+settings.safety_duplicate_seconds}
         return {'allowed':True}
 
-    def outcome(self, account, receipt, settings):
+    def outcome(self, account, receipt, settings, *, chat=''):
         with self.store.lock:
             state = self.state(account)
             if receipt.confirmed:
-                if state.get('consecutive_failures'):
-                    state['consecutive_failures']=0
+                if (state.get('recovery_status') == 'awaiting_send'
+                        and 0 < getattr(receipt, 'details', {}).get('started_at', 0)
+                        < state.get('recovery_completed_at', 0)):
+                    return
+                if state.get('consecutive_failures') or state.get('recovery_used'):
+                    # A different in-flight send can finish while recovery is
+                    # pending. It must not cancel that requested UI operation.
+                    state['consecutive_failures'] = 0
+                    if state.get('recovery_status') not in ('pending', 'recovering'):
+                        state['recovery_used'] = False
+                        if state.get('recovery_status') == 'awaiting_send':
+                            state['recovery_status'] = 'recovered'
+                            self.record(account, 'ui_recovery_confirmed', '界面恢复后的新消息已确认发送，失败计数已清零', level='info')
                     self._save(account,state)
                 return
-            if not receipt.definite_failure or not settings.safety_enabled:
+            if not receipt.definite_failure or (not settings.safety_enabled
+                    and not getattr(settings, 'send_auto_recovery_enabled', True)):
                 return
             attempts=max(1,min(2,int(getattr(receipt,'attempts',1) or 1)))
             state['consecutive_failures']=state.get('consecutive_failures',0)+attempts
+            if chat:
+                state['recovery_chat'] = chat
+            state['last_send_error'] = str(receipt.error or '')[:240]
             self._save(account,state)
             self.record(account,'send_failed',
                         f'发送在提交前失败；本次明确失败尝试 {attempts} 次')
-            if state['consecutive_failures'] >= 2:
-                self.hold(account,'failure_circuit','连续2次明确发送失败，已暂停回复，请核对微信和服务状态后恢复')
+            if state['consecutive_failures'] >= 2 or state.get('recovery_status') == 'awaiting_send':
+                if (getattr(settings, 'send_auto_recovery_enabled', True)
+                        and not state.get('recovery_used') and not state.get('hold_reason')):
+                    state.update(recovery_status='pending', recovery_requested_at=time.time(),
+                                 recovery_used=True, recovery_error='')
+                    self._save(account, state)
+                    self.record(account, 'ui_recovery_requested', '连续2次明确发送失败，准备返回微信主页面并刷新界面状态', chat=chat, level='info')
+                    callback = getattr(self, 'recovery_callback', None)
+                    if callback:
+                        callback()
+                elif state.get('recovery_status') not in ('pending', 'recovering'):
+                    self.hold(account, 'failure_circuit',
+                        '微信界面恢复后仍明确发送失败，已暂停；请在顶部“异常与恢复”处理'
+                        if state.get('recovery_used') else
+                        '连续2次明确发送失败，已暂停；请在顶部“异常与恢复”处理')
 
     def login_request(self, account, settings):
         if not settings.safety_enabled:

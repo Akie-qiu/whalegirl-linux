@@ -212,10 +212,8 @@ function renderRecords(rows) {
     if (row.error) { const error = document.createElement('p'); error.className = ['ignored','baseline','uncertain'].includes(row.state) ? 'hint' : 'error-text'; error.textContent = row.error; article.append(error); }
     if (row.state === 'uncertain') {
       const actions = document.createElement('div'); actions.className = 'row';
-      for (const [label, received] of [['微信已收到', true], ['确认未发送', false]]) {
-        const button = document.createElement('button'); button.className = 'secondary'; button.textContent = label;
-        button.onclick = () => action(button, async () => { await api('review', 'POST', { key: row.key, received }); await update(); notice('已记录核对结果，不会自动重发。'); }); actions.append(button);
-      }
+      const button = document.createElement('button'); button.className = 'secondary'; button.textContent = '在顶部“异常与恢复”统一核对';
+      button.onclick = () => window.recoveryCenter?.openIssues(); actions.append(button);
       article.append(actions);
     }
     box.append(article);
@@ -277,6 +275,7 @@ function renderState(s) {
     text('compact-mood-badge', (mood?.label || '🌊 平静摸鱼') + ' · 活力 ' + (mood?.energy ?? 58));
     text('compact-timing-badge', '⏱️ 耗时 ' + (timing.total_seconds == null ? '—' : timing.total_seconds.toFixed(1) + 's'));
   }
+  window.recoveryCenter?.stateUpdated(s);
 }
 function renderSafety(risk) {
   if (!risk) return;

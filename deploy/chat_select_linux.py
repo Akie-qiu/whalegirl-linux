@@ -577,6 +577,10 @@ def select_chat():
         if not re.fullmatch('[0-9a-f]{32}',nonce):raise ValueError('Invalid UI job identity')
         job_path=Path('/data/whalegirl-jobs')/(nonce+'.json')
         job_spec=json.loads(job_path.read_text())
+        if job_spec.get('operation') == 'reset_ui':
+            from native_recovery import run
+            run(job_path, target_id)
+            return {'ok':True, 'username':target_id, 'skipped':True}
         SKIP_MESSAGES = (str(job_spec.get('operation','')).startswith('moments_') or job_spec.get('operation') in ('send_sticker','send_image','open_chat') or
                          job_spec.get('operation')=='send_text' and not job_spec.get('quote_to'))
         if str(job_spec.get('operation', '')).startswith('moments_'):
