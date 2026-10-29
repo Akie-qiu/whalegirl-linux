@@ -443,7 +443,7 @@ class TiebaTools:
             self.service.enrich_busy = False
             await engine.close()
 
-    async def resolve(self, engine, messages, system, decision, first, generation, diagnostics, max_tokens, *, format_diagnostics=None):
+    async def resolve(self, engine, messages, system, decision, first, generation, diagnostics, max_tokens, *, format_diagnostics=None, history_out=None):
         """Only a requested read adds a model round trip; normal replies stay one call."""
         from .learning import merge_proposals
         history = list(messages)
@@ -494,6 +494,8 @@ class TiebaTools:
         diagnostics.update(tool_rounds=rounds, offered_meme_ids=sorted(allowed_ids))
         if proposals:
             decision['learning_proposals'] = proposals
+        if history_out is not None:
+            history_out[:] = history
         return decision
 
     def validate_share(self, first, request):
