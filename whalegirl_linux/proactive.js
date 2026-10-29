@@ -11,6 +11,17 @@
     <h3>文字与表情</h3>
     <div id="proactive-expression-slot" class="settings-grid"></div>
     <p class="hint">AI 统一决定说话、只发表情或穿插发送，积极性影响偏好，不保证固定比例；条数是上限，不是每次必须发满。</p>
+    <div class="settings-grid">
+      <label>文字搭配表情意愿 / 100<input id="sticker-text-pair-eagerness" type="number" min="0" max="100"><span class="hint">高：说完具体内容后，更愿意用表情补充语气。</span></label>
+      <label>只发表情意愿 / 100<input id="sticker-only-eagerness" type="number" min="0" max="100"><span class="hint">高：一个表情能接住时，少凑一句文字解释。</span></label>
+      <label>接表情、拍一拍的表情意愿 / 100<input id="sticker-reaction-eagerness" type="number" min="0" max="100"><span class="hint">高：更愿意用表情回应轻松的表情互动。</span></label>
+      <label>每轮最多原生表情 / 张<input id="sticker-max-per-reply" type="number" min="1" max="3"><span class="hint">仍受本轮总条数和账号额度限制，不要求每轮发满。</span></label>
+    </div>
+    <p class="hint">0～100 调整 AI 的表达偏好，不是程序随机发送的概率；0 表示不主动采用该方式，明确要求时仍可正常响应。</p>
+    <details><summary>群聊记录整理的表情风格参考 · 可编辑</summary>
+      <label>给 AI 的表达参考<textarea id="sticker-style-note" rows="5" maxlength="1200" placeholder="由管理员根据聊天记录整理的表达习惯，不放私人原话"></textarea></label>
+      <p class="hint">这段参考与上方设置一同保存，进入固定提示词；不启动后台学习任务，不要求 AI 统计次数或照抄群友台词。</p>
+    </details>
     <h3>临时安静</h3>
     <div class="settings-grid"><label>未指定时长时，安静多久 / 分钟<input id="quiet-default-minutes" type="number" min="1" max="1440"></label></div>
     <p class="hint">对机器人说“先安静一会儿”“安静半小时”即可临时潜水。期间明确 @、拍一拍或关键词唤醒，只答这一次；说“可以说话了”或到时恢复原规则。各群互不影响，聊天仍留作上下文。</p>
@@ -60,7 +71,8 @@
   const names = ['autonomy_enabled','participation','proactive_enabled','proactive_private_enabled','proactive_mentions_enabled','proactive_level',
     'proactive_per_day','proactive_chat_per_day','proactive_cooldown_minutes','proactive_decision_minutes',
     'proactive_idle_minutes','proactive_continuation_minutes','proactive_start_hour','proactive_end_hour','proactive_pause_hours',
-    'stickers_enabled','sticker_aggressiveness','sticker_cooldown_seconds','reply_max_parts','reply_part_interval','quiet_default_minutes'];
+    'stickers_enabled','sticker_aggressiveness','sticker_cooldown_seconds','reply_max_parts','reply_part_interval','quiet_default_minutes',
+    'sticker_text_pair_eagerness','sticker_only_eagerness','sticker_reaction_eagerness','sticker_max_per_reply','sticker_style_note'];
   let chosen = new Set(), strict = new Set(), latest = null, lastFetch = 0;
   function field(name) { return name==='sticker_cooldown_seconds' ? $('style-sticker-cooldown') : $(name.replaceAll('_','-')); }
   function populate() {

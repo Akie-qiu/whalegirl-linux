@@ -464,6 +464,8 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
         allowed = {name for name in Settings.model_fields if name.startswith('proactive_')}
         allowed.update({'autonomy_enabled', 'participation','stickers_enabled','sticker_aggressiveness',
                         'sticker_cooldown_seconds','reply_max_parts','reply_part_interval','quiet_default_minutes'})
+        allowed.update({'sticker_text_pair_eagerness','sticker_only_eagerness','sticker_reaction_eagerness',
+                        'sticker_max_per_reply','sticker_style_note'})
         if set(body.values) - allowed:
             raise HTTPException(400, '自主聊天设置包含未知参数')
         try:

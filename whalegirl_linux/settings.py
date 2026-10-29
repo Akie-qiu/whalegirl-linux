@@ -47,6 +47,11 @@ class Settings(BaseModel):
     sticker_aggressiveness: Literal['low','normal','high'] = 'normal'
     sticker_after_text: Literal['off','normal','high'] = 'high'
     sticker_pair_probability: int = Field(default=90, ge=0, le=100)
+    sticker_text_pair_eagerness: int = Field(default=90, ge=0, le=100)
+    sticker_only_eagerness: int = Field(default=75, ge=0, le=100)
+    sticker_reaction_eagerness: int = Field(default=90, ge=0, le=100)
+    sticker_max_per_reply: int = Field(default=1, ge=1, le=3)
+    sticker_style_note: str = Field(default='', max_length=1200)
     api_url: str = "https://api.deepseek.com/chat/completions"
     api_style: Literal['auto', 'openai', 'responses', 'anthropic'] = 'auto'
     reasoning_effort: Literal['default', 'low', 'medium', 'high'] = 'default'

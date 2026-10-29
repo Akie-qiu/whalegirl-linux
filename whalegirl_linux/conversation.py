@@ -42,7 +42,9 @@ def plan_actions(decision, choices, settings):
             continue
         if item.get('type') == 'sticker':
             sticker = item.get('id')
-            if isinstance(sticker,str) and sticker in choices and not any(a['type']=='sticker' for a in actions):
+            if (isinstance(sticker,str) and sticker in choices
+                    and sum(a['type']=='sticker' for a in actions)<settings.sticker_max_per_reply
+                    and not any(a['type']=='sticker' and a['id']==sticker for a in actions)):
                 actions.append({'type':'sticker','id':sticker,'display':'[原生表情] '+choices[sticker]})
         elif item.get('type') == 'text':
             value = item.get('text')
@@ -497,17 +499,31 @@ def sticker_static_prompt(settings):
         'high':'积极：接梗、开心、鼓励、安慰、害羞、拍一拍等情绪场景主动找贴切表情；文字回答后仍可用表情补充情绪，不要因为已经说了话就自动放弃表情。'
     }[settings.sticker_aggressiveness]
     capacity=settings.reply_max_parts if settings.chat_habits_enabled else 1
+    def willingness(value):
+        return ('不主动使用，明确要求时正常响应' if value==0 else '克制' if value<35 else
+                '自然选择' if value<70 else '积极考虑' if value<90 else '很积极，贴切时优先采用')
+    controls={'文字搭配表情':settings.sticker_text_pair_eagerness,
+              '只发表情代替文字':settings.sticker_only_eagerness,
+              '接表情或拍一拍':settings.sticker_reaction_eagerness}
+    choices='；'.join(f'{name} {value}/100（{willingness(value)}）' for name,value in controls.items())
+    note=settings.sticker_style_note.strip()
     return ('\n原生表情包是聊天里的非语言表达，优先把它当作情绪、语气或态度来理解和回应，不要把它当成需要介绍的图片。'
         '普通聊天中不要描述人物外观、动作、画面或图中文字，不要解释“这个表情表示什么”，也不要用“你发的这个表情……”起头；直接接当前话题，像真人用表情回应一样。'
         '只有对方明确问这张表情是什么、图上写了什么或画面内容时，才使用可用的画面资料作答；资料不全就说明看不清，不猜。'
-        '每轮最多一个原生表情，actions可按文字→表情→补一句排列；表情单独占一个动作，不写成文字描述，ID只能来自目录。明确要表情时优先合适表情。'
+        '每轮最多'+str(min(settings.sticker_max_per_reply,capacity))+'个原生表情，仍服从总动作上限；actions可按文字→表情→补一句排列，也可只有sticker。'
+        '只有sticker是完整有效的回复，不需要文字兜底；表情单独占一个动作，不写成文字描述，ID只能来自目录。明确要表情时优先合适表情。'
         '按情绪、画面和对方语气选，不贴切就不硬发；开心微笑不能代替安慰，尴尬不是害羞，反讽不是赞同，严肃求助先给有用回答，不塞卖萌表情。'
         '\n原生表情积极性：'+preference+
+        '\n表达方式意愿：'+choices+'。总体积极性是基础，这些项目细分具体表达方式；某项为0时不主动采用该方式，明确要求时可例外。'
+        '以上数值是偏好，不是程序抽签概率，也不是必须达到的比例；实际语气和人设优先。'
+        '只发表情意愿高时，轻松互动可让合适表情直接承担回应，不要先凑一句解释；搭配意愿高时，具体话语说完也可用表情延续语气；'
+        '接表情意愿高时，收到普通表情或拍一拍可用合适表情接住，不把表情当成待点评的图片。'
         '这只是选择偏好，不是固定发送比例。贴切的表情直接写入actions，由你决定是否需要文字及表情所在位置；'
         '不用另外提供sticker_suggestion，不要先输出备选再让程序抽签。一个表情已表达完整态度时可以只发它，文字已足够也可以不发表情。'
         '群聊仍不选亲吻、情侣示爱或性暗示，不绕过重复冷却、发送额度或表达边界。'
         + ('当前每轮动作上限为1，只能选择文字或表情。' if capacity<2 else
-           '本轮动作上限为'+str(capacity)+'条，这是上限，不是目标条数。'))
+           '本轮动作上限为'+str(capacity)+'条，这是上限，不是目标条数。')
+        + ('\n【根据群聊记录整理的表情表达参考】'+note if note else ''))
 
 
 def asks_sticker_content(text):
