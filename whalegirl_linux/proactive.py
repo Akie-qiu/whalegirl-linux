@@ -92,7 +92,8 @@ class ProactiveService:
             and chat in s.proactive_chat_ids
             and (chat.endswith('@chatroom') or s.proactive_private_enabled)
             and (chat not in s.trigger_only_chat_ids or chat in s.proactive_strict_chat_ids)
-            and self.chat_state(chat)['paused_until'] <= now)
+            and self.chat_state(chat)['paused_until'] <= now
+            and not self.runtime.chat_control.active(s.account_id,chat))
 
     def muted_people(self, chat, now=None):
         return {r[0] for r in self.store.db.execute("""SELECT subject FROM proactive_people
@@ -502,6 +503,7 @@ class ProactiveService:
                     job = self.runtime.images.get(row['image_job'])
                     row['image_state'] = job['state'] if job else 'missing'
         return {'enabled': self.config.settings.proactive_enabled, 'busy': self.busy, 'last_error': self.last_error,
+                'quiet':self.runtime.chat_control.snapshot(),
                 'runs': rows, 'chats': {chat: self.chat_state(chat) for chat in self.config.settings.proactive_chat_ids}}
 
     async def loop(self):

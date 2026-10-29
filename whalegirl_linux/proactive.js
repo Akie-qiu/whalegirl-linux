@@ -8,6 +8,12 @@
     <span class="pill" id="proactive-status">读取中</span></div>
     <h3>聊天方式</h3><div id="proactive-mode-slot"></div>
     <div id="proactive-participation-slot" class="settings-grid"></div>
+    <h3>文字与表情</h3>
+    <div id="proactive-expression-slot" class="settings-grid"></div>
+    <p class="hint">AI 统一决定说话、只发表情或穿插发送，积极性影响偏好，不保证固定比例；条数是上限，不是每次必须发满。</p>
+    <h3>临时安静</h3>
+    <div class="settings-grid"><label>未指定时长时，安静多久 / 分钟<input id="quiet-default-minutes" type="number" min="1" max="1440"></label></div>
+    <p class="hint">对机器人说“先安静一会儿”“安静半小时”即可临时潜水。期间明确 @、拍一拍或关键词唤醒，只答这一次；说“可以说话了”或到时恢复原规则。各群互不影响，聊天仍留作上下文。</p>
     <p class="hint" id="proactive-pacing-note"></p>
     <h3>主动开聊</h3>
     <div class="settings-grid">
@@ -35,7 +41,7 @@
     群成员说忙时不主动点名；要求暂停时暂不主动开聊，普通被动回复不受此开关影响。</p>
     <div id="proactive-chatlist" class="chatlist"></div>
     <div class="panel-footer"><span id="proactive-save-note" class="hint">新增功能默认关闭</span>
-      <button id="save-proactive" class="primary">保存聊天设置</button></div>
+      <button id="save-proactive" class="primary">保存全部聊天设置</button></div>
     <div class="section-top"><h3>最近主动判断</h3><button id="refresh-proactive" class="secondary">刷新记录</button></div>
     <p class="hint">记录显示简短依据、使用的消息／记忆编号和实际发送状态。主动调度不冒充收到的微信消息，也不写成人物事实。</p>
     <div id="proactive-runs"></div>`;
@@ -44,13 +50,19 @@
   const participation = $('participation').closest('label'), previousRow = participation.parentElement;
   $('proactive-participation-slot').append(participation);
   if (previousRow.children.length === 1) previousRow.firstElementChild.style.gridColumn = '1 / -1';
+  for (const id of ['stickers-enabled','sticker-aggressiveness','reply-max-parts','reply-part-interval','style-sticker-cooldown']) {
+    const label = $(id).closest('label'), previous = label.parentElement;
+    $('proactive-expression-slot').append(label);
+    if (!previous.children.length) previous.hidden = true;
+  }
   const link = document.createElement('a'); link.href = '#proactive-panel'; link.textContent = '自主与主动聊天';
   document.querySelector('nav').append(link);
   const names = ['autonomy_enabled','participation','proactive_enabled','proactive_private_enabled','proactive_mentions_enabled','proactive_level',
     'proactive_per_day','proactive_chat_per_day','proactive_cooldown_minutes','proactive_decision_minutes',
-    'proactive_idle_minutes','proactive_continuation_minutes','proactive_start_hour','proactive_end_hour','proactive_pause_hours'];
+    'proactive_idle_minutes','proactive_continuation_minutes','proactive_start_hour','proactive_end_hour','proactive_pause_hours',
+    'stickers_enabled','sticker_aggressiveness','sticker_cooldown_seconds','reply_max_parts','reply_part_interval','quiet_default_minutes'];
   let chosen = new Set(), strict = new Set(), latest = null, lastFetch = 0;
-  function field(name) { return $(name.replaceAll('_','-')); }
+  function field(name) { return name==='sticker_cooldown_seconds' ? $('style-sticker-cooldown') : $(name.replaceAll('_','-')); }
   function populate() {
     for (const name of names) {
       const input = field(name);
@@ -96,7 +108,18 @@
         latest = await api('proactive/pause', 'POST', {chat:id, resume:paused});
         chatLabels(); notice(paused ? '主动联系暂停已解除，仍遵守授权、冷却和额度' : '已暂停此会话的主动联系');
       });
-      row.append(p, button); box.append(row);
+      const quiet = latest?.quiet?.[id];
+      const quietLine = document.createElement('p'); quietLine.className = 'hint';
+      quietLine.textContent = quiet?.active ? (quiet.until < 0 ? '临时静默 · 等待明确恢复' : '临时静默至 ' + new Date(quiet.until*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'})) + ' · 明确唤醒只答本次' : '正常参与 · 按当前唤醒和自主聊天规则';
+      const quietButton = document.createElement('button'); quietButton.className = 'secondary';
+      quietButton.textContent = quiet?.active ? '恢复此会话聊天' : '让此会话安静一会儿';
+      quietButton.onclick = () => action(quietButton,async () => {
+        latest = await api('chat-control','POST',{chat:id,op:quiet?.active?'resume':'quiet',minutes:cfg.quiet_default_minutes ?? 30});
+        chatLabels(); notice(quiet?.active ? '已解除静默，恢复原来的聊天规则' : '已临时静默；明确唤醒仍可回答本次');
+      });
+      const advanced = document.createElement('details'), summary = document.createElement('summary');
+      summary.textContent = '单独暂停主动联系';advanced.append(summary,p,button);
+      row.append(quietLine,quietButton,advanced); box.append(row);
     }
     if (!cfg.allowed_chat_ids.length) box.textContent = '先在“会话与唤醒”授权群聊或联系人';
   }
@@ -128,16 +151,22 @@
     const values = {};
     for (const name of names) {
       const input = field(name); values[name] = input.type === 'checkbox' ? input.checked : input.type === 'number' ? Number(input.value) : input.value;
+      if (!input.checkValidity()) throw new Error('请检查聊天设置中的数值范围');
     }
     values.proactive_chat_ids = [...chosen].filter(id => cfg.allowed_chat_ids.includes(id));
     values.proactive_strict_chat_ids = [...strict].filter(id => values.proactive_chat_ids.includes(id));
     cfg = await api('proactive/config', 'POST', {values});
     populate(); await refresh(true);
     window.dispatchEvent(new CustomEvent('whalegirl-panel-saved', {detail:'proactive-panel'}));
-    if (announce) notice('聊天模式、参与程度和主动开聊设置已一起保存');
+    if (announce) notice('聊天参与、文字表情、静默时长和主动开聊设置已统一保存');
   }
   $('save-proactive').onclick = () => action($('save-proactive'), () => save());
   $('refresh-proactive').onclick = () => action($('refresh-proactive'), () => refresh(true));
+  for (const name of names) field(name).addEventListener('input',() => text('proactive-save-note','有未保存的修改'));
+  $('stickers-enabled').onchange = () => {
+    $('sticker-aggressiveness').disabled = !$('stickers-enabled').checked;
+    text('proactive-save-note','有未保存的修改');
+  };
   window.proactiveChat = {populate, chatLabels, refresh, save};
   // This deferred script can arrive after the initial config request finishes.
   if (cfg) {

@@ -699,6 +699,9 @@ class TiebaService:
             return False
         now = time.time()
         for chat, pending in list(self.context_pending.items()):
+            if self.runtime.chat_control.active(s.account_id,chat):
+                self.context_pending.pop(chat,None)
+                continue
             if now-pending['started'] > 90 or not self.share_permission(chat, s.account_id)['ok']:
                 self.context_pending.pop(chat, None)
                 continue
@@ -772,6 +775,9 @@ class TiebaService:
             ORDER BY created LIMIT 20""", (s.account_id,)).fetchall()
         for raw in rows:
             row = dict(raw)
+            if r.chat_control.active(s.account_id,row['chat']):
+                self.execute("UPDATE tieba_shares SET state='cancelled',error='会话临时静默，取消旧主动分享' WHERE id=?",(row['id'],))
+                continue
             if (row['chat'] not in s.allowed_chat_ids or row['chat'] not in s.tieba_share_chat_ids
                     or not self.retention.active(row['tid']) or not self.discovery_allowed(row)
                     or time.time() - row['created'] > 6 * 3600):
@@ -789,7 +795,7 @@ class TiebaService:
             auth = await r.gateway.status_for_send()
             s = self.config.settings
             if (not self.current(row['account']) or not s.tieba_share_enabled or not s.enabled
-                    or not self.discovery_allowed(row)
+                    or not self.discovery_allowed(row) or r.chat_control.active(s.account_id,row['chat'])
                     or row['chat'] not in s.allowed_chat_ids or row['chat'] not in s.tieba_share_chat_ids
                     or auth.get('status') != 'logged_in' or auth.get('loggedInUser') != s.account_id):
                 return False

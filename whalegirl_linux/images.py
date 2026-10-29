@@ -587,6 +587,11 @@ class ImageService:
         return self.generating or self.dispatching
 
     def check_proactive_permission(self, job):
+        control=getattr(self.runtime,'chat_control',None)
+        if control and job.get('destination')=='chat' and job.get('source_key'):
+            source=self.store.get(job['source_key'].split('#',1)[0])
+            if source and not control.allowed(source):
+                raise ValueError('会话临时静默，图片保留在图库，不继续发送旧任务')
         if not job.get('source_key', '').startswith('proactive:'):
             return
         identity = job['source_key'].split('#', 1)[0].removeprefix('proactive:')

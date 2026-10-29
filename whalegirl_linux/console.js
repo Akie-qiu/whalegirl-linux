@@ -381,9 +381,8 @@ $('save-chats').onclick = () => action($('save-chats'), async () => {
   const restricted = [...modes].filter(([id, mode]) => id.endsWith('@chatroom') && mode === 'trigger').map(([id]) => id);
   await saveSubset({ allowed_chat_ids: [...selected], trigger_only_chat_ids: restricted,
     natural_group_replies: true, require_mention_or_keyword: true, keywords,
-    stickers_enabled: $('stickers-enabled').checked, quote_replies_enabled: $('quotes-enabled').checked,
+    quote_replies_enabled: $('quotes-enabled').checked,
     group_mentions_enabled: $('group-mentions-enabled').checked,
-    sticker_aggressiveness: $('sticker-aggressiveness').value,
     global_memory: $('global-memory').checked,
     vision_enabled: $('vision-enabled').checked, context_messages: Number($('context-count').value) });
   text('chat-save-note', '会话设置已保存 · ' + new Date().toLocaleTimeString('zh-CN')); notice('会话与唤醒设置已保存。');

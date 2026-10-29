@@ -23,7 +23,7 @@
   const stickerCooldownLabel=element('label','','同一表情候选冷却 / 秒'),stickerCooldown=element('input');
   stickerCooldown.type='number';stickerCooldown.id='style-sticker-cooldown';stickerCooldown.min=0;stickerCooldown.max=3600;stickerCooldown.step=1;
   stickerCooldownLabel.append(stickerCooldown,element('span','hint','近期发过的同一表情暂不参与候选；运行保护中的重复内容限制仍独立生效。'));styleBox.append(stickerCooldownLabel);
-  const pairingHint=element('p','hint','文字与表情由 AI 在同一份发送计划里决定，可以只说话、只发表情或自然穿插；程序不再按概率补表情。表情积极性统一在“会话与唤醒”调整，发送条数上限在“聊天习惯”调整，群聊仍保持朋友语气。');
+  const pairingHint=element('p','hint','文字、表情积极性、发送条数与表情冷却已统一在“自主与主动聊天”设置；这里仅保存说话风格和人设参数。');
   styleBox.append(pairingHint);
   const conversationSection=element('section','span-all');
   conversationSection.style.gridColumn='1 / -1';conversationSection.style.minWidth='0';
@@ -99,16 +99,14 @@
   $('habits-panel').querySelector('.section-top').after(humanLikeSection);
   const saveStyleBtn=button('保存说话风格与真人感设置',async()=>{
     const values={};for(const n of Object.keys(styleFields))values[n]=$('style-'+n).value;
-    if(!stickerCooldown.checkValidity())throw new Error('同一表情候选冷却需在 0～3600 秒之间');
     if(!halfLifeInput.checkValidity())throw new Error('小情绪半衰期需在 5～180 分钟之间');
-    values.sticker_cooldown_seconds=Number(stickerCooldown.value);
     values.mood_engine_enabled=moodCheck.checked;
     values.daily_life_theater_enabled=lifeCheck.checked;
     values.anti_formula_guard_enabled=antiCheck.checked;
     values.chime_in_ultra_short=chimeCheck.checked;
     values.mood_volatility=volSelect.value;
     values.mood_half_life_minutes=Number(halfLifeInput.value);
-    await saveSubset(values);notice('说话风格、真人感状态与配表情设置已保存，下一轮生效');
+    await saveSubset(values);notice('说话风格与真人感设置已保存，下一轮生效');
   });
   saveStyleBtn.id='save-style-settings';
   styleBox.append(saveStyleBtn);

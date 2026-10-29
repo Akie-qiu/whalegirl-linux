@@ -201,7 +201,7 @@
     const values={chat_habits_enabled:$('chat-habits-enabled').checked,
       followup_wait_enabled:$('followup-wait-enabled').checked,
       interest_keywords:$('interest-keywords').value.split('\n').map(x=>x.trim()).filter(Boolean),repeat_probability:Number($('repeat-probability').value)/100};
-    for (const name of numeric.filter(n=>!n.includes('_per_'))) values[name]=Number(field(name).value);
+    for (const name of numeric.filter(n=>!n.includes('_per_') && !['reply_max_parts','reply_part_interval'].includes(n))) values[name]=Number(field(name).value);
     await saveSubset(values);notice('聊天习惯已保存，下一轮生效。');
   });
   $('save-web-search').onclick = () => action($('save-web-search'),async () => {

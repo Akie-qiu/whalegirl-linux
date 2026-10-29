@@ -92,6 +92,13 @@ class ProactivePauseRequest(BaseModel):
     resume: bool = False
 
 
+class ChatQuietRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    chat: str = Field(min_length=1,max_length=200)
+    op: str = Field(pattern='^(quiet|resume)$')
+    minutes: float | None = Field(default=None,ge=0,le=10080)
+
+
 class LoginRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
     password: str = Field(min_length=1,max_length=1024)
@@ -455,7 +462,8 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     @app.post('/api/proactive/config')
     async def proactive_config(body: ProactiveConfigRequest):
         allowed = {name for name in Settings.model_fields if name.startswith('proactive_')}
-        allowed.update({'autonomy_enabled', 'participation'})
+        allowed.update({'autonomy_enabled', 'participation','stickers_enabled','sticker_aggressiveness',
+                        'sticker_cooldown_seconds','reply_max_parts','reply_part_interval','quiet_default_minutes'})
         if set(body.values) - allowed:
             raise HTTPException(400, '自主聊天设置包含未知参数')
         try:
@@ -475,6 +483,14 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
             runtime.proactive.pause(body.chat, body.resume)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
+        return runtime.proactive.snapshot()
+
+    @app.post('/api/chat-control')
+    async def chat_control(body: ChatQuietRequest):
+        try:
+            runtime.chat_control.apply(body.chat,body.op,body.minutes)
+        except ValueError as exc:
+            raise HTTPException(400,str(exc)) from exc
         return runtime.proactive.snapshot()
 
     @app.post('/api/tieba/config')
