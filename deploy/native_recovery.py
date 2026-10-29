@@ -1,9 +1,53 @@
 """Return native WeChat to its chat surface inside the gateway GUI guard."""
 import json
+import hashlib
 from pathlib import Path
+import re
+import shutil
 import time
 
 ROOT = Path('/data/whalegirl-jobs')
+STORAGE_WARNING_SIZE = (282, 310)
+STORAGE_WARNING_RGB = 'ed4c15aaed191e7da91fb959233800984307d130badb3ec5853b379d68214fdc'
+
+
+def active_modal(ui):
+    """This client does not expose every modal through AT-SPI."""
+    active=ui.run_process(['xdotool','getactivewindow'],capture_output=True,text=True,timeout=3)
+    window=active.stdout.strip()
+    if active.returncode or not window.isdigit():return None
+    owner=ui.run_process(['xdotool','getwindowpid',window],capture_output=True,text=True,timeout=3)
+    client=ui.run_process(['pgrep','-xo','wechat'],capture_output=True,text=True,timeout=3)
+    if owner.returncode or client.returncode or owner.stdout.strip()!=client.stdout.strip():return None
+    props=ui.run_process(['xprop','-id',window,'_NET_WM_STATE'],capture_output=True,text=True,timeout=3)
+    if '_NET_WM_STATE_MODAL' not in props.stdout:return None
+    geometry=ui.run_process(['xdotool','getwindowgeometry','--shell',window],capture_output=True,text=True,check=True,timeout=3)
+    values=dict(re.findall(r'^(X|Y|WIDTH|HEIGHT)=(-?\d+)$',geometry.stdout,re.M))
+    if len(values)!=4:raise ValueError('无法读取微信弹窗位置')
+    return {'window':window,**{k:int(v) for k,v in values.items()}}
+
+
+def resolve_modal(ui):
+    modal=active_modal(ui)
+    if modal is None:return False
+    if (modal['WIDTH'],modal['HEIGHT'])!=STORAGE_WARNING_SIZE:
+        raise ValueError('微信仍有弹窗遮挡聊天，需要先处理弹窗')
+    if shutil.disk_usage(ROOT).free<1024**3:
+        raise ValueError('磁盘空间仍不足，保留微信提示，请先释放至少1GB可用空间')
+    capture=ui.run_process(['ffmpeg','-hide_banner','-loglevel','error','-f','x11grab','-draw_mouse','0',
+        '-video_size','282x310','-i',':99.0+'+str(modal['X'])+','+str(modal['Y']),
+        '-frames:v','1','-threads','1','-pix_fmt','rgb24','-f','rawvideo','pipe:1'],
+        capture_output=True,check=True,timeout=5)
+    if len(capture.stdout)!=282*310*3 or hashlib.sha256(capture.stdout).hexdigest()!=STORAGE_WARNING_RGB:
+        raise ValueError('微信有未识别的弹窗，不能自动关闭，请先在微信中处理')
+    # The verified pinned-client bitmap is the resolved storage warning only.
+    # Its lower button dismisses today's notice without opening storage settings.
+    ui.run_process(['/opt/tools/click',str(modal['X']+141),str(modal['Y']+261)],
+                   check=True,timeout=3)
+    time.sleep(.15)
+    if active_modal(ui) is not None:
+        raise ValueError('微信弹窗尚未关闭，聊天界面未恢复')
+    return True
 
 
 def chat_navigation(ui, root):
@@ -27,6 +71,7 @@ def chat_navigation(ui, root):
 
 
 def reset_surface(ui):
+    storage_dismissed=resolve_modal(ui)
     root = ui.tree()
     moments = [n for n in ui.walk(root) if n.get('role') == 'frame' and n.get('name') == 'Moments']
     if moments:
@@ -47,7 +92,9 @@ def reset_surface(ui):
     lists = [n for n in ui.walk(root) if n.get('role') == 'list' and n.get('name') == 'Chats']
     if len(lists) != 1 or not (lists[0].get('bounds') or {}).get('width'):
         raise ValueError('未能确认微信聊天主界面')
-    return {'main_ready': True}
+    if active_modal(ui) is not None:
+        raise ValueError('微信仍有弹窗遮挡聊天，不能确认界面恢复')
+    return {'main_ready': True,'storage_warning_dismissed':storage_dismissed}
 
 
 def run(path, target_id):

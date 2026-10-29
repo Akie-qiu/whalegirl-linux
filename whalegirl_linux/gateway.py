@@ -78,10 +78,17 @@ class AgentGateway:
         private_write(path,json.dumps({'operation':operation,'chat':chat,'created':time.time(),**values},ensure_ascii=False))
         response=await self.client.post(f"/api/chats/{quote(chat+'::whalejob::'+nonce,safe='')}/open",params={'clearUnreads':'false'},timeout=35)
         response.raise_for_status();value=response.json()
-        if value.get('ok') is not True:
-            saved=json.loads(path.read_text())
-            raise UIJobError(str(saved.get('error') or value.get('error') or 'Native UI job failed')[:200],saved.get('state',''))
         result = json.loads(path.read_text())
+        if value.get('ok') is not True:
+            completed=(operation=='reset_ui' and result.get('state')=='recovered' and result.get('main_ready') is True
+                       or operation=='open_chat' and result.get('state')=='done')
+            if (value.get('error')=='No action selected' and completed and result.get('operation')==operation
+                    and result.get('chat')==chat and not result.get('error')):
+                # The native task can finish before the upstream planner runs
+                # out of actions. Only navigation/recovery may use this receipt.
+                result['transport_warning']='planner_exhausted_after_native_completion'
+            else:
+                raise UIJobError(str(result.get('error') or value.get('error') or 'Native UI job failed')[:200],result.get('state',''))
         result['job_id'] = nonce
         return result
 
