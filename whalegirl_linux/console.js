@@ -192,7 +192,8 @@ function renderRecords(rows) {
     const article = document.createElement('article'); article.className = 'record';
     const top = document.createElement('div'); top.className = 'record-top';
     const who = document.createElement('strong'); who.textContent = row.sender + ' · ' + chatName(row.chat);
-    const status = document.createElement('span'); status.textContent = (recordLabels[row.state] || row.state) + ' · ' + new Date(row.updated * 1000).toLocaleString('zh-CN', { hour12: false });
+    const mediaWaiting = row.state === 'queued' && (row.error || '').startsWith('图片加载中');
+    const status = document.createElement('span'); status.textContent = (mediaWaiting ? '等待图片传输' : recordLabels[row.state] || row.state) + ' · ' + new Date(row.updated * 1000).toLocaleString('zh-CN', { hour12: false });
     top.append(who, status); article.append(top);
     for (const [content, isReply] of [[row.content, false], [row.reply, true]]) {
       if (!content) continue;
@@ -209,7 +210,7 @@ function renderRecords(rows) {
       detail.textContent=(item.kind==='sticker'?'表情包':item.kind==='image'?'图片':'文字')+'：'+(recordLabels[item.state] || item.state)+(d.attempts?' · 尝试 '+d.attempts+' 次':'')+(d.confirmation==='native_poll'?' · 已由后续消息确认':'')+(item.error?' · '+item.error:'');
       article.append(detail);
     }
-    if (row.error) { const error = document.createElement('p'); error.className = ['ignored','baseline','uncertain'].includes(row.state) ? 'hint' : 'error-text'; error.textContent = row.error; article.append(error); }
+    if (row.error) { const error = document.createElement('p'); error.className = mediaWaiting || ['ignored','baseline','uncertain'].includes(row.state) ? 'hint' : 'error-text'; error.textContent = row.error; article.append(error); }
     if (row.state === 'uncertain') {
       const actions = document.createElement('div'); actions.className = 'row';
       const button = document.createElement('button'); button.className = 'secondary'; button.textContent = '在顶部“异常与恢复”统一核对';

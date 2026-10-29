@@ -40,8 +40,23 @@ def line(row, labels, *, max_chars=None):
     return f"[{when}｜{labels.get(row['chat'], row['chat'])}｜{author}｜消息{row['local_id']}] {clip(text,max_chars or (12000 if row['kind']==49 else 1400))}"
 
 
-async def build_context(store, gateway, settings, first, batch, labels, *, initiative=False):
-    context_started=time.monotonic();image_seconds=0.0
+def complete_image_bytes(media):
+    """Reject incomplete files and viewport crops before they become vision input."""
+    data=media.get('data') or ''
+    if not data or len(data)>12*1024*1024 or media.get('partial'):
+        return b''
+    try:
+        raw=base64.b64decode(data,validate=True)
+        with Image.open(BytesIO(raw)) as image:
+            image.load()
+        return raw
+    except (ValueError,OSError,SyntaxError):
+        return b''
+
+
+async def build_context(store, gateway, settings, first, batch, labels, *, initiative=False,
+                        defer_unready=False):
+    context_started=time.monotonic();image_seconds=0.0;pending_images=0
     context_limit=settings.context_messages
     stride=max(1,min(8,context_limit//4))
     pool = store.conversation(first['account'], first['chat'], context_limit + stride)
@@ -137,7 +152,7 @@ async def build_context(store, gateway, settings, first, batch, labels, *, initi
                         source=store.find_message(first['account'],first['chat'],ref.get('serverId',''))
                 except Exception:pass
             if source and source['kind']==ref['type']:references.append(source)
-            else:unresolved=True
+            else:unresolved=True;pending_images+=1
         # Plain text must not reopen a previous image on every reply, nor when asking the bot to send/draw images.
         asking_bot_image = bool(
             re.search(
@@ -189,27 +204,32 @@ async def build_context(store, gateway, settings, first, batch, labels, *, initi
             image_started=time.monotonic()
             try:
                 media = store.cached_image(row['key'])
-                if initiative and not media.get('data'):
+                # A rendered thumbnail is a provisional fallback, not a permanent
+                # replacement for a photo that was still downloading last time.
+                raw=(complete_image_bytes(media)
+                     if media.get('quality')!='visible_chat_thumbnail' else b'')
+                if initiative and not raw:
                     # Autonomous opportunities must not navigate or scroll
                     # WeChat to fetch old images and block regular replies.
                     continue
-                if not media:
+                if not raw:
                     try:
                         media = await gateway.media(row['chat'], row['local_id'],kind=row['kind'],server_id=row['key'].rsplit('/',1)[-1])
                     except Exception:
                         media = {}
-                data = media.get('data') or ''
+                    raw=complete_image_bytes(media)
                 # Clipboard/viewport failures are recoverable via the exact row's
                 # rendered thumbnail; they must not suppress the fallback itself.
-                if not data:
+                if not raw and not defer_unready:
                     media = await gateway.visible_media(row['chat'],row['local_id'],row['kind'],
                         message_time=row['timestamp'],server_id=row['key'].rsplit('/',1)[-1])
-                    data = media.get('data') or ''
-                if not data or len(data)>12*1024*1024:
+                    raw=complete_image_bytes(media)
+                if not raw:
+                    pending_images+=1
                     reason='原图尚未出现在当前可见消息中' if media.get('quality')=='not_visible' else '未取得对应原图或可见缩略图；可能未同步或已过期'
-                    store.media_result(row['key'],'unavailable',reason)
+                    store.media_result(row['key'],'loading' if defer_unready else 'unavailable',reason)
                     continue
-                raw = base64.b64decode(data, validate=True)
+                data=media['data']
                 if raw.startswith(b'\x89PNG\r\n\x1a\n'):mime='image/png'
                 elif raw.startswith(b'\xff\xd8\xff'):mime='image/jpeg'
                 elif raw.startswith((b'GIF87a',b'GIF89a')):mime='image/gif'
@@ -231,13 +251,15 @@ async def build_context(store, gateway, settings, first, batch, labels, *, initi
                     im.thumbnail((1600,1600))
                     stream=BytesIO();im.save(stream,'JPEG',quality=87)
                     data=base64.b64encode(stream.getvalue()).decode();mime='image/jpeg'
-                store.cache_image(row['key'],media)
+                if media.get('quality')!='visible_chat_thumbnail':
+                    store.cache_image(row['key'],media)
                 store.media_result(row['key'],'ready',media.get('quality','native_cache'))
                 quality_note = '；这是微信可见缩略图，可能有裁切，只描述实际可见部分' if media.get('quality')=='visible_chat_thumbnail' else ''
                 blocks.append({'type':'text','text':f"图片来源 key={row['key']}；{line(row, labels)}{quality_note}"})
                 blocks.append({'type':'image_url','image_url':{'url':f'data:{mime};base64,{data}'}})
                 attachments.append(row['key'])
             except Exception as exc:
+                pending_images+=1
                 store.media_result(row['key'],'failed',type(exc).__name__)
                 continue
             finally:
@@ -248,6 +270,7 @@ async def build_context(store, gateway, settings, first, batch, labels, *, initi
             blocks[0]['text'] += '\n本轮已附上对应消息的真实图片。此前聊天中的“图未加载”是旧状态；现在按本轮实际图像回答，不要沿用旧的读取失败说法。'
     return [{'role':'user','content':blocks if attachments else blocks[0]['text']}], attachments, {
         'current_messages':len(recent),'recalled_messages':len(memory),'images':len(attachments),
+        'pending_images':pending_images,
         'selected_history_messages':len(history_rows),'context_mode':context_mode,
         'context_truncated_messages':truncated,
         'digest_included':digest_relevant,'image_seconds':round(image_seconds,3),

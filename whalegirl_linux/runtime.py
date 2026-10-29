@@ -93,6 +93,7 @@ class Runtime:
         # never implemented by sleeping inside the global worker lock.
         self.followup_waits = {}
         self.followup_ready = {}
+        self.media_waits = {}
         self.followup_tools_disabled_generation = -1
         self.chat_labels = {}
         self.last_timing = {}
@@ -399,7 +400,7 @@ class Runtime:
         settings = self.config.settings
         if not settings.enabled or self.paused_reason or self.safety.held(settings.account_id):
             return False
-        exclude_chats = set(exclude_chats) | self.autonomy.waiting_chats() | {
+        exclude_chats = set(exclude_chats) | self.autonomy.waiting_chats() | self._media_waiting_chats() | {
             chat for chat, task in self.followup_waits.items() if not task.done()
         }
         first = self.store.queue(exclude_chats=exclude_chats)
@@ -496,8 +497,28 @@ class Runtime:
             for item in additions:self.store.update(item['key'],'merged')
             batch+=additions
             event['content']='\n'.join(f"[{m['sender']}] {m['content']}" for m in batch)[:5000]
-        messages, image_keys, context_counts = await build_context(self.store,self.gateway,settings,first,batch,self.chat_labels)
+        media_wait=self.media_waits.get(first['chat'],{})
+        can_wait=(media_wait.get('attempts',0)<2 and
+                  time.monotonic()<media_wait.get('deadline',float('inf')) and
+                  time.time()-first['timestamp']<75)
+        messages, image_keys, context_counts = await build_context(
+            self.store,self.gateway,settings,first,batch,self.chat_labels,defer_unready=can_wait)
         timing.update(context_counts)
+        if context_counts.get('pending_images') and can_wait:
+            attempt=media_wait.get('attempts',0)
+            self.media_waits[first['chat']]={
+                'key':key,'attempts':attempt+1,
+                'deadline':media_wait.get('deadline',time.monotonic()+30),
+                'retry_at':time.monotonic()+(2 if attempt==0 else 5),
+            }
+            for item in batch:
+                self.store.update(item['key'],'queued',error='图片加载中，等待传输完成后自动重读')
+            # No model request or outgoing action has happened. Yield the worker
+            # so another conversation can reply while this photo downloads.
+            self.processing=''
+            self.processing_key=''
+            return True
+        self.media_waits.pop(first['chat'],None)
         mention_choices = {}
         mentions_enabled = settings.group_mentions_enabled and first['chat'].endswith('@chatroom')
         if mentions_enabled and hasattr(self.gateway,'group_members'):
@@ -1005,6 +1026,20 @@ class Runtime:
             return result
         finally:
             self.tieba.cancel_planned(first['key'])
+
+    def _media_waiting_chats(self):
+        now=time.monotonic()
+        waiting=set()
+        for chat,wait in list(self.media_waits.items()):
+            source=self.store.get(wait['key'])
+            if (not source or source['state']!='queued'
+                    or source['account']!=self.config.settings.account_id
+                    or chat not in self.config.settings.allowed_chat_ids
+                    or not self.chat_control.allowed(source)):
+                self.media_waits.pop(chat,None)
+            elif wait['retry_at']>now:
+                waiting.add(chat)
+        return waiting
 
     async def debounce(self,first,settings,generation):
         batch=self.store.queued_chat(first['account'],first['chat'])
