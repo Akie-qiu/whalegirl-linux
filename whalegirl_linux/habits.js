@@ -91,7 +91,8 @@
   $('autonomy-enabled').onchange = async () => {
     const control = $('autonomy-enabled'); const value = control.checked; control.disabled = true;
     try {
-      await saveSubset({autonomy_enabled:value});
+      if (window.proactiveChat?.save) await window.proactiveChat.save(false);
+      else await saveSubset({autonomy_enabled:value});
       notice(value ? '已切换到新版自主聊天。' : '已切回旧版回复逻辑，接续意图与新版旁听学习已暂停。');
       if ($('autonomy-details').open) await refreshAutonomy();
     } catch (error) {
@@ -199,7 +200,6 @@
   $('save-habits').onclick = () => action($('save-habits'),async () => {
     const values={chat_habits_enabled:$('chat-habits-enabled').checked,
       followup_wait_enabled:$('followup-wait-enabled').checked,
-      participation:$('participation').value,
       interest_keywords:$('interest-keywords').value.split('\n').map(x=>x.trim()).filter(Boolean),repeat_probability:Number($('repeat-probability').value)/100};
     for (const name of numeric.filter(n=>!n.includes('_per_'))) values[name]=Number(field(name).value);
     await saveSubset(values);notice('聊天习惯已保存，下一轮生效。');

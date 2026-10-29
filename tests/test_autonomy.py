@@ -172,6 +172,39 @@ class AutonomyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(config.settings.context_messages, 40)
                 self.assertEqual(config.settings.proactive_chat_ids, [])
 
+    async def test_unified_chat_settings_save_mode_and_contact_choices_together(self):
+        app = create_app(self.folder/'unified', gateway=habit_fixtures.Gateway(),
+                         engine_factory=Engine, run_background=False)
+        config = app.state.config
+        config.save(Settings(account_id='account',allowed_chat_ids=['room@chatroom'],
+            autonomy_enabled=True,proactive_enabled=True,proactive_chat_ids=['room@chatroom']))
+        headers = {'Authorization':'Bearer '+config.admin_token,'Origin':'http://127.0.0.1'}
+        with TestClient(app) as client:
+            response = client.post('/api/proactive/config',headers=headers,json={'values':{
+                'autonomy_enabled':False,'participation':'quiet','proactive_enabled':True,
+                'proactive_per_day':17,'proactive_chat_ids':['room@chatroom']}})
+            self.assertEqual(response.status_code,200)
+            self.assertFalse(config.settings.autonomy_enabled)
+            self.assertTrue(config.settings.proactive_enabled)
+            self.assertEqual(config.settings.proactive_chat_ids,['room@chatroom'])
+            self.assertEqual(config.settings.participation,'quiet')
+            self.assertEqual(config.settings.proactive_per_day,17)
+            self.assertEqual(config.settings.context_messages,40)
+            self.assertTrue(config.settings.memory_enabled)
+
+    async def test_invalid_unified_contact_selection_does_not_partially_switch_modes(self):
+        app = create_app(self.folder/'invalid-unified',gateway=habit_fixtures.Gateway(),
+                         engine_factory=Engine,run_background=False)
+        config = app.state.config
+        config.save(Settings(account_id='account',allowed_chat_ids=['room@chatroom'],autonomy_enabled=True))
+        before = config.settings.model_dump()
+        headers = {'Authorization':'Bearer '+config.admin_token,'Origin':'http://127.0.0.1'}
+        with TestClient(app) as client:
+            response = client.post('/api/proactive/config',headers=headers,json={'values':{
+                'autonomy_enabled':False,'participation':'active','proactive_chat_ids':['unknown']}})
+            self.assertEqual(response.status_code,400)
+            self.assertEqual(config.settings.model_dump(),before)
+
 
 class AutonomousProactiveTests(unittest.IsolatedAsyncioTestCase):
     message = proactive_fixtures.ProactiveTests.message

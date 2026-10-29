@@ -437,6 +437,7 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     @app.post('/api/proactive/config')
     async def proactive_config(body: ProactiveConfigRequest):
         allowed = {name for name in Settings.model_fields if name.startswith('proactive_')}
+        allowed.update({'autonomy_enabled', 'participation'})
         if set(body.values) - allowed:
             raise HTTPException(400, '自主聊天设置包含未知参数')
         try:

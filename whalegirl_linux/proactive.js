@@ -3,11 +3,14 @@
   const section = document.createElement('section');
   section.id = 'proactive-panel'; section.className = 'panel span-all';
   section.innerHTML = `
-    <div class="section-top"><div><span class="section-index">CHAT / AUTONOMY</span><h2>自主聊天</h2>
-    <p class="muted">由 AI 决定是否开聊、聊什么、找谁。收到的新消息优先；无人回应不连续追发。</p></div>
+    <div class="section-top"><div><span class="section-index">CHAT / AUTONOMY</span><h2>自主与主动聊天</h2>
+    <p class="muted">新旧模式、日常接话、主动开聊和后续话题，在这里一起管理。</p></div>
     <span class="pill" id="proactive-status">读取中</span></div>
+    <h3>聊天方式</h3><div id="proactive-mode-slot"></div>
+    <div id="proactive-participation-slot" class="settings-grid"></div>
+    <h3>主动开聊</h3>
     <div class="settings-grid">
-      <label class="check-label"><input id="proactive-enabled" type="checkbox">启用自主聊天总开关</label>
+      <label class="check-label"><input id="proactive-enabled" type="checkbox">允许 AI 主动发起聊天</label>
       <label class="check-label"><input id="proactive-private-enabled" type="checkbox">允许主动私聊已勾选的联系人</label>
       <label class="check-label"><input id="proactive-mentions-enabled" type="checkbox">允许主动开聊时 @群成员</label>
       <label>主动程度<select id="proactive-level"><option value="quiet">克制 · 有具体话题才开口</option><option value="balanced">适中 · 分享和关心近况</option><option value="active">积极 · 更愿意发起交流</option></select></label>
@@ -31,14 +34,18 @@
     群成员说忙时不主动点名；要求暂停时暂不主动开聊，普通被动回复不受此开关影响。</p>
     <div id="proactive-chatlist" class="chatlist"></div>
     <div class="panel-footer"><span id="proactive-save-note" class="hint">新增功能默认关闭</span>
-      <button id="save-proactive" class="primary">保存自主聊天设置</button></div>
+      <button id="save-proactive" class="primary">保存聊天设置</button></div>
     <div class="section-top"><h3>最近主动判断</h3><button id="refresh-proactive" class="secondary">刷新记录</button></div>
     <p class="hint">记录显示简短依据、使用的消息／记忆编号和实际发送状态。主动调度不冒充收到的微信消息，也不写成人物事实。</p>
     <div id="proactive-runs"></div>`;
   document.querySelector('.content-grid').insertBefore(section, $('stability-panel'));
-  const link = document.createElement('a'); link.href = '#proactive-panel'; link.textContent = '自主聊天';
+  $('proactive-mode-slot').append($('autonomy-controls'));
+  const participation = $('participation').closest('label'), previousRow = participation.parentElement;
+  $('proactive-participation-slot').append(participation);
+  if (previousRow.children.length === 1) previousRow.firstElementChild.style.gridColumn = '1 / -1';
+  const link = document.createElement('a'); link.href = '#proactive-panel'; link.textContent = '自主与主动聊天';
   document.querySelector('nav').append(link);
-  const names = ['proactive_enabled','proactive_private_enabled','proactive_mentions_enabled','proactive_level',
+  const names = ['autonomy_enabled','participation','proactive_enabled','proactive_private_enabled','proactive_mentions_enabled','proactive_level',
     'proactive_per_day','proactive_chat_per_day','proactive_cooldown_minutes','proactive_decision_minutes',
     'proactive_idle_minutes','proactive_continuation_minutes','proactive_start_hour','proactive_end_hour','proactive_pause_hours'];
   let chosen = new Set(), strict = new Set(), latest = null, lastFetch = 0;
@@ -51,7 +58,9 @@
     }
     chosen = new Set(cfg.proactive_chat_ids || []); strict = new Set(cfg.proactive_strict_chat_ids || []);
     chatLabels();
-    text('proactive-save-note', cfg.proactive_enabled ? '设置已保存；仅在适合时主动开聊' : '自主聊天已关闭，勾选对象并保存后启用');
+    text('autonomy-mode', cfg.autonomy_enabled ? '当前使用新版自主决策 · 切换立即保存本页设置' : '当前使用旧版回复逻辑 · 切换立即保存本页设置');
+    text('proactive-save-note', '已保存 · ' + (cfg.autonomy_enabled ? '新版自主决策' : '旧版回复逻辑') + ' · ' +
+      (cfg.proactive_enabled ? '允许主动开聊' : '主动开聊已关闭'));
   }
   function chatLabels() {
     if (!cfg) return;
@@ -112,7 +121,7 @@
     if (!cfg || !token || (!force && Date.now()-lastFetch < 30000)) return;
     lastFetch = Date.now(); render(await api('proactive')); chatLabels();
   }
-  $('save-proactive').onclick = () => action($('save-proactive'), async () => {
+  async function save(announce=true) {
     const values = {};
     for (const name of names) {
       const input = field(name); values[name] = input.type === 'checkbox' ? input.checked : input.type === 'number' ? Number(input.value) : input.value;
@@ -120,10 +129,13 @@
     values.proactive_chat_ids = [...chosen].filter(id => cfg.allowed_chat_ids.includes(id));
     values.proactive_strict_chat_ids = [...strict].filter(id => values.proactive_chat_ids.includes(id));
     cfg = await api('proactive/config', 'POST', {values});
-    populate(); await refresh(true); notice('自主聊天设置已保存');
-  });
+    populate(); await refresh(true);
+    window.dispatchEvent(new CustomEvent('whalegirl-panel-saved', {detail:'proactive-panel'}));
+    if (announce) notice('聊天模式、参与程度和主动开聊设置已一起保存');
+  }
+  $('save-proactive').onclick = () => action($('save-proactive'), () => save());
   $('refresh-proactive').onclick = () => action($('refresh-proactive'), () => refresh(true));
-  window.proactiveChat = {populate, chatLabels, refresh};
+  window.proactiveChat = {populate, chatLabels, refresh, save};
   // This deferred script can arrive after the initial config request finishes.
   if (cfg) {
     populate();

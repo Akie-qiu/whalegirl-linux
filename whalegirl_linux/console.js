@@ -540,16 +540,20 @@ document.addEventListener('DOMContentLoaded', () => {
     'timing-panel':['save-timing'],
     'web-search-panel':['save-web-search'],
     'habits-panel':['save-style-settings','save-context-strategy','save-habits'],
+    'proactive-panel':['save-proactive'],
     'category-limits-panel':['save-category-limits'],
     'learning-panel':['learning-save'],
     'memory-panel':['hub-save-settings'],
     'affection-panel':['save-affection-rules']
   };
   let dirtyPanelId='';
+  window.addEventListener('whalegirl-panel-saved', event => {
+    if (event.detail === dirtyPanelId) { stickyBar.hidden = true; dirtyPanelId = ''; }
+  });
   const ignoreDirtyIds=new Set([
     'chat-search','records-scope','learning-query','learning-filter-chat','learning-filter-kind','learning-filter-state',
     'memory-search','memory-show-archived','memory-filter-chat','persona-live-chat','inbox-chat','inbox-query',
-    'quick-enabled','quick-affection-enabled','affection-enabled','pc-search'
+    'quick-enabled','quick-affection-enabled','affection-enabled','pc-search','autonomy-enabled'
   ]);
   contentGrid.addEventListener('input',markDirty);
   contentGrid.addEventListener('change',markDirty);
