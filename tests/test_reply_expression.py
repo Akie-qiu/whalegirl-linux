@@ -29,9 +29,9 @@ class ReplyExpressionTests(unittest.TestCase):
         self.assertIn('群聊用公开场合的朋友语气',warmth_prompt(settings))
         self.assertNotIn('也可只回“？”',habit_prompt(settings,{}))
         choices={'a'*32:'一起庆祝'}
-        self.assertIn('优先考虑 text→sticker',sticker_prompt(settings,choices,{}))
+        self.assertIn('直接写入actions',sticker_prompt(settings,choices,{}))
         self.assertEqual(sticker_prompt(settings,{},{}),'')
-        self.assertIn('关闭主动配表情',sticker_prompt(settings.model_copy(update={'sticker_after_text':'off'}),choices,{}))
+        self.assertNotIn('客户端在有合适候选时按',sticker_prompt(settings,choices,{}))
         self.assertIn('只能选择文字或表情',sticker_prompt(settings.model_copy(update={'reply_max_parts':1}),choices,{}))
         self.assertIn('平和简洁',warmth_prompt(settings.model_copy(update={'reply_warmth':'low'})))
 
@@ -84,13 +84,13 @@ class ReplyExpressionTests(unittest.TestCase):
             persisted=Config(directory).settings
             self.assertEqual((persisted.reply_warmth,persisted.sticker_after_text),('normal','off'))
 
-    def test_pairing_uses_valid_model_choice_probability_and_existing_limits(self):
+    def test_legacy_suggestion_is_translated_without_randomness_and_respects_limits(self):
         settings=Settings(sticker_pair_probability=90);choices={'a'*32:'开心庆祝'}
         actions=plan_actions({'reply':'太好啦'},{},settings);decision={'sticker_suggestion':'a'*32}
         paired,status=pair_sticker(decision,actions,choices,settings,draw=.89)
-        self.assertEqual([a['type'] for a in paired],['text','sticker']);self.assertEqual(status['result'],'appended')
+        self.assertEqual([a['type'] for a in paired],['text','sticker']);self.assertEqual(status['result'],'model_selected')
         skipped,status=pair_sticker(decision,actions,choices,settings,draw=.91)
-        self.assertEqual(skipped,actions);self.assertEqual(status['result'],'probability_skip')
+        self.assertEqual(skipped,paired);self.assertEqual(status['result'],'model_selected')
         for supplied,options,cfg,reason in [
             (decision,{},settings,'no_suitable_suggestion'),
             ({'sticker_suggestion':'b'*32},choices,settings,'no_suitable_suggestion'),
@@ -123,8 +123,8 @@ class ReplyExpressionRuntimeTests(unittest.IsolatedAsyncioTestCase):
             engine.chat=chat
             await runtime.process_next()
             self.assertEqual(engine.calls,1)
-            self.assertIn('温暖、愿意搭话',seen[0]);self.assertIn('优先考虑 text→sticker',seen[0])
-            self.assertEqual([s[0] for s in gateway.sent],['text','sticker'])
+            self.assertIn('温暖、愿意搭话',seen[0]);self.assertIn('直接写入actions',seen[0])
+            self.assertEqual([s[0] for s in gateway.sent],['text'])
             metrics=json.loads(store.db.execute('SELECT metrics FROM reply_metrics WHERE key=?',(event['key'],)).fetchone()[0])
-            self.assertEqual(metrics['sticker_pairing']['result'],'appended')
+            self.assertEqual(metrics['sticker_pairing']['result'],'model_planned')
         finally:await runtime.close()

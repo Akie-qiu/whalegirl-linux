@@ -40,7 +40,7 @@ def line(row, labels, *, max_chars=None):
     return f"[{when}｜{labels.get(row['chat'], row['chat'])}｜{author}｜消息{row['local_id']}] {clip(text,max_chars or (12000 if row['kind']==49 else 1400))}"
 
 
-async def build_context(store, gateway, settings, first, batch, labels):
+async def build_context(store, gateway, settings, first, batch, labels, *, initiative=False):
     context_started=time.monotonic();image_seconds=0.0
     context_limit=settings.context_messages
     stride=max(1,min(8,context_limit//4))
@@ -55,13 +55,14 @@ async def build_context(store, gateway, settings, first, batch, labels):
     memory = store.memory(first['account'], [first['chat']], first['chat'],
                           first.get('sender_id') or next((r['sender_id'] for r in recent if r['key']==first['key']), ''),
                           question, exclude=[alias for r in pool for alias in r.get('alias_keys',[r['key']])]+suppressed,
-                          limit=settings.history_recall_limit) if settings.history_recall_limit and settings.memory_enabled else []
+                          limit=settings.history_recall_limit) if settings.history_recall_limit and settings.memory_enabled and not initiative else []
     batch_keys={r['key'] for r in batch}
     batch_ids={r.get('local_id') for r in batch if r.get('local_id')}
     history_rows=[r for r in recent if not (set(r.get('alias_keys',[r['key']])) & (batch_keys | set(suppressed)))
                   and r.get('local_id') not in batch_ids]
     context_mode = 'complete_recent'
-    text_lines=[line(r,labels,max_chars=24000) for r in history_rows]
+    text_lines=[('[key='+r['key']+'] ' if initiative else '')+line(r,labels,max_chars=24000)
+                for r in history_rows]
     # Preserve every row. Only oversized bodies share the character budget;
     # ordinary short messages are never filtered by lexical overlap.
     budget=max(settings.context_char_budget, len(text_lines)*160)
@@ -94,6 +95,14 @@ async def build_context(store, gateway, settings, first, batch, labels):
               "\n【较早话题摘要｜仅在当前消息明确回指时参考】\n" + (digest_text or '本轮未载入较早话题摘要。') +
               "\n【相关历史消息候选｜只在与当前问题直接相关时参考】\n" + (recalled or '本轮未找到足够相关的旧消息。') +
               "\n【本次需要回复的消息】\n" + '\n'.join(f"[{message_time(m['timestamp'])}｜{speaker_label(m)}] {clip(m['content'],min(24000,max(1600,32000//max(1,len(batch)))))}" for m in batch))
+    if initiative:
+        # No synthetic incoming message and no separately truncated copy of
+        # the same history. Keep the ordinary chronological context budget.
+        prompt = ("以下为当前会话的近期完整聊天资料，不是刚收到的新消息，也不是必须逐条补答的任务。"
+                  "先看时间、账号ID、原说话人、引用及前后顺序，区分别人互聊与对你说话；图片中的说话人不等于发图者。\n"
+                  "【当前会话近期完整消息（含未@内容）】\n" + current_text +
+                  "\n【当前自主开聊机会】没有人刚向你提问；结合话题是否仍在继续、已过去多久、你是否已回应，自行决定开口或沉默。"
+                  "没有附件且没有对应已保存描述的[图片]不能视为已经看过，不能移用另一张图的描述或猜测画面。")
     blocks = [{'type':'text','text':prompt}]
     attachments = []
     if settings.vision_enabled:
@@ -101,6 +110,11 @@ async def build_context(store, gateway, settings, first, batch, labels):
             return row['kind']==3 or (row['kind']==47 and sticker_question)
         sticker_question=bool(_STICKER_CONTENT_QUESTION.search(question))
         current_images=[r for r in recent if needs_image(r) and r['key'] in batch_keys]
+        if initiative:
+            last_sent=max(store.latest_sent(first['account'], first['chat']),
+                          max((r['timestamp'] for r in recent if r['is_self']==1),default=0))
+            current_images=[r for r in recent if r['is_self']==0 and r['kind']==3
+                            and r['timestamp']>last_sent and not r.get('description')][-2:]
         # Busy groups can push a queued image beyond the short recent-context window.
         for m in batch:
             if any(r['key']==m['key'] for r in current_images):continue
@@ -175,6 +189,10 @@ async def build_context(store, gateway, settings, first, batch, labels):
             image_started=time.monotonic()
             try:
                 media = store.cached_image(row['key'])
+                if initiative and not media.get('data'):
+                    # Autonomous opportunities must not navigate or scroll
+                    # WeChat to fetch old images and block regular replies.
+                    continue
                 if not media:
                     try:
                         media = await gateway.media(row['chat'], row['local_id'],kind=row['kind'],server_id=row['key'].rsplit('/',1)[-1])

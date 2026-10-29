@@ -3,7 +3,7 @@
   const element=(tag,cls,content) => {const e=document.createElement(tag);if(cls)e.className=cls;if(content)e.textContent=content;return e;};
   const button=(title,fn) => {const b=element('button','secondary',title);b.type='button';b.onclick=()=>action(b,fn);return b;};
   const conversationFields={banter_level:'玩梗程度',play_along:'顺着演的意愿',callback_frequency:'旧梗回忆频率',assertiveness:'主见程度'};
-  const styleFields={reply_warmth:'回复温度',sticker_after_text:'文字后配表情',colloquialism:'口语程度',teasing:'吐槽强度',persona_density:'人设浓度',followup_questions:'反问频率',reply_length:'默认句长',...conversationFields};
+  const styleFields={reply_warmth:'回复温度',colloquialism:'口语程度',teasing:'吐槽强度',persona_density:'人设浓度',followup_questions:'反问频率',reply_length:'默认句长',...conversationFields};
   const styleOptions={reply_warmth:[['low','平和简洁'],['normal','自然亲切'],['high','温暖热络']],sticker_after_text:[['off','关闭主动搭配'],['normal','适中 · 合适时搭配'],['high','积极 · 优先文字后配表情']],reply_length:[['short','简短'],['normal','适中'],['detailed','充分解释']]};
   Object.assign(styleOptions,{
     banter_level:[['low','偶尔轻松一句'],['normal','自然接梗'],['high','更爱嘴贫']],
@@ -23,10 +23,7 @@
   const stickerCooldownLabel=element('label','','同一表情候选冷却 / 秒'),stickerCooldown=element('input');
   stickerCooldown.type='number';stickerCooldown.id='style-sticker-cooldown';stickerCooldown.min=0;stickerCooldown.max=3600;stickerCooldown.step=1;
   stickerCooldownLabel.append(stickerCooldown,element('span','hint','近期发过的同一表情暂不参与候选；运行保护中的重复内容限制仍独立生效。'));styleBox.append(stickerCooldownLabel);
-  const pairProbabilityLabel=element('label','','合适候选的自动搭配概率 / %'),pairProbability=element('input');
-  pairProbability.type='number';pairProbability.id='style-sticker-pair-probability';pairProbability.min=0;pairProbability.max=100;pairProbability.step=5;
-  pairProbabilityLabel.append(pairProbability,element('span','hint','AI 同一轮选出贴切表情后，按此概率附在文字后；90 表示合适候选有 90% 概率发送，不代表所有消息的 90%。0 关闭自动补配，不影响 AI 已明确安排的表情。'));styleBox.append(pairProbabilityLabel);
-  const pairingHint=element('p','hint','回复温度控制亲切感，群聊仍保持朋友语气。文字后配表情控制搭配意愿，不是保证每条都发；每轮上限至少为 2 才能同时发文字和表情。');
+  const pairingHint=element('p','hint','文字与表情由 AI 在同一份发送计划里决定，可以只说话、只发表情或自然穿插；程序不再按概率补表情。表情积极性统一在“会话与唤醒”调整，发送条数上限在“聊天习惯”调整，群聊仍保持朋友语气。');
   styleBox.append(pairingHint);
   const conversationSection=element('section','span-all');
   conversationSection.style.gridColumn='1 / -1';conversationSection.style.minWidth='0';
@@ -103,10 +100,8 @@
   const saveStyleBtn=button('保存说话风格与真人感设置',async()=>{
     const values={};for(const n of Object.keys(styleFields))values[n]=$('style-'+n).value;
     if(!stickerCooldown.checkValidity())throw new Error('同一表情候选冷却需在 0～3600 秒之间');
-    if(!pairProbability.checkValidity())throw new Error('自动搭配概率需在 0～100 之间');
     if(!halfLifeInput.checkValidity())throw new Error('小情绪半衰期需在 5～180 分钟之间');
     values.sticker_cooldown_seconds=Number(stickerCooldown.value);
-    values.sticker_pair_probability=Number(pairProbability.value);
     values.mood_engine_enabled=moodCheck.checked;
     values.daily_life_theater_enabled=lifeCheck.checked;
     values.anti_formula_guard_enabled=antiCheck.checked;
@@ -208,7 +203,6 @@
     if(!cfg)return;
     for(const n of Object.keys(styleFields))$('style-'+n).value=cfg[n] ?? (['reply_warmth','sticker_after_text'].includes(n)?'high':'normal');
     stickerCooldown.value=cfg.sticker_cooldown_seconds ?? 180;
-    pairProbability.value=cfg.sticker_pair_probability ?? 90;
     moodCheck.checked=cfg.mood_engine_enabled !== false;
     lifeCheck.checked=cfg.daily_life_theater_enabled !== false;
     antiCheck.checked=cfg.anti_formula_guard_enabled !== false;

@@ -65,7 +65,7 @@ class AutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(pair_sticker(decision,actions,{'a'*32:'开心'},new,draw=1)[0]), 2)
         old = new.model_copy(update={'autonomy_enabled':False})
         self.assertFalse(participation(old,self.store,event,[event],now=1770000000)[0])
-        self.assertEqual(len(pair_sticker(decision,actions,{'a'*32:'开心'},old,draw=1)[0]), 1)
+        self.assertEqual(len(pair_sticker(decision,actions,{'a'*32:'开心'},old,draw=1)[0]), 2)
         self.configure(autonomy_enabled=False)
         self.assertEqual(self.service.static_prompt(), '')
         self.assertEqual(self.service.dynamic_prompt(event), '')

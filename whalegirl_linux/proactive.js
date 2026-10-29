@@ -8,6 +8,7 @@
     <span class="pill" id="proactive-status">读取中</span></div>
     <h3>聊天方式</h3><div id="proactive-mode-slot"></div>
     <div id="proactive-participation-slot" class="settings-grid"></div>
+    <p class="hint" id="proactive-pacing-note"></p>
     <h3>主动开聊</h3>
     <div class="settings-grid">
       <label class="check-label"><input id="proactive-enabled" type="checkbox">允许 AI 主动发起聊天</label>
@@ -61,6 +62,8 @@
     text('autonomy-mode', cfg.autonomy_enabled ? '当前使用新版自主决策 · 切换立即保存本页设置' : '当前使用旧版回复逻辑 · 切换立即保存本页设置');
     text('proactive-save-note', '已保存 · ' + (cfg.autonomy_enabled ? '新版自主决策' : '旧版回复逻辑') + ' · ' +
       (cfg.proactive_enabled ? '允许主动开聊' : '主动开聊已关闭'));
+    text('proactive-pacing-note', '文字、表情及发送顺序统一由 AI 决定。' +
+      (Number(cfg.proactive_idle_minutes) > 0 ? '当前主动开聊要等会话安静 ' + cfg.proactive_idle_minutes + ' 分钟，可能较晚才重提话题；希望及时接话可把下方安静时长设为 0，普通自动回复不受此等待影响。' : '主动开聊没有额外安静时长要求；判断机会不代表每次都要说话。'));
   }
   function chatLabels() {
     if (!cfg) return;
@@ -87,7 +90,7 @@
       const paused = (latest?.chats?.[id]?.paused_until || 0) * 1000 > Date.now();
       const p = document.createElement('p'); p.className = 'hint';
       p.textContent = paused ? '主动聊天暂停至 ' + new Date(latest.chats[id].paused_until*1000).toLocaleString('zh-CN',{hour12:false}) + ' · ' + latest.chats[id].pause_reason :
-        '无人回应时当天不追发；对方回应后或第二天再由 AI 判断新话题';
+        '无人回应时不反复追发旧话题；有新发言或已安排的后续事情，再由 AI 判断';
       const button = document.createElement('button'); button.className = 'secondary'; button.textContent = paused ? '恢复主动联系' : '暂时停止主动联系';
       button.onclick = () => action(button, async () => {
         latest = await api('proactive/pause', 'POST', {chat:id, resume:paused});

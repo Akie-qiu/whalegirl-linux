@@ -107,7 +107,7 @@ class Settings(BaseModel):
     debounce_max_seconds: float = Field(default=4, ge=0, le=8)
     followup_wait_enabled: bool = True
     followup_wait_seconds: float = Field(default=10, ge=3, le=10)
-    reply_max_parts: int = Field(default=3, ge=1, le=3)
+    reply_max_parts: int = Field(default=6, ge=1, le=6)
     reply_part_interval: float = Field(default=0.8, ge=0.3, le=3)
     participation: Literal['quiet','balanced','active'] = 'balanced'
     interest_keywords: list[str] = Field(default_factory=lambda: ['游戏','八卦','表情包'], max_length=30)

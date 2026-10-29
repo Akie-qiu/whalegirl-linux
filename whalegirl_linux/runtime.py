@@ -553,7 +553,7 @@ class Runtime:
         # keep it as the final system-prompt suffix. The stable instructions
         # above remain an exact cacheable prefix whichever mode is selected.
         if structured:
-            static_system+='\n只输出JSON：{"should_reply":true,"actions":[{"type":"text","text":"简短自然中文","quote_local_id":0,"mentions":[]},{"type":"sticker","id":"目录中的确切ID"}],"image_request":null,"tieba_request":null,"tieba_used_meme_ids":[],"sticker_suggestion":"","sticker_skip_reason":"","search_query":"","fetch_url":"","memory_ops":[],"learning_proposals":[],"image_descriptions":[]}。动作按实际需要选0～'+str(settings.reply_max_parts)+'个，文字简短，贴切表情可另占一个动作；旁观时should_reply=false且actions=[]；图片描述格式为{"key":"实际附件key","description":"真实可见内容"}。不输出代码围栏。'
+            static_system+='\n只输出JSON：{"should_reply":true,"actions":[],"image_request":null,"tieba_request":null,"tieba_used_meme_ids":[],"search_query":"","fetch_url":"","memory_ops":[],"learning_proposals":[],"image_descriptions":[]}。actions是一份有序发送计划，按语境自主选0～'+str(settings.reply_max_parts)+'个动作；文字为{"type":"text","text":"自然短句","quote_local_id":0,"mentions":[]}，原生表情为{"type":"sticker","id":"目录中的确切ID"}。可以只有文字、只有一个表情或穿插发送，不固定格式或条数；程序不再随机追加表情。旁观时should_reply=false且actions=[]；图片描述格式为{"key":"实际附件key","description":"真实可见内容"}。不输出代码围栏。'
         dynamic_system = ''
         dynamic_system += self.images.tools.dynamic_prompt(image_tool_context, base_image_ids)
         dynamic_system += habit_dynamic_prompt(settings,social)
@@ -955,6 +955,12 @@ class Runtime:
                 timing['total_seconds']=round(time.time()-first['timestamp'],3)
                 self.store.metrics(key,timing)
                 offer_learning('image_queued')
+                return True
+            if structured and decision.get('actions') == []:
+                self.store.update(key,'ignored',error='AI 本轮未安排发送动作')
+                timing['total_seconds']=round(time.time()-first['timestamp'],3)
+                self.store.metrics(key,timing)
+                offer_learning('silent')
                 return True
             self.store.update(key,'failed',error='没有可发送的文字或原生表情')
             return True
