@@ -246,6 +246,19 @@ def send_native_sticker(job,path,root,name,is_group):
         run_process(['xdotool','key','--clearmodifiers','Escape'],check=True,timeout=3)
 
 
+def favorite_tile(tiles, index, total, known):
+    """A full Qt grid can become virtualized immediately after scrolling."""
+    if len(tiles)==total:
+        known.update({n['native_ref']:i for i,n in enumerate(tiles) if n.get('native_ref')})
+        return tiles[index] if 0<=index<len(tiles) else None
+    offsets={known[n['native_ref']]-i for i,n in enumerate(tiles) if n.get('native_ref') in known}
+    shared=sum(n.get('native_ref') in known for n in tiles)
+    if len(offsets)!=1 or shared<2:return None
+    first=next(iter(offsets));relative=index-first
+    known.update({n['native_ref']:first+i for i,n in enumerate(tiles) if n.get('native_ref')})
+    return tiles[relative] if 0<=relative<len(tiles) else None
+
+
 def _send_native_sticker(job,path,root,name,is_group):
     started=time.monotonic()
     md5=job.get('md5','')
@@ -305,21 +318,22 @@ def _send_native_sticker(job,path,root,name,is_group):
             b=chosen['bounds']
             scroll(area,'4' if b['y']<area['y'] else '5')
             root=tree();tiles,area=panel(root)
-            chosen=tiles[index] if len(tiles)==len(order) else None
+            chosen=favorite_tile(tiles,index,len(order),known)
     else:
-        tail_first=index>=len(order)-20 and index>=20
+        # Use the nearest boundary. Starting every middle favorite at the top
+        # can exhaust the locator budget before reaching its row.
+        tail_first=index>=len(order)/2
         scroll(area,'5' if tail_first else '4');root=tree();tiles,area=panel(root)
         initial_index=index-(len(order)-len(tiles)) if tail_first else index
         first_index=len(order)-len(tiles) if tail_first else 0
         known={n['native_ref']:first_index+i for i,n in enumerate(tiles) if n.get('native_ref')}
         chosen=tiles[initial_index] if 0<=initial_index<len(tiles) else None
-        if chosen is None and not tail_first:
+        if chosen is None:
             # Qt virtualizes this grid and accelerates wheel events. Align the
             # stable accessible objects shared by consecutive pages instead of
             # inferring the row offset from pixel displacement.
             if any(not n.get('native_ref') for n in tiles):raise ValueError('Native favorite identities are unavailable')
-            known={n['native_ref']:i for i,n in enumerate(tiles)}
-            first_index=0
+            known={n['native_ref']:first_index+i for i,n in enumerate(tiles)}
             job['favorite_scroll']=[]
             stagnant=0
             for _ in range(16):
@@ -327,7 +341,7 @@ def _send_native_sticker(job,path,root,name,is_group):
                 before_index=first_index
                 before_refs=tuple(n.get('native_ref') for n in tiles)
                 run_process(['xdotool','mousemove',str(round(area['x']+area['width']/2)),str(round(area['y']+area['height']/2)),
-                    'click','--repeat','1','--delay','20','5'],check=True,timeout=3)
+                    'click','--repeat','1','--delay','20','4' if tail_first else '5'],check=True,timeout=3)
                 time.sleep(.06);root=tree();tiles,area=panel(root)
                 offsets={known[n['native_ref']]-i for i,n in enumerate(tiles) if n.get('native_ref') in known}
                 aligned=len(offsets)==1 and all(n.get('native_ref') for n in tiles)
@@ -343,23 +357,27 @@ def _send_native_sticker(job,path,root,name,is_group):
                 # Virtualized pages can briefly expose no shared anchor while
                 # WeChat rebuilds its tile list. Continue one wheel notch at a
                 # time; never infer an index from an ambiguous page.
-                if stagnant>=3 or aligned and first_index==before_index and relative<0:break
+                wrong_direction=relative>=len(tiles) if tail_first else relative<0
+                if stagnant>=3 or aligned and first_index==before_index and wrong_direction:break
         if not clickable(chosen,area):
             scroll(area,'5');root=tree();tiles,area=panel(root)
             tail_index=index-(len(order)-len(tiles))
+            known={n['native_ref']:len(order)-len(tiles)+i for i,n in enumerate(tiles) if n.get('native_ref')}
             chosen=tiles[tail_index] if 0<=tail_index<len(tiles) else None
     if chosen is None:raise ValueError('Requested favorite is outside the currently exposed native page')
     # Qt normally exposes the full grid even when most rows are outside the viewport.
     # With a full grid the native order gives an exact index for middle favorites too.
     for _ in range(8):
         if time.monotonic()-started>12:break
-        if len(tiles)!=len(order):break
-        chosen=tiles[index];b=chosen['bounds']
+        chosen=favorite_tile(tiles,index,len(order),known)
+        if chosen is None:break
+        b=chosen['bounds']
         if clickable(chosen,area):break
         direction='4' if b['y']<area['y'] else '5'
         run_process(['xdotool','mousemove',str(round(area['x']+area['width']/2)),str(round(area['y']+area['height']/2)),
                         'click','--repeat','2','--delay','40',direction],check=True,timeout=3)
         time.sleep(.1);root=tree();tiles,area=panel(root)
+    if chosen is None:raise ValueError('Native favorite position became ambiguous before sending')
     b=chosen['bounds']
     if not clickable(chosen,area):
         raise ValueError('Requested favorite has no clickable visible area')
