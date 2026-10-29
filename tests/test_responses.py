@@ -11,6 +11,7 @@ import httpx
 
 from whalegirl_linux.settings import Config, Settings
 from whalegirl_linux.upstream.ai_engine import AIEngine
+from whalegirl_linux.time_context import CLOCK_RULE
 
 
 USAGE = {"input_tokens": 100, "output_tokens": 30, "total_tokens": 130,
@@ -47,7 +48,7 @@ class ResponsesPayloadTests(unittest.TestCase):
         payload = engine._build_payload(messages, "人设\n【本轮动态上下文】动态", .55, max_tokens=450)
         self.assertEqual(messages, before)
         self.assertEqual(payload["model"], "same-model")
-        self.assertEqual(payload["instructions"], "人设")
+        self.assertEqual(payload["instructions"], "人设" + CLOCK_RULE)
         self.assertEqual(payload["max_output_tokens"], 450)
         self.assertIs(payload["store"], False)
         self.assertNotIn("max_tokens", payload)

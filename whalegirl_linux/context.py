@@ -93,7 +93,6 @@ async def build_context(store, gateway, settings, first, batch, labels):
               "以下保留最近设置条数内的连续消息，不按关键词筛选。先结合说话人、引用和前后顺序理解指代，再回答本轮消息。\n" + current_text +
               "\n【较早话题摘要｜仅在当前消息明确回指时参考】\n" + (digest_text or '本轮未载入较早话题摘要。') +
               "\n【相关历史消息候选｜只在与当前问题直接相关时参考】\n" + (recalled or '本轮未找到足够相关的旧消息。') +
-              "\n【本轮处理时间｜北京时间】\n" + message_time(time.time()) +
               "\n【本次需要回复的消息】\n" + '\n'.join(f"[{message_time(m['timestamp'])}｜{speaker_label(m)}] {clip(m['content'],min(24000,max(1600,32000//max(1,len(batch)))))}" for m in batch))
     blocks = [{'type':'text','text':prompt}]
     attachments = []

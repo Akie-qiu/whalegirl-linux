@@ -8,6 +8,7 @@ from unittest.mock import patch
 from whalegirl_linux.context import build_context
 from whalegirl_linux.settings import Settings
 from whalegirl_linux.store import Store
+from whalegirl_linux.upstream.ai_engine import AIEngine
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -41,7 +42,10 @@ class MessageTimeContextTests(unittest.IsolatedAsyncioTestCase):
         prompt = messages[0]['content']
         self.assertIn('[2026-10-28 14:30:01｜测试用户｜账号ID=person] 我先说一下', prompt)
         self.assertIn('[2026-10-28 14:30:07｜测试用户｜账号ID=person] 还有一个条件', prompt)
-        self.assertIn('【本轮处理时间｜北京时间】\n2026-10-28 14:30:11', prompt)
+        with patch('whalegirl_linux.time_context.time.time', return_value=self.now):
+            payload = AIEngine('https://example.test/v1', 'test')._build_payload(messages, '', None)
+        self.assertIn('【服务器当前时间】2026-10-28 14:30:11 周三 北京时间',
+                      payload['messages'][-1]['content'])
         self.assertFalse(images)
 
     async def test_history_keeps_its_original_time_alongside_current_message(self):

@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 import httpx
 from loguru import logger
 from ..token_usage import normalize_usage
+from ..time_context import CLOCK_RULE, clock_messages
 
 
 class IncompleteModelResponse(ValueError):
@@ -242,6 +243,13 @@ class AIEngine:
 
         dynamic_marker = "\n【本轮动态上下文】"
         reply_marker = "\n【本次需要回复的消息】\n"
+        # A tiny live input, after the reusable system prefix. All reply/tool
+        # paths use the server clock, including Responses and proactive chat.
+        if dynamic_marker in system_prompt:
+            prefix, suffix = system_prompt.split(dynamic_marker, 1)
+            system_prompt = prefix + CLOCK_RULE + dynamic_marker + suffix
+        else:
+            system_prompt += CLOCK_RULE
         effective_system = system_prompt
         effective_messages = messages
         if (
@@ -275,6 +283,8 @@ class AIEngine:
                     {"role": "user", "content": [new_first_block, *content[1:]]},
                     *messages[1:],
                 ]
+
+        effective_messages = clock_messages(effective_messages)
 
         if self.api_style == "responses":
             payload["max_output_tokens"] = payload.pop("max_tokens")

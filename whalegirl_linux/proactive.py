@@ -16,6 +16,9 @@ from .memory import memory_parts
 from .mentions import apply_mentions, mention_options, mention_prompt
 from .stickers import parse_json
 from .resources import native_pressure
+from .context import message_time
+from .search import DeepSeekSearch, search_static_prompt
+from .model_reply import guarded_chat
 
 BEIJING = timezone(timedelta(hours=8))
 
@@ -288,7 +291,7 @@ class ProactiveService:
             source_ids = {m['key'] for m in recent} | {'memory:'+str(i) for i in recall.get('ids', [])+recall.get('joke_ids', [])}
             tieba_evidence = {}
             system = ((s.system_prompt_override.strip() or r.styles.get_active().system_prompt)
-                + habit_static_prompt(s) + warmth_prompt(s) + memory_static
+                + habit_static_prompt(s) + warmth_prompt(s) + memory_static + search_static_prompt(s)
                 + r.affection.static_prompt(first, s) + r.affection.dynamic_prompt(first, humans[-6:], s)
                 + r.images.tools.static_prompt(first, include_catalog=False)
                 + r.images.tools.catalog_prompt(base_image_catalog) + sticker_static_prompt(s)
@@ -306,13 +309,13 @@ class ProactiveService:
                   '如果选择图片，通知文字由你按语境生成，不能在任务完成前声称已经发出或画好。'
                   '输出JSON：{"should_reply":false,"reason":"供管理员查看的简短依据，不含内部推理",'
                   '"sources":["确切消息key或memory:ID"],"actions":[{"type":"text","text":"自然开场","mentions":[]},'
-                  '{"type":"sticker","id":"目录ID"}],"image_request":null,"tieba_request":null,"tieba_used_meme_ids":[]}。'
+                  '{"type":"sticker","id":"目录ID"}],"image_request":null,"tieba_request":null,"tieba_used_meme_ids":[],"search_query":"","fetch_url":""}。'
                   'image_request使用既有send_library_image/generate_image格式；沉默时actions=[]且image_request=null。')
             system += r.autonomy.static_prompt()
-            data = {'beijing_time': datetime.fromtimestamp(now, BEIJING).isoformat(),
-                    'chat': r.chat_labels.get(chat, chat), 'initiative': s.proactive_level,
+            data = {'chat': r.chat_labels.get(chat, chat), 'initiative': s.proactive_level,
                     'do_not_address': sorted(muted),
-                    'recent_messages': [{**{k: v.get(k) for k in ('key', 'sender_id', 'sender', 'is_self', 'timestamp')},
+                    'recent_messages': [{**{k: v.get(k) for k in ('key', 'sender_id', 'sender', 'is_self')},
+                                         'timestamp': message_time(v['timestamp']),
                                          'content': v['content'][:600], 'description': v.get('description', '')[:240]}
                                         for v in recent]}
             dynamic = (memory_dynamic + r.images.tools.dynamic_prompt(image_context, base_image_ids)
@@ -325,9 +328,15 @@ class ProactiveService:
                                       max_tokens=s.max_tokens+400, temperature=.65, timeout=12, max_retries=0)
             engine.usage_callback = lambda event: r.token_ledger.record(s.account_id, event)
             tool_messages = [{'role':'user', 'content':json.dumps(data, ensure_ascii=False)+dynamic}]
-            raw = await asyncio.wait_for(engine.chat(tool_messages,
-                system_prompt=system, max_tokens=s.max_tokens+400, response_format={'type':'json_object'},
-                operation='proactive'), timeout=15)
+            search_tools = DeepSeekSearch.tools(engine, s)
+            options = dict(system_prompt=system, max_tokens=s.max_tokens+400,
+                           response_format={'type':'json_object'}, operation='proactive')
+            if search_tools:
+                result = await asyncio.wait_for(engine.chat_with_tools(tool_messages, search_tools, **options), timeout=15)
+                requested = DeepSeekSearch.native_decision(result)
+                raw = json.dumps(requested, ensure_ascii=False) if requested else result.get('content') or ''
+            else:
+                raw = await asyncio.wait_for(engine.chat(tool_messages, **options), timeout=15)
             if not raw or not raw.strip():
                 raise ValueError(getattr(engine, 'last_error', '') or '模型未返回内容')
             decision = parse_json(raw or '')
@@ -335,6 +344,20 @@ class ProactiveService:
                 raise ValueError('Invalid proactive decision')
             decision = await r.tieba.tools.resolve(engine, tool_messages, system, decision, first, generation,
                                                   tieba_evidence, s.max_tokens+650)
+            if s.web_search_enabled and (decision.get('search_query') or decision.get('fetch_url')):
+                result = (await r.web_search.fetch(engine, decision['fetch_url'], s) if decision.get('fetch_url') else
+                          await r.web_search.run(engine, decision['search_query'], s))
+                if generation != self.config.generation or not self.send_allowed(first):
+                    self.finish(identity, 'skipped', error='联网期间收到新消息或权限变化，本轮未发送')
+                    return True
+                raw = await guarded_chat(engine, tool_messages + [
+                    {'role':'assistant', 'content':json.dumps(decision, ensure_ascii=False)},
+                    {'role':'user', 'content':DeepSeekSearch.evidence_message(result)}],
+                    diagnostics=tieba_evidence, stage='proactive_search', system_prompt=system,
+                    max_tokens=s.max_tokens+400, operation='proactive')
+                decision = parse_json(raw)
+                if not isinstance(decision, dict) or not isinstance(decision.get('should_reply'), bool):
+                    raise ValueError('Invalid proactive search followup')
             refs = decision.get('sources') if isinstance(decision.get('sources'), list) else []
             self.finish(identity, 'planning', reason=decision.get('reason') or 'AI 判断本轮是否适合主动聊天',
                         sources=[v for v in refs if isinstance(v, str) and v in source_ids][:12])
