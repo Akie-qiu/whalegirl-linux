@@ -43,6 +43,7 @@
     $('web-search-enabled').checked = cfg.web_search_enabled;
     $('web-search-result-count').value = cfg.web_search_result_count ?? 5;
     $('web-search-timeout').value = cfg.web_search_timeout ?? 35;
+    text('web-search-key-status',cfg.search_api_key_configured ? '已保存独立搜索密钥，切换聊天模型后继续使用。' : '未保存独立密钥；使用 DeepSeek 官方聊天接口时可复用其密钥。');
     $('participation').value = cfg.participation;
     $('interest-keywords').value = (cfg.interest_keywords || []).join('\n');
     $('repeat-probability').value = Math.round(cfg.repeat_probability * 100);
@@ -206,7 +207,9 @@
   });
   $('save-web-search').onclick = () => action($('save-web-search'),async () => {
     await saveSubset({web_search_enabled:$('web-search-enabled').checked,
-      web_search_result_count:Number($('web-search-result-count').value),web_search_timeout:Number($('web-search-timeout').value)});
+      web_search_result_count:Number($('web-search-result-count').value),web_search_timeout:Number($('web-search-timeout').value)}, '', $('web-search-api-key').value);
+    $('web-search-api-key').value='';
+    text('web-search-key-status',cfg.search_api_key_configured ? '已保存独立搜索密钥，切换聊天模型后继续使用。' : '未保存独立密钥；使用 DeepSeek 官方聊天接口时可复用其密钥。');
     notice('联网设置已保存，下一轮生效。');
   });
   $('save-category-limits').onclick = () => action($('save-category-limits'),async () => {

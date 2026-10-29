@@ -164,13 +164,24 @@ def main():
         switched = True
         subprocess.run(['systemctl', 'start', 'whalegirl-linux.service'], check=True, timeout=30)
 
+        last_probe = {}
         for _ in range(60):
             try:
-                with urllib.request.urlopen('http://127.0.0.1:8092/health', timeout=2) as response:
+                with OPENER.open('http://127.0.0.1:8092/health', timeout=2) as response:
                     health = json.load(response)
                 state_after = api('state')
                 config_after = {**CONFIG_DEFAULTS, **api('config')}
                 config_after.pop('api_key_configured', None)
+                last_probe = {
+                    'health': health.get('status'),
+                    'failed_background_tasks': health.get('failed_background_tasks'),
+                    'configuration_difference_keys': sorted(key for key in set(config_after) | set(comparable_config)
+                        if config_after.get(key) != comparable_config.get(key)),
+                    'wechat_status': state_after.get('gateway', {}).get('status'),
+                    'previous_wechat_status': state_before.get('gateway', {}).get('status'),
+                    'sticker_available': state_after.get('stickers', {}).get('available', 0),
+                    'enabled': state_after.get('enabled'), 'expected_enabled': bool(comparable_config.get('enabled')),
+                }
                 if (health.get('status') == 'ok' and not health.get('failed_background_tasks')
                         and config_after == comparable_config
                         and (state_after.get('gateway', {}).get('status') == 'logged_in'
@@ -178,11 +189,11 @@ def main():
                         and (not REQUIRE_ONLINE or state_after.get('stickers',{}).get('available',0)>0)
                         and state_after.get('enabled') == bool(comparable_config.get('enabled'))):
                     break
-            except Exception:
-                pass
+            except Exception as exc:
+                last_probe = {'error_type': type(exc).__name__}
             time.sleep(.5)
         else:
-            raise RuntimeError('New core did not become healthy with the existing login')
+            raise RuntimeError('New core did not become healthy with the existing login: ' + json.dumps(last_probe))
 
         preserved = {
             'wechat_pid': command('docker', 'exec', CONTAINER, 'pgrep', '-x', 'wechat') == native_pid,

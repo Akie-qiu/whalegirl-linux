@@ -176,9 +176,9 @@ async function refreshChats(silent = false) {
     if (!silent) notice('会话列表已更新。');
   } catch (error) { renderChats(); if (!silent) throw error; }
 }
-async function saveSubset(values, apiKey = '') {
-  const current = await api('config'); delete current.api_key_configured; delete current.image_api_key_configured;
-  cfg = await api('config', 'POST', { settings: { ...current, ...values }, api_key: apiKey });
+async function saveSubset(values, apiKey = '', searchKey = '') {
+  const current = await api('config'); delete current.api_key_configured; delete current.image_api_key_configured; delete current.search_api_key_configured;
+  cfg = await api('config', 'POST', { settings: { ...current, ...values }, api_key: apiKey, search_api_key: searchKey });
   await update();
   return cfg;
 }

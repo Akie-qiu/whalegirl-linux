@@ -111,7 +111,7 @@ class Runtime:
         self.memory_hub.migrate_masks()
         self.sticker_library = StickerLibrary(store,self.stickers)
         self.sticker_library.sync(config.settings.account_id)
-        self.web_search = DeepSeekSearch()
+        self.web_search = DeepSeekSearch(config)
         self.moments = MomentsService(self)
         self.images = ImageService(self)
         self.tieba = TiebaService(self)
@@ -141,6 +141,8 @@ class Runtime:
         await asyncio.gather(*self.tasks, *wait_tasks, return_exceptions=True)
         if self.engine:
             await self.engine.close()
+        if hasattr(self.web_search, 'close'):
+            await self.web_search.close()
         await self.gateway.close()
         self.store.close()
 

@@ -336,6 +336,14 @@ class Config:
         if key.strip():
             private_write(self.directory / 'image-api-key.enc', self.fernet.encrypt(key.strip().encode()).decode())
 
+    def search_api_key(self):
+        path = self.directory / 'search-api-key.enc'
+        return self.fernet.decrypt(path.read_bytes()).decode() if path.exists() else ''
+
+    def save_search_key(self, key):
+        if key.strip():
+            private_write(self.directory / 'search-api-key.enc', self.fernet.encrypt(key.strip().encode()).decode())
+
     def tieba_credentials(self):
         path = self.directory / 'tieba-credentials.enc'
         return json.loads(self.fernet.decrypt(path.read_bytes())) if path.exists() else {}
@@ -381,4 +389,5 @@ class Config:
 
     def public(self):
         return {**self.settings.model_dump(), "api_key_configured": bool(self.api_key()),
-                "image_api_key_configured": bool(self.image_api_key())}
+                "image_api_key_configured": bool(self.image_api_key()),
+                "search_api_key_configured": bool(self.search_api_key())}

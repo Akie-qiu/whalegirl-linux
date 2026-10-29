@@ -30,6 +30,7 @@ class ConfigRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     settings: Settings
     api_key: str = Field(default="", max_length=1024)
+    search_api_key: str = Field(default='', max_length=1024, repr=False)
 
 
 class ReviewRequest(BaseModel):
@@ -894,6 +895,7 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
                 settings.active_persona_id = ''
                 settings.active_persona_revision = 0
             config.save(settings, body.api_key)
+            config.save_search_key(body.search_api_key)
             runtime.moments.settings_changed(previous_settings, settings)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc

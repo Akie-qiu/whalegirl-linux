@@ -51,14 +51,38 @@ def search_prompt(settings):
 
 
 class DeepSeekSearch:
-    def __init__(self):
+    def __init__(self, config=None, *, client=None):
         self.last={}
+        self.config=config
+        self._client=client
+        self._owns_client=client is None
+
+    def credentials(self, engine):
+        key=self.config.search_api_key() if self.config else ''
+        if key:return key
+        # Preserve existing official-model installations. A relay credential
+        # must never be forwarded to the official search service.
+        parsed=urlsplit(getattr(engine,'api_url',''))
+        if parsed.scheme=='https' and parsed.hostname=='api.deepseek.com':
+            return str(getattr(engine,'api_key','') or '').strip()
+        return ''
+
+    async def client(self):
+        if self._client is None or self._client.is_closed:
+            # No chat transport, relay headers or redirects share this client.
+            self._client=httpx.AsyncClient(trust_env=False,follow_redirects=False)
+            self._owns_client=True
+        return self._client
+
+    async def close(self):
+        if self._client is not None and self._owns_client:
+            await self._client.aclose()
+        self._client=None
 
     @staticmethod
     def tools(engine, settings):
         if (not settings.web_search_enabled or getattr(engine, 'api_style', '') != 'openai'
                 or getattr(engine, 'stream_enabled', False)
-                or urlsplit(getattr(engine, 'api_url', '')).hostname != 'api.deepseek.com'
                 or not hasattr(engine, 'chat_with_tools')):
             return []
         return [{'type': 'function', 'function': {'name': name, 'description': description,
@@ -107,12 +131,14 @@ class DeepSeekSearch:
                 result['error']='联网搜索已关闭';return result
             if not query:
                 result['error']='没有合适的公共检索词';return result
-            if engine.api_style!='openai' or urlsplit(engine.api_url).hostname!='api.deepseek.com':
-                result['error']='当前接口不是 DeepSeek 官方联网搜索接口';return result
+            key=self.credentials(engine)
+            if not key:
+                result['error']='请在联网搜索设置中保存 DeepSeek 官方搜索密钥';return result
             payload={'query':query,'count':settings.web_search_result_count,'need_content':True}
-            client=await engine._get_client()
+            client=await self.client()
             attempted=True
-            response=await client.post('https://api.deepseek.com/v1/tools/search',json=payload,timeout=httpx.Timeout(settings.web_search_timeout))
+            response=await client.post('https://api.deepseek.com/v1/tools/search',json=payload,
+                headers={'Authorization':'Bearer '+key},timeout=httpx.Timeout(settings.web_search_timeout))
             response.raise_for_status();data=response.json()
             raw_usage=data.get('usage');outcome='success'
             rows=data.get('results')
@@ -160,11 +186,13 @@ class DeepSeekSearch:
             except ValueError:public_ip=True
             if not public_ip or host in ('localhost','localhost.localdomain') or host.endswith(('.local','.internal')):
                 result['error']='不抓取本机或内网网页';return result
-            if engine.api_style!='openai' or urlsplit(engine.api_url).hostname!='api.deepseek.com':
-                result['error']='当前接口不是 DeepSeek 官方网页抓取接口';return result
-            client=await engine._get_client()
+            key=self.credentials(engine)
+            if not key:
+                result['error']='请在联网搜索设置中保存 DeepSeek 官方搜索密钥';return result
+            client=await self.client()
             attempted=True
             response=await client.post('https://api.deepseek.com/v1/tools/fetch',json={'url':url,'max_content_tokens':5000},
+                                       headers={'Authorization':'Bearer '+key},
                                        timeout=httpx.Timeout(settings.web_search_timeout))
             response.raise_for_status();data=response.json();result['requests']=1
             raw_usage=data.get('usage');outcome='success'

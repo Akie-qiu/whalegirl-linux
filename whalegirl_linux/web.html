@@ -62,8 +62,9 @@
   <section class="panel span-all" id="web-search-panel">
     <div class="section-top"><div><span class="section-index">WEB / SEARCH</span><h2>按需联网搜索</h2><p class="muted">使用 DeepSeek 官方 Search / Fetch 接口。普通闲聊保持快速模式，需要新信息时由 AI 搜索或读取公开网页，再像平时一样回复。</p></div></div>
     <label class="check-label"><input id="web-search-enabled" type="checkbox">允许 AI 按需联网</label>
+    <label for="web-search-api-key">DeepSeek 官方搜索密钥</label><input id="web-search-api-key" type="password" autocomplete="new-password" placeholder="独立于聊天模型，留空保留已保存密钥"><p id="web-search-key-status" class="hint"></p>
     <div class="two-fields"><label>每次搜索最多返回网页数<input id="web-search-result-count" type="number" min="1" max="10"></label><label>联网等待上限 / 秒<input id="web-search-timeout" type="number" min="10" max="60"></label></div>
-    <p id="web-search-status" class="timing-detail">正在读取联网状态</p><p class="hint">不显示搜索引用标记、来源列表或原生引用气泡。每轮最多一次搜索或网页读取；联网失败会说明暂时查不到，不拿旧知识冒充实时结果。联网请求使用服务器已保存的 DeepSeek API Key。</p>
+    <p id="web-search-status" class="timing-detail">正在读取联网状态</p><p class="hint">不显示搜索引用标记、来源列表或原生引用气泡。每轮最多一次搜索或网页读取；联网失败会说明暂时查不到，不拿旧知识冒充实时结果。搜索与网页读取使用独立加密保存的官方密钥，兼容不同聊天模型和中转接口。</p>
     <div class="panel-footer"><span class="hint">群聊唤醒规则继续生效</span><button id="save-web-search" class="primary">保存联网设置</button></div>
   </section>
   <section class="panel span-all" id="habits-panel">

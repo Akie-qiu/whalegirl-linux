@@ -20,8 +20,9 @@ class SearchApiTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             class Engine:
                 api_style='openai';api_url='https://api.deepseek.com/chat/completions'
+                api_key='fixture-official'
                 async def _get_client(self):return client
-            result=await DeepSeekSearch().run(Engine(),'查询公开公告',Settings(web_search_enabled=True))
+            result=await DeepSeekSearch(client=client).run(Engine(),'查询公开公告',Settings(web_search_enabled=True))
         self.assertTrue(result['ok']);self.assertEqual(result['requests'],1)
         self.assertEqual(seen,[('https://api.deepseek.com/v1/tools/search',{'query':'查询公开公告','count':5,'need_content':True})])
         self.assertIn('公开事实',result['text'])
@@ -32,8 +33,9 @@ class SearchApiTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             class Engine:
                 api_style='openai';api_url='https://api.deepseek.com/chat/completions'
+                api_key='fixture-official'
                 async def _get_client(self):return client
-            result=await DeepSeekSearch().run(Engine(),'查询公开公告',Settings(web_search_enabled=True))
+            result=await DeepSeekSearch(client=client).run(Engine(),'查询公开公告',Settings(web_search_enabled=True))
         self.assertFalse(result['ok']);self.assertEqual(len(calls),1);self.assertIn('403',result['error'])
 
     async def test_citations_removed_and_web_reply_stays_plain(self):
