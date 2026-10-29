@@ -29,13 +29,15 @@
     a.onclick = () => { for (const item of nav.querySelectorAll('a')) item.classList.toggle('active', item === a); };
     nav.insertBefore(a, nav.querySelector('[href="#stability-panel"]'));
   }
-  let editing = null, loaded = [], lastFetch = 0;
+  let editing = null, loaded = [], lastFetch = 0, lastAutonomyFetch = 0;
   const numeric = ['debounce_single_seconds','debounce_burst_seconds','debounce_max_seconds','followup_wait_seconds','reply_max_parts',
     'reply_part_interval','quiet_start_hour','quiet_end_hour','text_per_hour','text_per_day','sticker_per_hour','sticker_per_day'];
   const field = name => $(name.replaceAll('_','-'));
   function populate() {
     for (const name of numeric) field(name).value = cfg[name];
     $('chat-habits-enabled').checked = cfg.chat_habits_enabled;
+    $('autonomy-enabled').checked = cfg.autonomy_enabled ?? false;
+    text('autonomy-mode', cfg.autonomy_enabled ? '当前使用新版自主聊天' : '当前使用旧版回复逻辑');
     $('followup-wait-enabled').checked = cfg.followup_wait_enabled ?? true;
     $('editable-memory-enabled').checked = cfg.editable_memory_enabled;
     $('web-search-enabled').checked = cfg.web_search_enabled;
@@ -59,6 +61,47 @@
     const b = document.createElement('button'); b.type = 'button'; b.className = 'secondary'; b.textContent = title;
     b.onclick = () => action(b, fn); return b;
   }
+  async function refreshAutonomy() {
+    lastAutonomyFetch = Date.now();
+    const result = await api('autonomy');
+    text('autonomy-mode', '当前使用' + result.mode + (result.busy ? ' · 正在整理新增聊天' : '') + (result.last_error ? ' · ' + result.last_error : ''));
+    const intents = $('autonomy-intents'), events = $('autonomy-events');
+    intents.replaceChildren(); events.replaceChildren();
+    if (!result.intents.length) intents.textContent = '暂时没有待接续的话题';
+    for (const item of result.intents) {
+      const row = document.createElement('article'); row.className = 'record';
+      const title = document.createElement('p'); title.textContent = chatName(item.chat) + ' · ' + item.topic;
+      const when = document.createElement('p'); when.className = 'hint';
+      when.textContent = (result.enabled ? '可考虑时间：' : '已暂停 · 可考虑时间：') + new Date(item.due * 1000).toLocaleString('zh-CN', {hour12:false,timeZone:'Asia/Shanghai'});
+      row.append(title, when, button('取消接续', async () => {
+        await api('autonomy/intents/' + item.id, 'POST', {op:'cancel'}); await refreshAutonomy();
+      })); intents.append(row);
+    }
+    const labels = {speak:'选择参与',silent:'选择旁观',observe:'合并观察',growth:'整理经验',wait:'等待补充'};
+    if (!result.events.length) events.textContent = '开启新版后显示参与依据和成长记录';
+    for (const item of result.events) {
+      const row = document.createElement('article'); row.className = 'record';
+      const title = document.createElement('strong'); title.textContent = (labels[item.kind] || item.kind) + ' · ' + chatName(item.chat);
+      const reason = document.createElement('p'); reason.textContent = item.reason;
+      const when = document.createElement('p'); when.className = 'hint';
+      when.textContent = new Date(item.created * 1000).toLocaleString('zh-CN', {hour12:false,timeZone:'Asia/Shanghai'});
+      row.append(title, reason, when); events.append(row);
+    }
+  }
+  $('autonomy-enabled').onchange = async () => {
+    const control = $('autonomy-enabled'); const value = control.checked; control.disabled = true;
+    try {
+      await saveSubset({autonomy_enabled:value});
+      notice(value ? '已切换到新版自主聊天。' : '已切回旧版回复逻辑，接续意图与新版旁听学习已暂停。');
+      if ($('autonomy-details').open) await refreshAutonomy();
+    } catch (error) {
+      control.checked = cfg.autonomy_enabled ?? false; notice(error.message, true);
+    } finally { control.disabled = false; }
+  };
+  $('refresh-autonomy').onclick = () => action($('refresh-autonomy'), refreshAutonomy);
+  $('autonomy-details').ontoggle = () => {
+    if ($('autonomy-details').open) refreshAutonomy().catch(error => notice(error.message, true));
+  };
   function reset() {
     editing = null; $('memory-subject').value = ''; $('memory-content').value = ''; $('memory-kind').value = 'fact';
     $('memory-joke-ttl').value=''; updateExpiry();
@@ -140,6 +183,9 @@
     for (const person of people) { const o=document.createElement('option');o.value=person.id;o.label=person.name;list.append(o); }
   }
   function stateUpdated(s) {
+    if ($('autonomy-details').open && Date.now() - lastAutonomyFetch > 10000) {
+      refreshAutonomy().catch(error => notice(error.message, true));
+    }
     const web=s.web_search || {}, last=web.last || {};
     text('web-search-status',!web.enabled?'联网已关闭':!last.checked_at?'联网已启用，按需调用':
       (last.ok?'上次联网成功':'上次联网未完成')+' · '+(last.seconds||0).toFixed(2)+' 秒'+

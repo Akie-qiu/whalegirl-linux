@@ -80,6 +80,9 @@ def participation(settings, store, first, batch, *, now=None):
     # While a burst is underway let the model judge relevance; no extra model call.
     allow = not natural or not settings.chat_habits_enabled or ((own < cap or (followup and own < cap+3)) and (not quiet or engaged) and
         (score>=threshold or (own==0 and not quiet and len(text.strip())>=3)))
+    if getattr(settings, 'autonomy_enabled', False):
+        # Let the same main model judge semantics; request pacing is separate.
+        allow = True
     notes = {'beijing_hour':local.hour,'quiet_hours':quiet,'recent_bot_turns':own,
              'interest_hit':interest,'conversation_active':engaged,'busy_group':hot,
              'participation':settings.participation,'local_score':score,'possible_followup':followup}
@@ -225,6 +228,8 @@ def current_mood_state(store, settings, account, chat, *, now=None):
 
 
 def update_mood_after_turn(store, settings, first, batch, confirmed_text='', *, now=None):
+    if getattr(settings, 'autonomy_enabled', False):
+        return  # Grounded model updates are handled by AutonomyService.
     if not getattr(settings, 'mood_engine_enabled', True):
         return
     now = time.time() if now is None else now
@@ -252,6 +257,8 @@ def update_mood_after_turn(store, settings, first, batch, confirmed_text='', *, 
 
 
 def current_life_scene(store, settings, account, chat, *, tieba_service=None, now=None):
+    if getattr(settings, 'autonomy_enabled', False):
+        return '正跟着眼前的话题聊天，实际经历以收到的消息和工具结果为准'
     now = time.time() if now is None else now
     state = current_mood_state(store, settings, account, chat, now=now)
     if state.get('life_override'):
@@ -559,6 +566,10 @@ def pair_sticker(decision, actions, choices, settings, *, draw=None):
     if not isinstance(md5,str) or md5 not in choices:return actions,{**status,'result':'no_suitable_suggestion'}
     capacity=settings.reply_max_parts if settings.chat_habits_enabled else 1
     if len(actions)>=capacity:return actions,{**status,'result':'action_limit'}
+    if getattr(settings, 'autonomy_enabled', False):
+        if str(decision.get('sticker_skip_reason') or '').strip():
+            return actions,{**status,'result':'model_skip'}
+        return [*actions,{'type':'sticker','id':md5,'display':'[原生表情] '+choices[md5]}],{**status,'result':'model_selected'}
     sample=random.random() if draw is None else draw
     if sample>=settings.sticker_pair_probability/100:return actions,{**status,'result':'probability_skip'}
     return [*actions,{'type':'sticker','id':md5,'display':'[原生表情] '+choices[md5]}],{**status,'result':'appended'}

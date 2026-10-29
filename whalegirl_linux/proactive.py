@@ -11,7 +11,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from .conversation import habit_static_prompt, plan_actions, sticker_dynamic_prompt, sticker_static_prompt, warmth_prompt
+from .conversation import habit_static_prompt, pair_sticker, plan_actions, sticker_dynamic_prompt, sticker_static_prompt, warmth_prompt
 from .memory import memory_parts
 from .mentions import apply_mentions, mention_options, mention_prompt
 from .stickers import parse_json
@@ -175,8 +175,11 @@ class ProactiveService:
         last = self.latest_human(chat)
         if not last or (not chat.endswith('@chatroom') and last['sender_id'] in self.muted_people(chat, now)):
             return False
+        if self.runtime.autonomy.active() and not self.runtime.autonomy.opportunity(chat, anchor=last['key'], now=now):
+            return False
+        due = self.runtime.autonomy.pending(s.account_id, chat, due=True, now=now)
         # Do not message unfamiliar contacts or repeatedly ping an unanswered opener.
-        if (state['waiting_after'] >= day_start(now) and last['timestamp'] <= state['waiting_after']):
+        if (not due and state['waiting_after'] >= day_start(now) and last['timestamp'] <= state['waiting_after']):
             return False
         decision_gap = s.proactive_decision_minutes * 60 * {'quiet': 2, 'balanced': 1, 'active': .5}[s.proactive_level]
         return (now >= max(state['last_decision'] + decision_gap,
@@ -259,6 +262,8 @@ class ProactiveService:
                      kind=1, local_id=0, timestamp=now, trigger='proactive',
                      content='[系统自主开聊候选，不是真实收到的微信消息]',
                      payload_json=json.dumps({'anchor': self.source_anchor(chat)}))
+        due_intents = r.autonomy.pending(s.account_id, chat, due=True, now=now)
+        r.autonomy.considered(first, self.source_anchor(chat))
         self.busy = True
         engine = None
         try:
@@ -303,6 +308,7 @@ class ProactiveService:
                   '"sources":["确切消息key或memory:ID"],"actions":[{"type":"text","text":"自然开场","mentions":[]},'
                   '{"type":"sticker","id":"目录ID"}],"image_request":null,"tieba_request":null,"tieba_used_meme_ids":[]}。'
                   'image_request使用既有send_library_image/generate_image格式；沉默时actions=[]且image_request=null。')
+            system += r.autonomy.static_prompt()
             data = {'beijing_time': datetime.fromtimestamp(now, BEIJING).isoformat(),
                     'chat': r.chat_labels.get(chat, chat), 'initiative': s.proactive_level,
                     'do_not_address': sorted(muted),
@@ -311,6 +317,7 @@ class ProactiveService:
                                         for v in recent]}
             dynamic = (memory_dynamic + r.images.tools.dynamic_prompt(image_context, base_image_ids)
                        + sticker_dynamic_prompt(choices, r.stickers.details(choices)))
+            dynamic += r.autonomy.dynamic_prompt(first)
             # Separate bounded request: a slow opener cannot occupy the regular reply worker.
             engine = r.engine_factory(api_url=s.api_url, api_key=self.config.api_key(), model=s.model,
                                       api_style=s.api_style,
@@ -333,9 +340,14 @@ class ProactiveService:
                         sources=[v for v in refs if isinstance(v, str) and v in source_ids][:12])
             self.last_error = ''
             if not decision['should_reply']:
+                if generation == self.config.generation and self.send_allowed(first):
+                    r.autonomy.accept(first, humans, decision, proactive=True)
+                    r.autonomy.finish_due(first, due_intents)
                 self.finish(identity, 'ignored')
                 return True
             actions = apply_mentions(plan_actions(decision, choices, s), mentions, mentions_enabled)
+            if r.autonomy.active():
+                actions, _ = pair_sticker(decision, actions, choices, s)
             for action in actions:
                 action['quote_local_id'] = 0
             if (generation != self.config.generation or not self.send_allowed(first) or self.blocked()
@@ -348,6 +360,8 @@ class ProactiveService:
                     return True
                 r.processing_key = key
                 r.processing = '自主聊天'
+                r.autonomy.accept(first, humans, decision, proactive=True)
+                r.autonomy.finish_due(first, due_intents)
                 self.store.insert(first, 'generating')
                 try:
                     self.finish(identity, 'sending')

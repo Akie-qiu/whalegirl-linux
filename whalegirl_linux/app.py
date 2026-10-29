@@ -37,6 +37,11 @@ class ReviewRequest(BaseModel):
     received: bool
 
 
+class AutonomyIntentRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    op: str = Field(pattern='^cancel$')
+
+
 class PromptRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     system_prompt: str = Field(default="", max_length=16000)
@@ -416,6 +421,18 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     @app.get('/api/proactive')
     async def proactive_state():
         return runtime.proactive.snapshot()
+
+    @app.get('/api/autonomy')
+    async def autonomy_state():
+        return runtime.autonomy.snapshot()
+
+    @app.post('/api/autonomy/intents/{identity}')
+    async def autonomy_intent(identity: str, body: AutonomyIntentRequest):
+        try:
+            runtime.autonomy.cancel(identity)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        return runtime.autonomy.snapshot()
 
     @app.post('/api/proactive/config')
     async def proactive_config(body: ProactiveConfigRequest):

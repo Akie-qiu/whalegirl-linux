@@ -20,6 +20,9 @@ DATA = Path('/var/lib/whalegirl-linux/core')
 CONTAINER = 'whalegirl-wechat-candidate-4118'
 FILES = {'whalegirl_linux/moments.py','whalegirl_linux/images.py','whalegirl_linux/image_references.py','whalegirl_linux/image_retention.py','tests/test_moments_references.py','tests/test_moments_recovery.py'}
 DEPLOYMENT = 'moments-recovery'
+TEST_MODULES = ('test_moments_recovery', 'test_moments_references')
+CONFIG_DEFAULTS = {}
+REQUIRE_ONLINE = True
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -88,12 +91,12 @@ def main():
         if name.endswith('.py'):
             compile(content, name, 'exec')
 
-    config_before = api('config')
+    config_before = {**CONFIG_DEFAULTS, **api('config')}
     comparable_config = {key: value for key, value in config_before.items() if key != 'api_key_configured'}
     state_before = api('state')
-    if state_before.get('paused_reason'):
+    if REQUIRE_ONLINE and state_before.get('paused_reason'):
         raise RuntimeError('Resolve paused or uncertain sends first')
-    if state_before.get('gateway', {}).get('status') != 'logged_in':
+    if REQUIRE_ONLINE and state_before.get('gateway', {}).get('status') != 'logged_in':
         raise RuntimeError('WeChat is offline; deployment postponed')
     if api('images').get('busy'):
         raise RuntimeError('Image work is active; deployment postponed')
@@ -129,7 +132,7 @@ def main():
             shutil.copy2(previous / name, saved)
 
     test = subprocess.run(
-        [str(BASE / 'venv/bin/python'), '-m', 'unittest','test_moments_recovery','test_moments_references','-q'],
+        [str(BASE / 'venv/bin/python'), '-m', 'unittest', *TEST_MODULES, '-q'],
         cwd=release,env={**os.environ,'PYTHONPATH':str(release)+':'+str(release/'tests'),'LOGURU_LEVEL':'WARNING'},
         capture_output=True,text=True,timeout=45,
     )
@@ -166,12 +169,13 @@ def main():
                 with urllib.request.urlopen('http://127.0.0.1:8092/health', timeout=2) as response:
                     health = json.load(response)
                 state_after = api('state')
-                config_after = api('config')
+                config_after = {**CONFIG_DEFAULTS, **api('config')}
                 config_after.pop('api_key_configured', None)
                 if (health.get('status') == 'ok' and not health.get('failed_background_tasks')
                         and config_after == comparable_config
-                        and state_after.get('gateway', {}).get('status') == 'logged_in'
-                        and state_after.get('stickers',{}).get('available',0)>0
+                        and (state_after.get('gateway', {}).get('status') == 'logged_in'
+                             or not REQUIRE_ONLINE and state_after.get('gateway',{}).get('status') == state_before.get('gateway',{}).get('status'))
+                        and (not REQUIRE_ONLINE or state_after.get('stickers',{}).get('available',0)>0)
                         and state_after.get('enabled') == bool(comparable_config.get('enabled'))):
                     break
             except Exception:
@@ -185,6 +189,7 @@ def main():
             'reader_pid': command('systemctl', 'show', 'whalegirl-native-reader', '-p', 'MainPID', '--value') == reader_pid,
             'container': command('docker', 'inspect', '--format', '{{.Id}} {{.RestartCount}}', CONTAINER) == container,
             'configuration_and_keys': all(digest(DATA / name) == value for name, value in protected.items()),
+            'existing_pause': state_after.get('paused_reason') == state_before.get('paused_reason'),
         }
         if not all(preserved.values()):
             raise RuntimeError('Deployment preservation check failed: ' + str(preserved))

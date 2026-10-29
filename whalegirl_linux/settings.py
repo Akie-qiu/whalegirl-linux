@@ -100,6 +100,7 @@ class Settings(BaseModel):
     sticker_cache_cleanup_enabled: bool = True
     sticker_failed_cache_hours: int = Field(default=24, ge=1, le=168)
     chat_habits_enabled: bool = True
+    autonomy_enabled: bool = False
     debounce_single_seconds: float = Field(default=0.65, ge=0, le=3)
     debounce_burst_seconds: float = Field(default=1.6, ge=0, le=5)
     debounce_max_seconds: float = Field(default=4, ge=0, le=8)
