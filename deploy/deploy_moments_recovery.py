@@ -52,6 +52,15 @@ def inflight():
         ))
 
 
+def require_space(extra=0):
+    # Root can consume reserved blocks even after the service user is out of
+    # space. Keep enough ordinary free space for the snapshot and live WAL.
+    snapshot_bytes=sum(path.stat().st_size for path in
+        (DATA/'state.sqlite3',DATA/'state.sqlite3-wal') if path.is_file())
+    if shutil.disk_usage(DATA).free < snapshot_bytes + extra + 256*1024**2:
+        raise RuntimeError('Insufficient disk space for a snapshot and live database; core unchanged')
+
+
 def switch(target, stamp):
     current = BASE / 'current'
     pending = BASE / ('current.' + DEPLOYMENT + '-' + stamp)
@@ -100,12 +109,16 @@ def main():
         raise RuntimeError('WeChat is offline; deployment postponed')
     if api('images').get('busy'):
         raise RuntimeError('Image work is active; deployment postponed')
+    moments_before = api('moments')
 
     native_pid = command('docker', 'exec', CONTAINER, 'pgrep', '-x', 'wechat')
     reader_pid = command('systemctl', 'show', 'whalegirl-native-reader', '-p', 'MainPID', '--value')
     container = command('docker', 'inspect', '--format', '{{.Id}} {{.RestartCount}}', CONTAINER)
     protected_names = ('settings.json', 'api-key.enc', 'image-api-key.enc', 'admin.token')
     protected = {name: digest(DATA / name) for name in protected_names if (DATA / name).exists()}
+    release_bytes=sum(path.stat().st_size for path in previous.rglob('*') if path.is_file()
+        and not {'__pycache__','test-runs','.git'}.intersection(path.relative_to(previous).parts))
+    require_space(release_bytes)
 
     stamp = time.strftime('%Y%m%d-%H%M%S') + '-' + str(time.time_ns() % 1_000_000_000)
     release = BASE / 'releases' / (DEPLOYMENT + '-' + stamp)
@@ -149,6 +162,7 @@ def main():
     unchanged()
     if any(digest(DATA / name) != value for name, value in protected.items()):
         raise RuntimeError('Configuration or credentials changed during staging')
+    require_space()
 
     switched = stopped = False
     try:
@@ -205,7 +219,7 @@ def main():
         if not all(preserved.values()):
             raise RuntimeError('Deployment preservation check failed: ' + str(preserved))
         moments=api('moments')
-        if comparable_config.get('moments_mode')=='auto' and comparable_config.get('moments_publish_enabled') and moments.get('counts',{}).get('publish',0)<comparable_config.get('moments_publish_per_day',0) and not moments.get('next_publish_at'):
+        if moments_before.get('next_publish_at') and comparable_config.get('moments_mode')=='auto' and comparable_config.get('moments_publish_enabled') and moments.get('counts',{}).get('publish',0)<comparable_config.get('moments_publish_per_day',0) and not moments.get('next_publish_at'):
             raise RuntimeError('Automatic Moments plan did not recover')
         report = {
             'release': str(release), 'previous': str(previous), 'backup': str(backup),

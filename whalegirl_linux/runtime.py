@@ -286,10 +286,12 @@ class Runtime:
                         from .gateway import Receipt
                         self.safety.outcome(account, Receipt(settled['state']=='sent',
                             definite_failure=settled['state']=='failed', details=settled.get('details') or {}), settings, chat=chat)
+                pending_controls={event['key'] for event in inserted}
                 for event in inserted:
+                    pending_controls.discard(event['key'])
                     if not first_read and 0 <= time.time()-event['timestamp'] <= 90:
                         handled=self.chat_control.observe(event,raw_events[event['key']],aliases=active_keywords,
-                            reply_to_bot=event.get('_reply_to_bot',False))
+                            reply_to_bot=event.get('_reply_to_bot',False),defer_keys=pending_controls)
                         if handled:continue
                         if not self.chat_control.allowed(event):
                             self.store.update(event['key'],'ignored',error='本会话临时静默，未明确唤醒；已保留上下文')
@@ -355,8 +357,10 @@ class Runtime:
 
     @classmethod
     def silence_requested(cls, raw, event, settings, *, extra_keywords=(), reply_to_bot=False):
+        local_command=chat_command(raw.get('content'),(*settings.keywords,*extra_keywords))
         if (raw.get('isSelf') is not False or raw.get('type') not in (1,49) or raw.get('forwarded')
-                or not cls.silence_phrase(raw.get('content'), (*settings.keywords, *extra_keywords))):
+                or not (local_command and local_command['op']=='quiet'
+                        or cls.silence_phrase(raw.get('content'), (*settings.keywords, *extra_keywords)))):
             return False
         text = normal(re.sub(r'@[\w.-]+', '', str(raw.get('content') or '')))
         group = event['chat'].endswith('@chatroom')
@@ -368,7 +372,7 @@ class Runtime:
         addressed = (not group or raw.get('isMentioned') is True or reply_to_bot
                      or bool(settings.account_id and str(reply.get('senderId') or '') == settings.account_id)
                      or explicitly_named)
-        return bool(addressed)
+        return bool(addressed or group and not reply)
 
     @staticmethod
     def should_reply(raw, event, settings, *, continuing=False, extra_keywords=(), reply_to_bot=False):

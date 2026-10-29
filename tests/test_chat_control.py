@@ -39,7 +39,8 @@ class QuietTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.runtime.engine)
         self.assertEqual(self.runtime.proactive.chat_state(CHAT)['paused_until'],0)
 
-    async def test_quiet_still_archives_but_only_explicit_wake_replies(self):
+    async def test_quiet_archives_and_wake_word_restores_normal_replies(self):
+        self.config.save(self.config.settings.model_copy(update={'natural_group_replies':True}))
         await self.poll('先安静一会儿')
         row=await self.poll('大家继续讨论',mid=2,mentioned=False)
         self.assertEqual(row['state'],'ignored')
@@ -48,9 +49,9 @@ class QuietTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row['state'],'queued')
         engine=await self.answer([{'type':'text','text':'我看着呢'}])
         self.assertEqual(self.gateway.sent,[('text','我看着呢')]);self.assertEqual(engine.calls,1)
-        self.assertTrue(self.runtime.chat_control.active('account',CHAT))
+        self.assertFalse(self.runtime.chat_control.active('account',CHAT))
         row=await self.poll('顺便聊别的',mid=4,mentioned=False)
-        self.assertEqual(row['state'],'ignored')
+        self.assertEqual(row['state'],'queued')
 
     async def test_private_messages_are_not_all_implicit_wakeups(self):
         self.config.save(self.config.settings.model_copy(update={'allowed_chat_ids':[CHAT,'friend']}))
@@ -59,13 +60,70 @@ class QuietTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row['state'],'ignored')
         row=await self.poll('鲸鱼娘 过来一下',mid=3,chat='friend',mentioned=False)
         self.assertEqual(row['state'],'queued')
+        self.assertTrue(self.runtime.chat_control.active('account','friend'))
         self.assertFalse(self.runtime.chat_control.active('account',CHAT))
 
     async def test_quoted_and_other_peoples_commands_do_not_change_state(self):
-        await self.poll('先安静一会儿',mentioned=False)
+        await self.poll('先安静一会儿',mentioned=False,reply={'senderId':'another-person'})
         self.assertFalse(self.runtime.chat_control.active('account',CHAT))
         await self.poll('先安静一会儿',mid=2,forwarded={'items':[{'content':'安静'}]})
         self.assertFalse(self.runtime.chat_control.active('account',CHAT))
+
+    async def test_plain_group_quiet_persists_until_mention_and_does_not_affect_other_chats(self):
+        self.config.save(self.config.settings.model_copy(update={
+            'allowed_chat_ids':[CHAT,'other@chatroom'],'proactive_enabled':True,'proactive_chat_ids':[CHAT],
+            'natural_group_replies':True}))
+        row=await self.poll('闭嘴',mentioned=False)
+        control=ChatControl(self.runtime)
+        self.assertEqual(row['state'],'ignored');self.assertEqual(control.state('account',CHAT)['until'],-1)
+        self.assertFalse(control.active('account','other@chatroom'))
+        with patch('whalegirl_linux.chat_control.time.time',return_value=time.time()+86400):
+            self.assertTrue(control.active('account',CHAT))
+        self.assertIsNone(self.runtime.engine);self.assertEqual(self.gateway.sent,[])
+        self.assertFalse(self.runtime.proactive.permitted(CHAT))
+        row=await self.poll('随口一句',mid=2,mentioned=False)
+        self.assertEqual(row['state'],'ignored')
+        row=await self.poll('拍了拍',mid=3,mentioned=False,event='pat',pat={'isForMe':True})
+        self.assertEqual(row['state'],'ignored');self.assertTrue(self.runtime.chat_control.active('account',CHAT))
+        wake=await self.poll('@机器人 回来看看',mid=4)
+        self.assertEqual(wake['state'],'queued');self.assertFalse(self.runtime.chat_control.active('account',CHAT))
+        self.assertTrue(self.runtime.proactive.permitted(CHAT));self.assertFalse(control.allowed(row))
+        row=await self.poll('继续说这个事情',mid=5,mentioned=False)
+        self.assertEqual(row['state'],'queued')
+        self.assertFalse(ChatControl(self.runtime).active('account',CHAT))
+
+    async def test_quoted_wake_words_and_old_mentions_do_not_resume_group(self):
+        old=await self.poll('@机器人 你好')
+        await self.poll('安静半小时',mid=2,mentioned=False)
+        self.assertEqual(self.runtime.chat_control.state('account',CHAT)['until'],-1)
+        row=await self.poll('这句话我引用一下',mid=3,mentioned=False,
+            reply={'senderId':'person','content':'鲸鱼娘 回来'})
+        self.assertEqual(row['state'],'ignored');self.assertTrue(self.runtime.chat_control.active('account',CHAT))
+        self.runtime.chat_control.observe(old,{'isSelf':False,'type':1,'content':'@机器人 你好','isMentioned':True})
+        self.assertTrue(self.runtime.chat_control.active('account',CHAT))
+
+    async def test_waking_a_trigger_only_group_preserves_its_original_rules(self):
+        self.config.save(self.config.settings.model_copy(update={
+            'natural_group_replies':True,'trigger_only_chat_ids':[CHAT]}))
+        await self.poll('闭嘴',mentioned=False)
+        row=await self.poll('鲸鱼娘 继续看看',mid=2,mentioned=False)
+        self.assertEqual(row['state'],'queued');self.assertFalse(self.runtime.chat_control.active('account',CHAT))
+        row=await self.poll('普通闲聊',mid=3,mentioned=False)
+        self.assertEqual(row['state'],'ignored')
+
+    async def test_quiet_wake_and_next_message_in_one_poll_keep_the_new_reply(self):
+        self.config.save(self.config.settings.model_copy(update={'natural_group_replies':True}))
+        self.store.baseline('account',CHAT)
+        now=time.time()
+        rows=[{'serverId':mid,'localId':mid,'type':1,'content':content,'sender':'person',
+               'senderName':'群友','isSelf':False,'isMentioned':mentioned,'timestamp':now+mid*.001-.02}
+              for mid,content,mentioned in [(1,'闭嘴',False),(2,'别的闲聊',False),(3,'@机器人 回来',True),(4,'继续聊刚才的',False)]]
+        async def messages(target,**kwargs):return rows
+        self.gateway.messages=messages
+        await self.runtime.poll_once()
+        self.assertFalse(self.runtime.chat_control.active('account',CHAT))
+        self.assertEqual([self.store.get(f'account/{CHAT}/{mid}')['state'] for mid in range(1,5)],
+                         ['ignored','ignored','queued','queued'])
 
     async def test_state_survives_recreation_expires_and_does_not_replay_old_messages(self):
         event=self.event();self.queue(event)

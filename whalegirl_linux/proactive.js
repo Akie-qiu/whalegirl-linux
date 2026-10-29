@@ -23,8 +23,8 @@
       <p class="hint">这段参考与上方设置一同保存，进入固定提示词；不启动后台学习任务，不要求 AI 统计次数或照抄群友台词。</p>
     </details>
     <h3>临时安静</h3>
-    <div class="settings-grid"><label>未指定时长时，安静多久 / 分钟<input id="quiet-default-minutes" type="number" min="1" max="1440"></label></div>
-    <p class="hint">对机器人说“先安静一会儿”“安静半小时”即可临时潜水。期间明确 @、拍一拍或关键词唤醒，只答这一次；说“可以说话了”或到时恢复原规则。各群互不影响，聊天仍留作上下文。</p>
+    <div class="settings-grid"><label>私聊未指定时长时，安静多久 / 分钟<input id="quiet-default-minutes" type="number" min="1" max="1440"></label></div>
+    <p class="hint">群里明确说“闭嘴”“先安静一会儿”，本群立即静默，不发送文字或表情，也不主动聊天；直到下次 @机器人或命中唤醒词，恢复原来的回复规则，拍一拍不解除。私聊仍按设置的时长临时安静。各会话互不影响，聊天仍留作上下文。</p>
     <p class="hint" id="proactive-pacing-note"></p>
     <h3>主动开聊</h3>
     <div class="settings-grid">
@@ -122,12 +122,12 @@
       });
       const quiet = latest?.quiet?.[id];
       const quietLine = document.createElement('p'); quietLine.className = 'hint';
-      quietLine.textContent = quiet?.active ? (quiet.until < 0 ? '临时静默 · 等待明确恢复' : '临时静默至 ' + new Date(quiet.until*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'})) + ' · 明确唤醒只答本次' : '正常参与 · 按当前唤醒和自主聊天规则';
+      quietLine.textContent = quiet?.active ? (quiet.until < 0 ? '持续静默' : '临时静默至 ' + new Date(quiet.until*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'})) + (id.endsWith('@chatroom') ? ' · 下次 @或唤醒词恢复正常回复' : ' · 明确唤醒只答本次') : '正常参与 · 按当前唤醒和自主聊天规则';
       const quietButton = document.createElement('button'); quietButton.className = 'secondary';
-      quietButton.textContent = quiet?.active ? '恢复此会话聊天' : '让此会话安静一会儿';
+      quietButton.textContent = quiet?.active ? '恢复此会话聊天' : id.endsWith('@chatroom') ? '让此群持续静默' : '让此会话安静一会儿';
       quietButton.onclick = () => action(quietButton,async () => {
-        latest = await api('chat-control','POST',{chat:id,op:quiet?.active?'resume':'quiet',minutes:cfg.quiet_default_minutes ?? 30});
-        chatLabels(); notice(quiet?.active ? '已解除静默，恢复原来的聊天规则' : '已临时静默；明确唤醒仍可回答本次');
+        latest = await api('chat-control','POST',{chat:id,op:quiet?.active?'resume':'quiet',minutes:id.endsWith('@chatroom')?0:(cfg.quiet_default_minutes ?? 30)});
+        chatLabels(); notice(quiet?.active ? '已解除静默，恢复原来的聊天规则' : id.endsWith('@chatroom') ? '本群已持续静默，下次 @或唤醒词恢复正常回复' : '已临时静默；明确唤醒仍可回答本次');
       });
       const advanced = document.createElement('details'), summary = document.createElement('summary');
       summary.textContent = '单独暂停主动联系';advanced.append(summary,p,button);

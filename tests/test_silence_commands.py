@@ -34,7 +34,7 @@ class SilenceCommandTests(unittest.TestCase):
                 raw, event = self.message(text)
                 self.assertFalse(Runtime.should_reply(raw, event, self.settings))
 
-    def test_group_silence_command_only_applies_when_addressed_to_bot(self):
+    def test_group_silence_command_also_accepts_clear_standalone_commands(self):
         raw, event = self.message('@鲸鱼娘 闭嘴', chat='room@chatroom', mentioned=True)
         self.assertFalse(Runtime.should_reply(raw, event, self.settings))
 
@@ -42,8 +42,8 @@ class SilenceCommandTests(unittest.TestCase):
         self.assertFalse(Runtime.should_reply(raw, event, self.settings))
 
         raw, event = self.message('闭嘴', chat='room@chatroom')
-        self.assertFalse(Runtime.silence_requested(raw, event, self.settings))
-        self.assertTrue(Runtime.should_reply(raw, event, self.settings))
+        self.assertTrue(Runtime.silence_requested(raw, event, self.settings))
+        self.assertFalse(Runtime.should_reply(raw, event, self.settings))
 
     def test_reply_to_bot_can_use_plain_shut_up_command(self):
         raw, event = self.message(
