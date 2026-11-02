@@ -11,8 +11,9 @@ from datetime import datetime
 from pathlib import Path
 
 from .gateway import message_id
-from .model_reply import guarded_chat
+from .model_reply import direct_text_decision, guarded_chat
 from .delivery import MAX_SEND_ATTEMPTS, reconcile_outbound
+from .reply_pipeline import ReplyPipeline
 from .context import build_context, vision_reply
 from .stickers import StickerCatalog, parse_json
 from .safety import SafetyGuard, client_warning
@@ -20,7 +21,7 @@ from .conversation import (
     anti_formula_check, current_life_scene, current_mood_state, evolve_group_mask,
     get_group_mask, habit_dynamic_prompt, habit_prompt, habit_static_prompt,
     pair_sticker, participation, persona_live_dynamic_prompt, plan_actions,
-    asks_sticker_content, repeat_candidate, sticker_dynamic_prompt, sticker_prompt, sticker_static_prompt,
+    asks_sticker_content, repeat_candidate, sticker_dynamic_prompt, sticker_prompt, sticker_static_prompt, sticker_usage_prompt,
     update_mood_after_turn, warmth_prompt,
 )
 from .memory import MemoryBook, consolidation_data, memory_parts, memory_prompt, participants, own_text
@@ -31,6 +32,8 @@ from .images import ImageService
 from .tieba import TiebaService
 from .resources import native_pressure
 from .message_payload import incoming_content
+from .social_context import conversation_cues, quote_candidates
+from .natural_chat import base_prompt as natural_base_prompt, reply_protocol
 from .search import DeepSeekSearch, search_dynamic_prompt, search_prompt, search_static_prompt
 from .recovery import RecoveryService
 from .chat_control import ChatControl, STATIC_PROMPT as CHAT_CONTROL_PROMPT, command as chat_command
@@ -87,6 +90,9 @@ class Runtime:
         self.last_send = 0.0
         self.tasks = []
         self.processing = ""
+        self.send_processing=''
+        self.pipeline=ReplyPipeline(self)
+        self.poll_wake=asyncio.Event()
         self.processing_key = ""
         self.chat_turn_lock = asyncio.Lock()
         # A wait-for-the-next-message request is kept per conversation.  It is
@@ -120,7 +126,17 @@ class Runtime:
         self.proactive = ProactiveService(self)
         self.autonomy = AutonomyService(self)
         self.recovery = RecoveryService(self)
+        from .growth import GrowthService
+        self.growth=GrowthService(self)
         self.ensure_authority_files()
+
+    @property
+    def processing(self):
+        return self._processing or getattr(self,'send_processing','') or (
+            '等待发送' if getattr(getattr(self,'pipeline',None),'chats',None) else '')
+
+    @processing.setter
+    def processing(self,value):self._processing=value
 
     async def start(self):
         self.tasks = [asyncio.create_task(self._poll_loop()), asyncio.create_task(self._worker_loop()),
@@ -131,7 +147,8 @@ class Runtime:
                       asyncio.create_task(self.images.metadata_loop()),asyncio.create_task(self.images.notice_loop()),
                       asyncio.create_task(self.tieba.browse_loop()),asyncio.create_task(self.tieba.dispatch_loop()),
                       asyncio.create_task(self.proactive.loop()),asyncio.create_task(self.learning.loop()),
-                      asyncio.create_task(self.autonomy.loop()), asyncio.create_task(self.recovery.loop())]
+                      asyncio.create_task(self.autonomy.loop()), asyncio.create_task(self.recovery.loop()),
+                      asyncio.create_task(self.growth.loop()),asyncio.create_task(self.pipeline.loop())]
 
     async def close(self):
         wait_tasks = list(self.followup_waits.values())
@@ -144,6 +161,7 @@ class Runtime:
             await self.engine.close()
         if hasattr(self.web_search, 'close'):
             await self.web_search.close()
+        await self.growth.close()
         await self.gateway.close()
         self.store.close()
 
@@ -317,6 +335,10 @@ class Runtime:
         # Preserve current-message addressing separately from quoted/forwarded data.
         if raw.get('isMentioned') is True:
             payload['image_address'] = {'mentioned_me': True}
+        if isinstance(raw.get('mentionedUserIds'), list):
+            payload['mentionedUserIds'] = list(dict.fromkeys(
+                identity for identity in raw['mentionedUserIds']
+                if isinstance(identity, str) and 0 < len(identity) <= 200))[:20]
         if kind==47 and re.fullmatch('[0-9a-f]{32}',str((raw.get('sticker') or {}).get('md5','')).lower()):
             payload['sticker']={'md5':raw['sticker']['md5'].lower()}
         if kind in (3,47):
@@ -396,11 +418,12 @@ class Runtime:
                 return direct or settings.natural_group_replies
         return True
 
-    async def process_next(self, *, exclude_chats=()):
+    async def process_next(self, *, exclude_chats=(),defer_delivery=False):
         settings = self.config.settings
         if not settings.enabled or self.paused_reason or self.safety.held(settings.account_id):
             return False
-        exclude_chats = set(exclude_chats) | self.autonomy.waiting_chats() | self._media_waiting_chats() | {
+        if defer_delivery and self.pipeline.full:return False
+        exclude_chats = set(exclude_chats) | self.pipeline.chats | self.autonomy.waiting_chats() | self._media_waiting_chats() | {
             chat for chat, task in self.followup_waits.items() if not task.done()
         }
         first = self.store.queue(exclude_chats=exclude_chats)
@@ -484,10 +507,19 @@ class Runtime:
         event = {**first, "content": "\n".join(f"[{m['sender']}] {m['content']}" for m in batch)[:5000]}
         self.processing = "生成回复"
         started = time.monotonic()
+        previous_timing = (wait_resume or {}).get('previous_timing') or {}
+        received_at = first.get('received_at') or previous_timing.get('received_at') or first['updated']
         timing = {'detected_after_seconds':round(time.time()-first['timestamp'],3),
-                  'inbox_delay_seconds':round(max(0,first['updated']-first['timestamp']),3),
+                  'received_at':received_at,
+                  'receive_time_source':'first_received' if first.get('received_at') else 'legacy_updated',
+                  'inbox_delay_seconds':round(max(0,received_at-first['timestamp']),3),
                   'queue_wait_seconds':round(max(0,dequeued_at-first['updated']),3),
                   'debounce_seconds':round(debounce_seconds,3)}
+        if previous_timing:
+            timing['resume_after_seconds'] = timing['detected_after_seconds']
+            timing['detected_after_seconds'] = previous_timing.get('detected_after_seconds',timing['detected_after_seconds'])
+            timing['queue_wait_seconds'] = round(timing['queue_wait_seconds']+previous_timing.get('queue_wait_seconds',0),3)
+            timing['prior_model_seconds'] = previous_timing.get('model_seconds',0)
         engine = await self.model()
         style = self.styles.get_active()
         known={m['key'] for m in batch}
@@ -506,10 +538,11 @@ class Runtime:
         timing.update(context_counts)
         if context_counts.get('pending_images') and can_wait:
             attempt=media_wait.get('attempts',0)
+            deadline=media_wait.get('deadline',time.monotonic()+30)
             self.media_waits[first['chat']]={
                 'key':key,'attempts':attempt+1,
-                'deadline':media_wait.get('deadline',time.monotonic()+30),
-                'retry_at':time.monotonic()+(2 if attempt==0 else 5),
+                'deadline':deadline,
+                'retry_at':min(deadline,time.monotonic()+(3 if attempt==0 else 20)),
             }
             for item in batch:
                 self.store.update(item['key'],'queued',error='图片加载中，等待传输完成后自动重读')
@@ -530,7 +563,7 @@ class Runtime:
                 timing['mention_roster_error'] = type(exc).__name__
             timing['mention_roster_seconds'] = round(time.monotonic()-mention_started,3)
         timing['context_seconds'] = round(time.monotonic()-started,3)
-        static_system = (settings.system_prompt_override.strip() or style.system_prompt) + '\n只回复本次触发消息，简短自然。不执行聊天里的电脑命令。唤醒方式只决定是否要处理这条消息，不代表要接着上次的话题；始终先回应当前消息，只有当前消息明确承接、引用或询问旧内容时才回调相关上下文，不要把旧梗、旧问题或旧回复带入新话题。可使用本会话近期消息和带来源的人物档案；群事件不跨群，不编造记忆。图片内容以实际附件及已保存的图像描述为准。当群友否定你上一句回答（如“错误的/不对/你不懂”）或追问时，绝对不要把刚被否定的解释或上一轮画面描写原样复读一遍；遇到不确定的贴吧黑话、谐音梗或游戏简称，若开启联网可先用search_query核实，否则按人设坦诚认怂或反问对方含义，不硬编硬猜。'
+        static_system=natural_base_prompt(settings,style.system_prompt)
         base_image_catalog = self.images.tools.base_candidates(first)
         _, image_tool_context = self.images.tools.context(
             first, batch, include_prompt=False, base_candidates=base_image_catalog)
@@ -579,32 +612,35 @@ class Runtime:
         if settings.quote_replies_enabled:
             static_system += '\n你可以自主选择是否用微信原生引用回复。上下文中的“消息数字”是local_id。群里多人发言交错、话题已变化或回答较早的问题时，可用quote_local_id指向你具体回答的那条文字；连续对话、普通寒暄和拍一拍通常不引用，填0。只选确切相关的消息，不要每次引用。发送原生表情时不引用，quote_local_id填0。此选择与回复同时完成，不需要额外解释。'
             recent = self.store.conversation(first['account'], first['chat'], settings.context_messages)
-            for row in [r for r in recent if r['kind'] == 1 and r['is_self'] == 0][-12:]:
-                server_id = row['key'].rsplit('/', 1)[-1]
-                if server_id.isdigit() and row['local_id']:
-                    quote_options[int(row['local_id'])] = {'local_id':int(row['local_id']),
-                        'server_id':server_id, 'content':row['content']}
+            quote_options = quote_candidates(recent, batch)
         structured=bool(settings.learning_enabled or settings.tieba_enabled or settings.images_chat_enabled or mention_choices or choices or natural or image_keys or quote_options or settings.chat_habits_enabled or settings.editable_memory_enabled or settings.web_search_enabled or settings.affection_enabled or settings.sticker_self_manage_enabled)
         structured = structured or self.autonomy.active()
         static_system += self.affection.static_prompt(first,settings,include_venue=False)
         static_system += warmth_prompt(settings)
-        static_system += self.affection.venue_prompt(first)
+        static_system += self.affection.venue_prompt(first,settings)
         if first['chat'].endswith('@chatroom'):
             static_system += mention_static_prompt(mentions_enabled)
         # Keep the format constraint after common rules and ahead of the
         # per-chat catalog, so gallery changes cannot split those rules.
         if structured:
-            static_system+='\n只输出JSON：{"should_reply":true,"actions":[],"image_request":null,"tieba_request":null,"tieba_used_meme_ids":[],"search_query":"","fetch_url":"","memory_ops":[],"learning_proposals":[],"image_descriptions":[]}。actions是一份有序发送计划，按语境自主选0～'+str(settings.reply_max_parts)+'个动作；文字为{"type":"text","text":"自然短句","quote_local_id":0,"mentions":[]}，原生表情为{"type":"sticker","id":"目录中的确切ID"}。可以只有文字、只有一个表情或穿插发送，不固定格式或条数；程序不再随机追加表情。旁观时should_reply=false且actions=[]；图片描述格式为{"key":"实际附件key","description":"真实可见内容"}。不输出代码围栏。'
+            static_system+=reply_protocol()
         dynamic_system = ''
         dynamic_system += self.images.tools.dynamic_prompt(image_tool_context, base_image_ids)
         dynamic_system += habit_dynamic_prompt(settings,social)
+        dynamic_system += conversation_cues(first,batch,recent_rows,now=time.time())
         dynamic_system += persona_live_dynamic_prompt(
             self.store, settings, first, batch, natural=natural
         )
         if first['chat'].endswith('@chatroom'):
             dynamic_system += mention_dynamic_prompt(mention_choices,mentions_enabled)
         dynamic_system += memory_dynamic
-        dynamic_system += self.autonomy.dynamic_prompt(first)
+        growth_context={}
+        dynamic_system += self.growth.prompt(first,batch,growth_context)
+        timing['growth']=growth_context
+        memory_recall['ids']=list(dict.fromkeys([*memory_recall.get('ids',[]),*growth_context.get('ids',[])]))
+        dynamic_system += self.autonomy.dynamic_prompt(first, batch)
+        memory_recall['ids'] = list(dict.fromkeys([*memory_recall.get('ids', []),
+                                                   *first.get('_interaction_versions', {})]))
         dynamic_system += self.chat_control.dynamic_prompt(first)
         learning_recalled = memory_recall.get('learning_ids', [])
         timing['learning_recall_count'] = len(learning_recalled)
@@ -614,18 +650,16 @@ class Runtime:
         timing['tieba_recall'] = tieba_recall
         dynamic_system += search_dynamic_prompt(settings)
         dynamic_system += self.sticker_library.dynamic_prompt(first,batch,settings)
-        if first.get('trigger') == 'continuation':
-            dynamic_system+='\n本次是你主动开聊后，对方在短暂交流窗口内的发言，可能是在接你的话。结合说话对象判断是否继续；对方在和别人说话或不想聊时should_reply=false，不因窗口开启就强行抢答。'
-        elif natural:
-            dynamic_system+='\n本次是群聊自然接话候选，没有显式@。结合近期机器人消息判断：对方在接你的话、追问你、邀请大家聊天、表达值得简短回应的情绪或有适合参与的话题时，可以自然接话；明显是别人互聊、重复内容、无意义刷屏或你已连续说很多时，should_reply=false并保持安静。不能因为没有@就一律沉默，也不能每句都抢答。'
-        else:
-            dynamic_system+='\n本次是明确发给你的消息（含拍一拍或私聊），优先简短回应；无意义测试、反复催促或明确不需回复时可旁观。拍一拍可以俏皮回应或用一个原生表情。'
+        dynamic_system+='\n本轮是群内普通新消息。' if natural else '\n本轮为唤醒、接续或私聊新消息，结合具体内容判断。'
         if sticker_question and incoming_stickers:
             dynamic_system += ('\n对方明确询问本轮收到或引用的原生表情内容。仅据下列对应表情档案说明画面或文字；'
                                '不要把描述扩展成旧话题，也不要声称档案未记录的细节。'
                                + sticker_dynamic_prompt(incoming_stickers,self.stickers.details(incoming_stickers),include_visual=True))
         if choices:
             dynamic_system+=sticker_dynamic_prompt(choices,self.stickers.details(choices))
+            frequency={}
+            dynamic_system+=sticker_usage_prompt(self.store,settings,first,frequency)
+            timing['sticker_frequency']=frequency
         if image_keys:
             dynamic_system += '\n此次含图像，只按实际图像识别；动图多格是同一个表情不同时刻。小字或细节看不清时明确说明，不猜测。image_descriptions按所给图片key保存真实可见内容。'
             if image_question:
@@ -635,7 +669,7 @@ class Runtime:
         if quote_options:
             dynamic_system += '\n可引用ID为：'+json.dumps(list(quote_options))+'。'
         repeat = repeat_candidate(recent_rows,time.time()) if natural and settings.chat_habits_enabled else None
-        if repeat and random.random()<settings.repeat_probability:
+        if repeat and not self.autonomy.experience.active() and random.random()<settings.repeat_probability:
             dynamic_system+='\n当前三个不同群友形成复读队形，可考虑仅复读这一句一次：'+json.dumps(repeat['content'],ensure_ascii=False)+'。若内容不宜重复可沉默；机器人已经说过时别跟。'
             if repeat['kind']==47:
                 dynamic_system+='这是一条原生表情的含义标签；只可选目录中匹配的sticker动作，不能把标签文字发出。'
@@ -671,8 +705,15 @@ class Runtime:
                 )
         # Gallery changes should not invalidate format and wait-tool rules.
         static_system += self.images.tools.catalog_prompt(base_image_catalog)
+        if structured:
+            dynamic_system += '\n返回接口仍使用JSON动作计划；口语回答写在actions的text里，接口字段名不属于发给群友的聊天文字。'
+        if wait_tool_enabled:
+            dynamic_system += '\n等待工具会让本轮再停最多'+str(settings.followup_wait_seconds)+'秒，仅在对方确实没说完时使用；完整问题、寒暄和要求配表情都直接处理。'
         system = static_system + ('\n【本轮动态上下文】' + dynamic_system if dynamic_system else '')
         model_started = time.monotonic()
+        def model_elapsed():
+            return round(float(previous_timing.get('model_seconds') or 0)+time.monotonic()-model_started,3)
+        timing['pre_model_seconds']=round(model_started-started,3)
         if hasattr(self.gateway,'warm_send_status'):
             self.gateway.warm_send_status()
         max_reply_tokens = settings.max_tokens + (650 if settings.images_chat_enabled else 400 if image_keys else 240 if structured else 0)
@@ -700,20 +741,22 @@ class Runtime:
             ]]
         search_tools = (DeepSeekSearch.tools(engine, settings)
                         if self.followup_tools_disabled_generation != generation else [])
+        initial_tool_calls = []
         if (wait_tool_enabled or resume_with_tool or search_tools) and hasattr(engine, 'chat_with_tools'):
             wait_result = await engine.chat_with_tools(
                 messages, ([{
                     'type': 'function',
                     'function': {
                         'name': 'wait_for_next_message',
-                        'description': '暂缓本轮回答，等待同一会话的下一条消息补充上下文，最多等待控制台设置的秒数。',
+                        'description': '仅在对方明确尚未说完、马上要补充条件或附件时暂缓回答。完整提问、普通短句、寒暄、要求配表情均不要等待。调用后最多额外等待控制台设置的秒数。',
                         'parameters': {
                             'type': 'object',
-                            'properties': {'reason': {'type': 'string', 'maxLength': 120}},
+                            'properties': {'reason': {'type': 'string', 'maxLength': 120,
+                                'description':'指出对方哪一部分尚未说完，以及下一条会怎样改变回答；不要仅以内容简短或有指代为由。'}},
                             'additionalProperties': False,
                         },
                     },
-                }] if wait_tool_enabled or resume_with_tool else []) + search_tools,
+                }] if wait_tool_enabled else []) + search_tools,
                 system_prompt=system, max_tokens=max_reply_tokens,
                 response_format={'type':'json_object'} if structured else None,
                 operation='image' if image_keys else 'chat',
@@ -721,6 +764,7 @@ class Runtime:
             )
             search_decision = DeepSeekSearch.native_decision(wait_result)
             tool_calls = wait_result.get('tool_calls') or []
+            initial_tool_calls = tool_calls
             wait_call = next((
                 call for call in tool_calls
                 if isinstance(call, dict)
@@ -735,16 +779,27 @@ class Runtime:
                     arguments = {}
                 reason = str(arguments.get('reason') or '模型判断对方可能还没说完')[:120]
                 self.store.update(key, 'waiting', error='已暂缓，等待同一会话下一条消息：' + reason)
-                self._schedule_followup_wait(first, generation, reason, followup_cursor,
-                                             followup_received_after,
-                                             batch_keys=[item['key'] for item in batch],
-                                             assistant_message=wait_result.get('assistant_message'))
+                timing['model_seconds'] = model_elapsed()
+                timing['initial_model_seconds'] = round(time.monotonic()-model_started,3)
                 timing['followup_wait'] = {'enabled': True, 'requested': True,
                                             'seconds': settings.followup_wait_seconds}
                 timing['total_seconds'] = round(time.time() - first['timestamp'], 3)
+                self._schedule_followup_wait(first, generation, reason, followup_cursor,
+                                             followup_received_after,
+                                             batch_keys=[item['key'] for item in batch],
+                                             assistant_message=wait_result.get('assistant_message'),
+                                             previous_timing=timing)
                 self.store.metrics(key, timing)
                 return True
             reply = json.dumps(search_decision, ensure_ascii=False) if search_decision else wait_result.get('content') or ''
+            # A model may repeat an already completed wait, or return an
+            # unrecognised function. Nothing has been executed in either case.
+            # Ask for a final decision once; never mark a tool-only turn empty.
+            if not reply and tool_calls:
+                timing['native_tool_recovery']={'reason':'unhandled_tool_call',
+                    'names':[str((c.get('function') or {}).get('name') or '')[:80] for c in tool_calls]}
+                reply=await engine.chat(messages,system_prompt=system,max_tokens=max_reply_tokens,
+                    response_format={'type':'json_object'},operation='chat')
             if not reply and str(getattr(engine,'last_error','')).startswith('HTTP 400'):
                 self.followup_tools_disabled_generation = generation
                 reply = await engine.chat(
@@ -765,10 +820,14 @@ class Runtime:
                 'seconds': wait_resume.get('seconds', settings.followup_wait_seconds),
                 'messages': wait_resume.get('messages', 0),
             }
-        timing['model_seconds'] = round(time.monotonic()-model_started,3)
+        timing['initial_model_seconds'] = round(time.monotonic()-model_started,3)
+        timing['model_seconds'] = model_elapsed()
+        if getattr(engine,'last_response_meta',None):
+            timing['model_response']=dict(engine.last_response_meta)
         if not reply or not reply.strip():
             self.last_error = engine.last_error or "模型未返回内容"
             self.store.update(key, "failed", error=self.last_error)
+            self.store.metrics(key,timing)
             if self.last_error in ("HTTP 401", "HTTP 402", "HTTP 403"):
                 self.paused_reason = {"HTTP 401": "模型凭据无效", "HTTP 402": "模型账户余额不足", "HTTP 403": "模型接口权限不足"}[self.last_error]
             return True
@@ -777,11 +836,13 @@ class Runtime:
             return True
         actions=[]
         decision={}
+        mood_updated = False
         learning_proposals = []
         def collect_learning(value):
             nonlocal learning_proposals
             learning_proposals = merge_proposals(learning_proposals, value.get('learning_proposals'))
         def offer_learning(outcome):
+            self.autonomy.experience.settle(first, outcome)
             self.learning.offer(first, batch, learning_proposals, learning_recalled,
                                 {'delivery': {'code': outcome}, 'image': image_result or {},
                                  'search': timing.get('web_search') or {}})
@@ -792,7 +853,14 @@ class Runtime:
             decision = {}
             recovery_stage = 'parse'
             try:
-                decision=parse_json(reply)
+                try:
+                    decision=parse_json(reply)
+                except (TypeError,ValueError):
+                    decision=direct_text_decision(reply,
+                        explicit=first.get('trigger') in ('direct','pat') and not natural,
+                        image_keys=image_keys,tool_calls=initial_tool_calls,resumed=bool(wait_resume))
+                    if decision is None:raise
+                    timing['format_recovery']='plain_text_local'
                 if not isinstance(decision,dict):raise ValueError('Invalid reply decision')
                 if self.chat_control.model_control(first,batch,decision)=='quiet':
                     self.store.update(key,'ignored',error='要求机器人安静，已进入临时静默')
@@ -852,7 +920,8 @@ class Runtime:
                 choices={m:v for m,v in choices.items() if m not in excluded}
                 if image_tool_context.get('direct_library_request') and not natural:
                     decision['should_reply'] = True
-                self.autonomy.accept(first, batch, decision)
+                autonomy_res = self.autonomy.accept(first, batch, decision)
+                mood_updated = bool(autonomy_res.get('mood_applied')) if isinstance(autonomy_res, dict) else bool(autonomy_res)
                 if decision.get('should_reply') is False or (natural and decision.get('should_reply') is not True):
                     self.images.tools.trace(first, {'decision':'chat', 'ok':True, 'code':'silent'})
                     self.store.update(key,'ignored',error='自然接话：旁观')
@@ -937,7 +1006,7 @@ class Runtime:
                 if timing.get('web_search'):
                     for action in actions:
                         if action['type']=='text':action['quote_local_id']=0
-                timing['model_seconds']=round(time.monotonic()-model_started,3)
+                timing['model_seconds']=model_elapsed()
             except (ValueError,TypeError,KeyError) as exc:
                 # Keep a usable user-facing action when an optional tool field
                 # or decoration is malformed. The old path discarded the
@@ -954,6 +1023,7 @@ class Runtime:
                     'reply_starts_json':reply.lstrip().startswith(('{','['))})
                 if not recovered and recovery_stage == 'parse' and timing.get('format_repair_attempts',0)<1:
                     timing['format_repair_attempts']=timing.get('format_repair_attempts',0)+1
+                    repair_started=time.monotonic()
                     try:
                         repaired = await engine.chat(
                             messages + [{'role':'assistant','content':reply},
@@ -967,6 +1037,8 @@ class Runtime:
                         if isinstance(repaired_decision,dict):
                             if repaired_decision.get('should_reply') is False:
                                 self.store.update(key,'ignored',error='格式恢复后模型选择旁观')
+                                timing['total_seconds']=round(time.time()-first['timestamp'],3)
+                                self.store.metrics(key,timing)
                                 return True
                             recovered=plan_actions(repaired_decision,choices,settings)
                             if recovered:
@@ -976,6 +1048,9 @@ class Runtime:
                                 recovery_stage='format_retry'
                     except Exception:
                         pass
+                    finally:
+                        timing['format_repair_seconds']=round(time.monotonic()-repair_started,3)
+                        timing['model_seconds']=model_elapsed()
                 if recovered:
                     actions = recovered
                     timing['format_recovery'] = recovery_stage
@@ -1014,18 +1089,27 @@ class Runtime:
             self.store.update(key,'failed',error='没有可发送的文字或原生表情')
             return True
         actions = apply_mentions(actions,mention_choices,mentions_enabled)
-        try:
-            result=await self.send_plan(first,batch,event,actions,quote_options,generation,timing)
-            confirmed='\n'.join(a['reply'] for a in self.store.actions(first['key']) if a['state']=='sent')
-            if confirmed and settings.memory_enabled:
-                self.memory_hub.mark_used(first['account'],decision.get('memory_used_ids'),memory_recall.get('ids',[]))
-            update_mood_after_turn(self.store, settings, first, batch, confirmed)
-            if structured:
-                self.tieba.tools.record_usage(first,decision,tieba_recall,confirmed)
-                offer_learning('sent' if confirmed else 'not_confirmed')
-            return result
-        finally:
-            self.tieba.cancel_planned(first['key'])
+        # Include format repair and tool followups instead of reporting only
+        # the first request and hiding their cost in the sending stage.
+        timing['model_seconds']=model_elapsed()
+        async def deliver_turn():
+            try:
+                result=await self.send_plan(first,batch,event,actions,quote_options,generation,timing)
+                confirmed='\n'.join(a['reply'] for a in self.store.actions(first['key']) if a['state']=='sent')
+                if confirmed and settings.memory_enabled:
+                    self.memory_hub.mark_used(first['account'],decision.get('memory_used_ids'),memory_recall.get('ids',[]))
+                update_mood_after_turn(self.store, settings, first, batch, confirmed, model_updated=mood_updated)
+                if structured:
+                    self.tieba.tools.record_usage(first,decision,tieba_recall,confirmed)
+                    offer_learning('sent' if confirmed else 'not_confirmed')
+                return result
+            finally:
+                self.tieba.cancel_planned(first['key'])
+        if defer_delivery:
+            self.store.update(key,'generating',reply='\n'.join(a['display'] for a in actions))
+            self.pipeline.submit(first,timing,deliver_turn)
+            return True
+        return await deliver_turn()
 
     def _media_waiting_chats(self):
         now=time.monotonic()
@@ -1057,7 +1141,7 @@ class Runtime:
         return batch
 
     def _schedule_followup_wait(self, first, generation, reason, cursor, received_after,
-                                *, batch_keys=(), assistant_message=None):
+                                *, batch_keys=(), assistant_message=None, previous_timing=None):
         """Wait per chat without holding chat_turn_lock or blocking other chats."""
         chat = first['chat']
         previous = self.followup_waits.get(chat)
@@ -1071,7 +1155,8 @@ class Runtime:
             deadline = time.monotonic() + wait_seconds
             common = {'anchor_time': anchor_time, 'anchor_id': anchor_id,
                       'received_after': received_after, 'generation': generation,
-                      'batch_keys': list(batch_keys), 'assistant_message': assistant_message}
+                      'batch_keys': list(batch_keys), 'assistant_message': assistant_message,
+                      'previous_timing':dict(previous_timing or {})}
             try:
                 while True:
                     if not self.chat_control.allowed(first):
@@ -1168,6 +1253,27 @@ class Runtime:
 
     async def send_plan(self,first,batch,event,actions,quote_options,generation,timing):
         settings=self.config.settings
+        eligible=(settings.fast_reply_enabled and hasattr(self.gateway,'send_turn') and 0<len(actions)<=3
+            and sum(a['type']=='sticker' for a in actions)<=1
+            and all(a['type'] in ('text','sticker') and not a.get('mentions') and not a.get('quote_local_id') for a in actions))
+        if eligible:
+            def allowed():
+                return (generation==self.config.generation and self.config.settings.enabled
+                    and first['chat'] in self.config.settings.allowed_chat_ids
+                    and self.chat_control.allowed(first) and not self.safety.held(first['account']))
+            async with self.gateway.send_turn(first['chat'],allowed) as session:
+                try:result=await self._send_plan(first,batch,event,actions,quote_options,generation,timing)
+                finally:self.send_processing=''
+            timing['fast_send']=session.stats
+            timing['worker_release_seconds']=round(time.time()-first['timestamp'],3)
+            self.store.metrics(first['key'],timing)
+            return result
+        timing['fast_send']={'enabled':settings.fast_reply_enabled,'used':False,'fallback':'legacy_or_complex_plan'}
+        try:return await self._send_plan(first,batch,event,actions,quote_options,generation,timing)
+        finally:self.send_processing=''
+
+    async def _send_plan(self,first,batch,event,actions,quote_options,generation,timing):
+        settings=self.config.settings
         key=first['key']
         reply='\n'.join(a['display'] for a in actions)
         self.store.update(key, "generating", reply=reply)
@@ -1175,7 +1281,7 @@ class Runtime:
                   self.store.latest_sent(first["account"], first["chat"]) + settings.chat_cooldown)
         interval_started = time.monotonic()
         while generation == self.config.generation and self.config.settings.enabled and due > time.time():
-            self.processing = "等待发送间隔"
+            self.send_processing = "等待发送间隔"
             await asyncio.sleep(min(due - time.time(), 0.2))
         if generation != self.config.generation or not self.config.settings.enabled:
             self.store.update(key, "skipped", reply=reply, error="生成期间配置发生变化，未发送")
@@ -1188,6 +1294,7 @@ class Runtime:
             self.store.update(key, "failed", reply=reply, error="发送前账号已变化或掉线")
             return True
         sent=[]
+        sent_memory=[]
         uncertain=[]
         outcomes=[]
         omitted=0
@@ -1220,7 +1327,7 @@ class Runtime:
                     omitted+=1;continue
                 end_state='partial' if sent else 'blocked';break
             self.store.update(key,'sending',reply='\n'.join(sent+[action['display']]))
-            self.processing='发送并读回确认'
+            self.send_processing='发送并读回确认'
             self.last_send=time.time()
             action_id=self.store.action_start(key,first,index,action)
             if action.get('tieba_share_id'):
@@ -1245,6 +1352,9 @@ class Runtime:
                 self.tieba.share_outcome(action['tieba_share_id'],
                     'sent' if receipt.confirmed else 'failed' if receipt.definite_failure else 'uncertain',
                     receipt.message_id,receipt.error)
+            if getattr(receipt,'details',{}).get('cancelled'):
+                self.store.action_finish(action_id,'cancelled',error=receipt.error,details=receipt.details)
+                reason=receipt.error;end_state='partial' if sent else 'skipped';break
             result={'id':action_id,'type':action['type'],'seconds':round(time.monotonic()-send_started,3),
                     'confirmed':receipt.confirmed,'quoted':getattr(receipt,'quoted',False),
                     'attempts':getattr(receipt,'attempts',1),
@@ -1263,6 +1373,7 @@ class Runtime:
                 if action['type']=='sticker':self.store.record_sticker(first['account'],first['chat'],action['id'])
                 timing.setdefault('first_reply_seconds',round(time.time()-first['timestamp'],3))
                 sent.append(action['display'])
+                sent_memory.append(action.get('text') if action['type']=='text' else '[表情包]')
             elif receipt.definite_failure:
                 self.store.action_finish(action_id,'failed',error=receipt.error,details=details)
                 reason=receipt.error;end_state='partial' if sent else 'failed';break
@@ -1287,7 +1398,7 @@ class Runtime:
         self.last_timing = timing
         self.store.metrics(key,timing)
         self.store.update(key,end_state,reply=actual,receipt='parts:'+str(len(sent)) if sent else '',error=reason)
-        if sent:self.store.remember(event,'\n'.join(sent))
+        if sent_memory:self.store.remember(event,'\n'.join(sent_memory))
         self.last_error=reason if end_state in ('failed','partial','uncertain') else ''
         return True
 
@@ -1541,6 +1652,7 @@ class Runtime:
 
     async def _poll_loop(self):
         while True:
+            self.poll_wake.clear()
             try:
                 await self.poll_once()
             except asyncio.CancelledError:
@@ -1549,7 +1661,9 @@ class Runtime:
                 self.last_error = f"微信网关暂不可用：{type(exc).__name__}"
                 self.gateway_state = {"status": "disconnected"}
                 self.account_id = ""
-            await asyncio.sleep(self.config.settings.poll_interval if self.config.settings.enabled else 15)
+            try:
+                await asyncio.wait_for(self.poll_wake.wait(),self.config.settings.poll_interval if self.config.settings.enabled else 15)
+            except asyncio.TimeoutError:pass
 
     async def _worker_loop(self):
         while True:
@@ -1559,7 +1673,7 @@ class Runtime:
                         chat for chat, task in self.followup_waits.items()
                         if not task.done()
                     }
-                    await self.process_next(exclude_chats=waiting_chats)
+                    await self.process_next(exclude_chats=waiting_chats,defer_delivery=True)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

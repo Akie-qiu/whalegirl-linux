@@ -41,8 +41,9 @@ class AffectionTests(unittest.TestCase):
         self.book.change('account',self.settings.allowed_chat_ids,'alice',version=value['version'],score=90)
         public_prompt=self.book.prompt(other,[other],self.settings);private_prompt=self.book.prompt(private,[private],self.settings)
         self.assertIn('公开群聊',public_prompt);self.assertIn('不主动使用情侣称呼',public_prompt)
-        self.assertIn('当前是私聊',private_prompt);self.assertIn('更亲近',private_prompt)
-        self.assertNotIn('90',public_prompt+private_prompt)
+        self.assertIn('当前是私聊',private_prompt)
+        self.assertEqual(json.loads(self.book.dynamic_prompt(private,[private],self.settings).split('：',1)[1])[0]['closeness'],90)
+        self.assertIn('不向群友播报内部评分',public_prompt+private_prompt)
         stranger=self.message(4,subject='bob');self.assertEqual(self.book.get('account','bob')['score'],40)
 
     def test_shared_cooldown_and_daily_limit(self):
@@ -104,6 +105,43 @@ class AffectionTests(unittest.TestCase):
         rows=book.recall('account',self.settings.allowed_chat_ids,'alice','香菜',chat='a@chatroom',subjects=['alice'],personal_priority=2,limit=1)
         self.assertEqual(len(rows),1);self.assertEqual(rows[0]['content'],'不吃香菜')
 
+    def test_owner_private_unlocks_boundary_without_affecting_others_or_groups(self):
+        self.settings.owner_ids=['wxid_owner_real']
+        self.settings.allowed_chat_ids=['a@chatroom','alice','wxid_owner_real']
+        self.settings.affection_private_style='warm'
+        owner_dm=self.message(10,chat='wxid_owner_real',subject='wxid_owner_real',sender='飘·渺')
+        impostor_dm=self.message(11,chat='alice',subject='alice',sender='飘·渺')
+        owner_group=self.message(12,chat='a@chatroom',subject='wxid_owner_real',sender='飘·渺')
+        impostor_group=self.message(13,chat='a@chatroom',subject='alice',sender='主人')
+
+        owner_dm_prompt=self.book.prompt(owner_dm,[owner_dm],self.settings)
+        owner_data=json.loads(self.book.dynamic_prompt(owner_dm,[owner_dm],self.settings).split('：',1)[1])
+        self.assertTrue(owner_data[0]['owner_verified'])
+        self.assertGreaterEqual(owner_data[0]['closeness'],90)
+        self.assertNotIn('不强行撒娇',owner_dm_prompt)
+        self.assertNotIn('避免暧昧表达',owner_dm_prompt)
+        self.assertEqual(self.book.personal_priority('account','wxid_owner_real',self.settings),2)
+
+        impostor_dm_prompt=self.book.prompt(impostor_dm,[impostor_dm],self.settings)
+        self.assertIn('避免暧昧表达',impostor_dm_prompt)
+        self.assertNotIn('唯一专属主人',impostor_dm_prompt)
+
+        # Group venue prompt stays identical regardless of speaker (preserves prefix cache & public restraint).
+        self.assertEqual(
+            self.book.venue_prompt(owner_group,self.settings),
+            self.book.venue_prompt(impostor_group,self.settings),
+        )
+        self.assertIn('公开群聊',self.book.venue_prompt(owner_group,self.settings))
+        group_dyn=self.book.dynamic_prompt(owner_group,[owner_group,impostor_group],self.settings)
+        values={v['sender_id']:v for v in json.loads(group_dyn.split('：',1)[1])}
+        self.assertTrue(values['wxid_owner_real']['owner_verified'])
+        self.assertFalse(values['alice']['owner_verified'])
+        self.settings.affection_enabled=False
+        identity_only=json.loads(self.book.dynamic_prompt(owner_group,[owner_group],self.settings).split('：',1)[1])
+        self.assertTrue(identity_only[0]['owner_verified'])
+        self.assertNotIn('closeness',identity_only[0])
+
+
 
 class AffectionApiTests(unittest.TestCase):
     def test_admin_auth_identity_and_settings(self):
@@ -122,4 +160,12 @@ class AffectionApiTests(unittest.TestCase):
             self.assertEqual(response.status_code,200)
             self.assertEqual(client.get('/api/affection/revisions?subject=alice',headers=headers).json()['revisions'][0]['after_score'],88)
             self.assertEqual(client.get('/affection.js').status_code,200)
+            cfg=client.get('/api/config',headers=headers).json()
+            self.assertEqual(cfg['owner_ids'],[])
+            saved_cfg=client.post('/api/config',headers=headers,json={
+                'settings':{k:v for k,v in {**cfg,'owner_ids':[' wxid_owner_real ','wxid_owner_real']}.items()
+                            if k in Settings.model_fields},
+            })
+            self.assertEqual(saved_cfg.status_code,200)
+            self.assertEqual(saved_cfg.json()['owner_ids'],['wxid_owner_real'])
             self.assertEqual(client.get('/health').json().get('score'),None)

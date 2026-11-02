@@ -36,8 +36,7 @@
   function populate() {
     for (const name of numeric) field(name).value = cfg[name];
     $('chat-habits-enabled').checked = cfg.chat_habits_enabled;
-    $('autonomy-enabled').checked = cfg.autonomy_enabled ?? false;
-    text('autonomy-mode', cfg.autonomy_enabled ? '当前使用新版自主聊天' : '当前使用旧版回复逻辑');
+    text('autonomy-mode','统一自主聊天：人格卡与本群表达决定语气');
     $('followup-wait-enabled').checked = cfg.followup_wait_enabled ?? true;
     $('editable-memory-enabled').checked = cfg.editable_memory_enabled;
     $('web-search-enabled').checked = cfg.web_search_enabled;
@@ -73,13 +72,14 @@
       const row = document.createElement('article'); row.className = 'record';
       const title = document.createElement('p'); title.textContent = chatName(item.chat) + ' · ' + item.topic;
       const when = document.createElement('p'); when.className = 'hint';
-      when.textContent = (result.enabled ? '可考虑时间：' : '已暂停 · 可考虑时间：') + new Date(item.due * 1000).toLocaleString('zh-CN', {hour12:false,timeZone:'Asia/Shanghai'});
+      when.textContent = (item.kind === 'unsaid' ? '遇到相关话题再接 · 有效至：' : '可考虑时间：') +
+        new Date((item.kind === 'unsaid' ? item.expires : item.due) * 1000).toLocaleString('zh-CN', {hour12:false,timeZone:'Asia/Shanghai'}) + (result.enabled ? '' : ' · 已暂停');
       row.append(title, when, button('取消接续', async () => {
         await api('autonomy/intents/' + item.id, 'POST', {op:'cancel'}); await refreshAutonomy();
       })); intents.append(row);
     }
-    const labels = {speak:'选择参与',silent:'选择旁观',observe:'合并观察',growth:'整理经验',wait:'等待补充'};
-    if (!result.events.length) events.textContent = '开启新版后显示参与依据和成长记录';
+    const labels = {speak:'选择参与',silent:'选择旁观',observe:'合并观察',growth:'整理经验',wait:'等待补充',mood_changed:'情绪变化',reading_considered:'考虑过的新见闻'};
+    if (!result.events.length) events.textContent = '这里显示参与依据和成长记录';
     for (const item of result.events) {
       const row = document.createElement('article'); row.className = 'record';
       const title = document.createElement('strong'); title.textContent = (labels[item.kind] || item.kind) + ' · ' + chatName(item.chat);
@@ -88,18 +88,30 @@
       when.textContent = new Date(item.created * 1000).toLocaleString('zh-CN', {hour12:false,timeZone:'Asia/Shanghai'});
       row.append(title, reason, when); events.append(row);
     }
+    let diary = $('experience-diary');
+    if (!diary) {
+      const title = document.createElement('h3'); title.textContent = '相处经历 · 按日期留档';
+      diary = document.createElement('div'); diary.id = 'experience-diary';
+      $('autonomy-details').append(title, diary);
+    }
+    diary.replaceChildren();
+    const deliveries = {planning:'等待本轮结果',observed:'听到或旁观',sent:'已确认回复',partial:'部分送达',
+      uncertain:'发送待核实',unconfirmed:'未确认送达',failed:'未送达',skipped:'发送取消',queued:'图片任务已排队'};
+    for (const item of result.experiences || []) {
+      const row = document.createElement('article'); row.className = 'record';
+      const date = document.createElement('p'); date.className = 'hint';
+      date.textContent = item.day + ' · ' + chatName(item.chat) + ' · ' + (deliveries[item.delivery] || item.delivery);
+      const content = document.createElement('p'); content.className = 'message'; content.textContent = item.content;
+      row.append(date, content);
+      if (item.feeling) { const feeling=document.createElement('p');feeling.className='hint';feeling.textContent='当时感受：'+item.feeling;row.append(feeling); }
+      row.append(button('停用这段经历', async () => {
+        await api('memory-hub', 'POST', {op:'archive', id:item.id, version:item.version});
+        await refreshAutonomy(); notice('经历已停用，可在统一记忆管理中恢复');
+      }));
+      diary.append(row);
+    }
+    if (!(result.experiences || []).length) diary.textContent = '值得留下的真实互动才会入档；与现有记忆共用来源、编辑、停用和恢复功能';
   }
-  $('autonomy-enabled').onchange = async () => {
-    const control = $('autonomy-enabled'); const value = control.checked; control.disabled = true;
-    try {
-      if (window.proactiveChat?.save) await window.proactiveChat.save(false);
-      else await saveSubset({autonomy_enabled:value});
-      notice(value ? '已切换到新版自主聊天。' : '已切回旧版回复逻辑，接续意图与新版旁听学习已暂停。');
-      if ($('autonomy-details').open) await refreshAutonomy();
-    } catch (error) {
-      control.checked = cfg.autonomy_enabled ?? false; notice(error.message, true);
-    } finally { control.disabled = false; }
-  };
   $('refresh-autonomy').onclick = () => action($('refresh-autonomy'), refreshAutonomy);
   $('autonomy-details').ontoggle = () => {
     if ($('autonomy-details').open) refreshAutonomy().catch(error => notice(error.message, true));

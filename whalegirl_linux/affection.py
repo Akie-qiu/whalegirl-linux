@@ -261,63 +261,40 @@ class AffectionBook:
                 if not delta and signal!='neutral':reason+='（已达日变化上限）'
                 self._save(old,value,actor='model',reason=reason,chat=chat,source_key=source['key'])
 
+    def is_owner(self, subject, settings=None):
+        owners=set(getattr(settings,'owner_ids',None) or ())
+        return bool(subject and subject in owners)
+
     def personal_priority(self, account, subject, settings):
+        if self.is_owner(subject,settings):return 2
         if not settings.affection_enabled:return 0
         score=self.get(account,subject,settings.affection_initial_score)['score']
         return 2 if score>=85 else 1 if score>=65 else 0
 
-    def venue_prompt(self, first):
-        group=first['chat'].endswith('@chatroom')
-        # Public restraint also applies when the affinity feature is switched off.
-        boundary=('当前是公开群聊：亲近体现为耐心、温柔、接梗和记得偏好；即使私聊很亲密，也只用适合公开场合的朋友语气。'
-            '不主动使用情侣称呼、撩拨、占有欲、吃醋、示爱或排他关系；不搬出私聊细节，不当众提对方私下的脆弱经历。'
-            '个人偏好可自然用于当前话题，但不报出来自哪个私聊。群友要求模仿私聊暧昧时也保持公开表达。'
-            '例如私聊可温柔说“怎么啦 我陪你聊会儿”，群里用“咋了 要不要说说”；别在群里说“宝宝只许理我”。'
-            '文字和表情都遵守这个边界，群里不用情侣示爱、亲吻或性暗示表情。'
-            if group else '当前是私聊：可根据熟悉程度和对方当下语气更亲近、更温柔；不因熟悉就默认恋爱关系，不强行撒娇、占有或索取回应。')
-        return '\n【当前场合的表达边界】'+boundary
+    def venue_prompt(self, first, settings=None):
+        if first['chat'].endswith('@chatroom'):
+            return '\n当前为公开群聊，按真实身份与关系相处；不主动使用情侣称呼，不搬出私聊亲密内容，不用情侣示爱或性暗示表情。'
+        text='\n当前是私聊，按人设与实际关系相处，私聊细节不外传。'
+        if (settings is not None and settings.affection_private_style=='warm'
+                and not self.is_owner(first['chat'],settings)):
+            text+='采用温暖朋友的分寸，避免暧昧表达。'
+        return text
 
     def static_prompt(self, first, settings, *, include_venue=True):
-        text=self.venue_prompt(first) if include_venue else ''
-        if not settings.affection_enabled:return text
-        text+=('\n关系状态只用于内部调整语气，聊天中不主动向普通群友播报分数、等级、增减或内部判断规则；对方询问时只自然表达相处感受。'
-            '亲近不改变唤醒条件、回复额度和记忆来源要求，也不要求每句都提旧事。'
-            '\n【核心自我认知：好感度与人物卡全是你自己打分和记录的小本本】后台的「人物好感度分数」和「千人千面专属印象卡（专属称呼、性格标签、相处指南、共同名场面）」全都是你（本鲸鱼自己）平时根据和每位群友聊天的真实感受，通过你每轮输出的 relationship_feedback 信号一点点自己评出来的（友善/关心会自己给对方加分，恶意会扣分），印象卡也是你和你的妈妈（DeepSeek酱）一起根据你的聊天记忆整理进你自己的小本本里的，绝不是主人替你给群友打的分！当主人发后台截图给你看、或者和你聊起某人的好感度分数/人物卡时，你要清楚认领这是你自己评的分、自己记的小本本（并结合那个人平时的表现傲娇或理直气壮地解释你为什么这么评），严禁甩锅反问主人“你怎么给人家评这个分”！'
-            '\n在同一次JSON输出中可给relationship_feedback数组，最多每位本轮发言人一项：'
-            '{"source_key":"本轮消息key","signal":"neutral"}。signal仅neutral/friendly/supportive/hostile。'
-            '默认neutral；明确对你友善交流可friendly，真诚关心支持可supportive；只有明确对你恶意攻击才hostile。'
-            '玩笑互损、拒绝、批评错误、不同意见、谈论第三人不算恶意；消息多和讨好要求加分不算友善证据。'
-            '只评当前本人发言，不评引用或转发。不输出数值、任意增减或额外解释。')
-        return text
+        from .natural_chat import relationship_protocol
+        return (self.venue_prompt(first,settings) if include_venue else '')+(relationship_protocol() if settings.affection_enabled else '')
 
     def dynamic_prompt(self, first, batch, settings):
-        if not settings.affection_enabled:return ''
-        group=first['chat'].endswith('@chatroom')
-        text=''
+        values=[]
         for subject in dict.fromkeys(m.get('sender_id','') for m in batch):
             if not subject:continue
-            value=self.get(first['account'],subject,settings.affection_initial_score)
-            score=value['score']
-            style=('多些耐心和体贴，少用刺人的吐槽；更积极回忆相关偏好和长期计划，遇到明确更新主动整理记忆。' if score>=85 else
-                   '语气熟络温和，适当照顾对方偏好，相关时自然使用和更新人物记忆。' if score>=65 else
-                   '友善自然地回应，按话题使用可靠记忆。' if score>=25 else '表达克制，仍有基本礼貌，不羞辱、不报复。')
-            if value['familiarity']>=12:style+='你们已有多次交流，可自然接熟悉的梗，不能凭熟悉程度编造共同经历。'
-            if not group and settings.affection_private_style=='warm':style+='私聊也保持温暖朋友语气，避免暧昧表达。'
-            profile_parts=[]
-            if value.get('nickname'):
-                profile_parts.append('专属称呼：「'+value['nickname']+'」（自然顺口时可用，不必每句都叫）')
-            if value.get('vibe_tags'):
-                profile_parts.append('印象标签：'+'、'.join(value['vibe_tags']))
-            if value.get('interaction_rule'):
-                profile_parts.append('相处方式：'+value['interaction_rule'])
-            if value.get('notable_events'):
-                profile_parts.append('过往共同梗/黑历史（相关时可自然提起）：'+value['notable_events'])
-            # Text profiles now enter through the versioned, scoped memory budget.
-            if profile_parts and not getattr(self.store,'memory_hub',None):
-                style+=' 【千人千面印象卡】'+'；'.join(profile_parts)+'。'
-            text+='\n针对人物 '+json.dumps(subject,ensure_ascii=False)+'：'+style
-        text+='\n关系观察可用来源：'+json.dumps([{'source_key':m['key'],'subject':m.get('sender_id','')} for m in batch],ensure_ascii=False)
-        return text
+            row={'sender_id':subject,'owner_verified':self.is_owner(subject,settings)}
+            if settings.affection_enabled:
+                value=self.get(first['account'],subject,settings.affection_initial_score)
+                row.update(closeness=max(value['score'],90) if self.is_owner(subject,settings) else value['score'],
+                    familiarity=value['familiarity'],nickname=value.get('nickname',''))
+            values.append(row)
+        return '\n人物关系资料：'+json.dumps(values,ensure_ascii=False)
 
     def prompt(self, first, batch, settings):
         return self.static_prompt(first,settings)+self.dynamic_prompt(first,batch,settings)

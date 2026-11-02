@@ -101,7 +101,21 @@ class A11yBus:
         return {'pid': self.pids[ref[0]]}
 
 
-def dump_tree(bus, max_depth=30, *, skip_messages=False, deadline=None):
+def parse_sticker_panel_ref(value):
+    """Accept only an AT-SPI D-Bus name and accessible object path."""
+    if not isinstance(value, str) or value.count('|') != 1:
+        raise ValueError('Invalid native sticker panel reference')
+    name, path = value.split('|')
+    unique = r':[0-9]+(?:\.[0-9]+)+'
+    named = r'[A-Za-z_-][A-Za-z0-9_-]*(?:\.[A-Za-z_-][A-Za-z0-9_-]*)+'
+    accessible = r'/org/a11y/atspi/accessible/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*'
+    if (len(name) > 255 or len(path) > 1024 or not re.fullmatch(unique + '|' + named, name)
+            or not re.fullmatch(accessible, path) or 'null' in path.lower().split('/')):
+        raise ValueError('Invalid native sticker panel reference')
+    return name, path
+
+
+def dump_tree(bus, max_depth=30, *, skip_messages=False, deadline=None, root_ref=DESKTOP):
     stats = {'nodes': 0, 'bulk_requests': 0, 'stale_nodes_skipped': 0,
              'child_index_requests': 0}
     seen = set()
@@ -130,6 +144,11 @@ def dump_tree(bus, max_depth=30, *, skip_messages=False, deadline=None):
                 result['native_ref'] = ref[0] + '|' + ref[1]
             if bounds:
                 result['bounds'] = bounds
+            if skip_messages and role == 'label' and name == 'Custom Stickers':
+                # Pinned WeChat sticker tiles are leaves. Sending needs their
+                # bounds and identity, not a state or child request per tile.
+                stats['nodes'] += 1
+                return result
             try:
                 states = bus.states(ref, role)
                 if states:
@@ -153,6 +172,10 @@ def dump_tree(bus, max_depth=30, *, skip_messages=False, deadline=None):
             children = [child for child in (walk(r, depth + 1) for r in refs) if child]
             if children:
                 result['children'] = children
+                if role == 'list' and any(child.get('name') == 'Custom Stickers' for child in children):
+                    # The picker cache scopes tile identities to their owning
+                    # live panel, not to screen coordinates or another popup.
+                    result['native_ref'] = ref[0] + '|' + ref[1]
             return result
         except TimeoutError:
             raise
@@ -160,7 +183,11 @@ def dump_tree(bus, max_depth=30, *, skip_messages=False, deadline=None):
             stats['stale_nodes_skipped'] += 1
             return None
 
-    return walk(DESKTOP, 0), stats
+    root = walk(root_ref, 0)
+    if root_ref != DESKTOP and not (root and root.get('role') == 'list'
+            and any(child.get('name') == 'Custom Stickers' for child in root.get('children', []))):
+        raise ValueError('Native sticker panel reference is stale or is not a sticker panel')
+    return root, stats
 
 
 def tree_aria(node, depth=0):
@@ -205,6 +232,7 @@ def main():
     parser.add_argument('--format', choices=['json', 'aria'], default='json')
     parser.add_argument('--max-depth', type=int, default=30)
     parser.add_argument('--skip-messages', action='store_true')
+    parser.add_argument('--sticker-panel-ref', type=parse_sticker_panel_ref, help=argparse.SUPPRESS)
     args = parser.parse_args()
     directory = Path('/data/native-tools/a11y-state')
     started = time.monotonic()
@@ -215,7 +243,8 @@ def main():
             locked = time.monotonic()
             deadline = started + 6.5
             tree, stats = dump_tree(A11yBus(deadline=deadline), args.max_depth,
-                                    skip_messages=args.skip_messages, deadline=deadline)
+                                    skip_messages=args.skip_messages, deadline=deadline,
+                                    root_ref=args.sticker_panel_ref or DESKTOP)
             stats.update(at=time.time(), elapsed_seconds=round(time.monotonic() - started, 4),
                          lock_wait_seconds=round(locked - started, 4), ok=bool(tree))
             publish_stats(directory, stats)

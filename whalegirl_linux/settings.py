@@ -11,7 +11,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 
 class StickerChatPermission(BaseModel):
@@ -19,6 +19,33 @@ class StickerChatPermission(BaseModel):
     auto_collect: bool = True
     command_collect: bool = True
     command_disable: bool = True
+
+
+MODEL_PROFILE_IDS = ('flash', 'pro', 'responses', 'custom')
+
+
+class ModelProfile(BaseModel):
+    """Non-secret settings for one model card.
+
+    API keys are deliberately kept in Config's encrypted profile-key file and
+    never travel through the public config response.
+    """
+    model_config = ConfigDict(extra="forbid")
+    api_url: str = "https://api.deepseek.com/chat/completions"
+    api_style: Literal['auto', 'openai', 'responses', 'anthropic'] = 'auto'
+    model: str = Field(default="deepseek-chat", min_length=1, max_length=100)
+    max_tokens: int = Field(default=220, ge=32, le=1200)
+    reasoning_effort: Literal['default', 'low', 'medium', 'high'] = 'default'
+    model_stream_enabled: bool = False
+
+    @field_validator('api_url')
+    @classmethod
+    def valid_model_api_url(cls, value):
+        value = value.strip()
+        parsed = urlsplit(value)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username is not None or parsed.fragment or parsed.query:
+            raise ValueError('模型接口需使用不含内嵌凭据、查询参数或片段的 HTTP 或 HTTPS 地址')
+        return value.rstrip('/')
 
 
 class Settings(BaseModel):
@@ -44,7 +71,8 @@ class Settings(BaseModel):
     safety_per_day: int = Field(default=500, ge=0, le=10000)
     safety_duplicate_seconds: int = Field(default=180, ge=30, le=1800)
     stickers_enabled: bool = True
-    sticker_aggressiveness: Literal['low','normal','high'] = 'normal'
+    sticker_aggressiveness: Literal['low','normal','high','very_high','sticker_first'] = 'normal'
+    sticker_usage_target: int = Field(default=0, ge=0, le=100)
     sticker_after_text: Literal['off','normal','high'] = 'high'
     sticker_pair_probability: int = Field(default=90, ge=0, le=100)
     sticker_text_pair_eagerness: int = Field(default=90, ge=0, le=100)
@@ -59,8 +87,9 @@ class Settings(BaseModel):
     model: str = Field(default="deepseek-chat", min_length=1, max_length=100)
     max_tokens: int = Field(default=220, ge=32, le=1200)
     history_pairs: int = Field(default=5, ge=0, le=15)
-    min_send_interval: float = Field(default=6, ge=3, le=120)
-    chat_cooldown: float = Field(default=15, ge=5, le=300)
+    min_send_interval: float = Field(default=6, ge=0, le=120)
+    fast_reply_enabled: bool = True
+    chat_cooldown: float = Field(default=15, ge=0, le=300)
     poll_interval: float = Field(default=1, ge=0.25, le=60)
     context_messages: int = Field(default=40, ge=10, le=100)
     global_memory: bool = True
@@ -68,6 +97,15 @@ class Settings(BaseModel):
     memory_consolidation_enabled: bool = True
     memory_token_budget: int = Field(default=1400, ge=400, le=6000)
     memory_item_limit: int = Field(default=8, ge=2, le=30)
+    growth_enabled: bool = True
+    growth_web_enabled: bool = True
+    growth_tieba_enabled: bool = False
+    growth_auto_apply: bool = True
+    growth_daily_tokens: int = Field(default=20000, ge=0, le=500000)
+    growth_reads_per_day: int = Field(default=3, ge=0, le=20)
+    growth_interval_minutes: int = Field(default=180, ge=30, le=1440)
+    growth_exploration: int = Field(default=25, ge=0, le=100)
+    growth_interests: list[str] = Field(default_factory=list, max_length=30)
     memory_cold_after_days: int = Field(default=30, ge=3, le=365)
     memory_scope_mode: Literal['shared_profiles', 'isolated'] = 'shared_profiles'
     memory_auto_capture: bool = True
@@ -91,6 +129,7 @@ class Settings(BaseModel):
     affection_daily_loss: int = Field(default=6, ge=0, le=20)
     affection_cooldown_seconds: int = Field(default=600, ge=60, le=86400)
     affection_private_style: Literal['warm','close'] = 'close'
+    owner_ids: list[str] = Field(default_factory=list, max_length=20)
     sticker_candidate_limit: int = Field(default=8, ge=4, le=20)
     sticker_cooldown_seconds: int = Field(default=180, ge=0, le=3600)
     sticker_self_manage_enabled: bool = True
@@ -106,7 +145,9 @@ class Settings(BaseModel):
     sticker_cache_cleanup_enabled: bool = True
     sticker_failed_cache_hours: int = Field(default=24, ge=1, le=168)
     chat_habits_enabled: bool = True
-    autonomy_enabled: bool = False
+    # Accepted from older configuration files; there is no alternate engine.
+    autonomy_enabled: bool = True
+    experience_growth_enabled: bool = True
     debounce_single_seconds: float = Field(default=0.65, ge=0, le=3)
     debounce_burst_seconds: float = Field(default=1.6, ge=0, le=5)
     debounce_max_seconds: float = Field(default=4, ge=0, le=8)
@@ -230,9 +271,14 @@ class Settings(BaseModel):
     tieba_archive_limit_mb: int = Field(default=512, ge=64, le=4096)
     expected_wechat_version: Literal["4.1.0.16", "4.1.1.8"] = "4.1.0.16"
 
+    @field_validator('autonomy_enabled', mode='before')
+    @classmethod
+    def unified_chat_engine(cls, value):
+        return True
+
     @field_validator("allowed_chat_ids", "keywords", "trigger_only_chat_ids", "interest_keywords", "moments_topics", "moments_friend_ids",
-                     "tieba_forums", "tieba_interests", "tieba_share_chat_ids",
-                     "proactive_chat_ids", "proactive_strict_chat_ids")
+                     "tieba_forums", "tieba_interests", "tieba_share_chat_ids", "growth_interests",
+                     "proactive_chat_ids", "proactive_strict_chat_ids", "owner_ids")
     @classmethod
     def clean_strings(cls, values):
         if any(not v.strip() or len(v) > 200 for v in values):
@@ -241,10 +287,13 @@ class Settings(BaseModel):
 
     @field_validator("api_url", "image_api_url")
     @classmethod
-    def valid_api_url(cls, value):
+    def valid_api_url(cls, value, info: ValidationInfo):
+        value=value.strip()
         parsed = urlsplit(value)
-        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.fragment or parsed.query:
-            raise ValueError("模型接口需使用不含内嵌凭据的 HTTPS 地址")
+        schemes=('http','https') if info.field_name=='api_url' else ('https',)
+        if parsed.scheme not in schemes or not parsed.hostname or parsed.username is not None or parsed.fragment or parsed.query:
+            protocol='HTTP 或 HTTPS' if info.field_name=='api_url' else 'HTTPS'
+            raise ValueError('模型接口需使用不含内嵌凭据、查询参数或片段的 '+protocol+' 地址')
         return value.rstrip("/")
 
     @field_validator('moments_asset_ids')
@@ -276,14 +325,126 @@ class Config:
             # Keep legacy settings within the configurable context window.
             if isinstance(saved, dict) and isinstance(saved.get("context_messages"), int):
                 saved["context_messages"] = max(10, min(100, saved["context_messages"]))
+            self.active_model_profile = (saved.get('active_model_profile') if isinstance(saved, dict) else '') or self._infer_profile_id(saved)
+            if self.active_model_profile not in MODEL_PROFILE_IDS:
+                self.active_model_profile = 'custom'
+            if isinstance(saved, dict):
+                saved.pop('active_model_profile', None)
             self.settings = Settings.model_validate(saved)
         else:
             self.settings = Settings()
+            self.active_model_profile = 'custom'
         self.admin_token = self._secret("admin.token", lambda: secrets.token_urlsafe(32))
         self.gateway_token = self._secret("gateway.token", lambda: secrets.token_hex(32))
         self.fernet = Fernet(self._secret("encryption.key", lambda: Fernet.generate_key().decode()).encode())
+        self._model_profiles_path = directory / 'model-profiles.json'
+        self._model_keys_path = directory / 'model-api-keys.enc'
+        self._model_profiles = {}
+        self._load_model_profiles()
         self.generation = 0
         self.console_sessions = {}
+
+    @staticmethod
+    def _infer_profile_id(values):
+        url = str(values.get('api_url') or '').rstrip('/')
+        style = values.get('api_style') or 'auto'
+        model = str(values.get('model') or '')
+        if model == 'deepseek-flash' and url == 'https://api.deepseek.com/chat/completions':
+            return 'flash'
+        if model == 'deepseek-v4-pro' and url == 'https://api.deepseek.com/chat/completions':
+            return 'pro'
+        if style == 'responses' or url.endswith('/responses'):
+            return 'responses'
+        return 'custom'
+
+    def _legacy_api_key(self):
+        path = self.directory / 'api-key.enc'
+        if not path.exists():
+            return ''
+        try:
+            return self.fernet.decrypt(path.read_bytes()).decode()
+        except Exception:
+            return ''
+
+    def _profile_from_settings(self, settings: Settings):
+        return ModelProfile.model_validate({
+            'api_url': settings.api_url,
+            'api_style': settings.api_style,
+            'model': settings.model,
+            'max_tokens': settings.max_tokens,
+            'reasoning_effort': settings.reasoning_effort,
+            'model_stream_enabled': settings.model_stream_enabled,
+        })
+
+    def _default_model_profiles(self):
+        current = self._profile_from_settings(self.settings)
+        profiles = {
+            'flash': ModelProfile(api_url='https://api.deepseek.com/chat/completions', api_style='openai',
+                                  model='deepseek-flash'),
+            'pro': ModelProfile(api_url='https://api.deepseek.com/chat/completions', api_style='openai',
+                                model='deepseek-v4-pro'),
+            'responses': ModelProfile(api_url='https://api.deepseek.com/responses', api_style='responses',
+                                      model=current.model),
+            'custom': current,
+        }
+        profiles[self.active_model_profile] = current
+        return profiles
+
+    def _load_model_keys(self):
+        if not self._model_keys_path.exists():
+            return {}
+        try:
+            value = json.loads(self.fernet.decrypt(self._model_keys_path.read_bytes()).decode())
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_model_keys(self, values):
+        private_write(self._model_keys_path, self.fernet.encrypt(json.dumps(values, ensure_ascii=False).encode()).decode())
+
+    def _write_model_profiles(self):
+        private_write(self._model_profiles_path, json.dumps({
+            'active': self.active_model_profile,
+            'profiles': {key: value.model_dump() for key, value in self._model_profiles.items()},
+        }, ensure_ascii=False, indent=2))
+
+    def _load_model_profiles(self):
+        defaults = self._default_model_profiles()
+        migrated = False
+        if self._model_profiles_path.exists():
+            try:
+                raw = json.loads(self._model_profiles_path.read_text('utf-8'))
+                source = raw.get('profiles') if isinstance(raw, dict) and isinstance(raw.get('profiles'), dict) else raw
+                if isinstance(raw, dict) and raw.get('active') in MODEL_PROFILE_IDS:
+                    self.active_model_profile = raw['active']
+                for key in MODEL_PROFILE_IDS:
+                    if isinstance(source, dict) and isinstance(source.get(key), dict):
+                        defaults[key] = ModelProfile.model_validate(source[key])
+            except (OSError, ValueError, TypeError):
+                migrated = True
+        else:
+            migrated = True
+        self._model_profiles = defaults
+        keys = self._load_model_keys()
+        active = self.active_model_profile
+        if not self._model_keys_path.exists():
+            legacy = self._legacy_api_key()
+            if legacy:
+                keys[active] = legacy
+                self._save_model_keys(keys)
+        # The first load upgrades the single legacy model setting to isolated
+        # cards without changing the active runtime configuration.
+        if migrated:
+            self._write_model_profiles()
+        if self.active_model_profile not in MODEL_PROFILE_IDS:
+            self.active_model_profile = 'custom'
+
+    def model_profiles_public(self):
+        keys = self._load_model_keys()
+        return {
+            key: {**profile.model_dump(), 'api_key_configured': bool(keys.get(key))}
+            for key, profile in self._model_profiles.items()
+        }
 
     def authorize_admin(self, supplied):
         if not supplied or len(supplied)>1024:
@@ -324,9 +485,36 @@ class Config:
             private_write(path, factory())
         return path.read_text("utf-8").strip()
 
-    def api_key(self):
-        path = self.directory / "api-key.enc"
-        return self.fernet.decrypt(path.read_bytes()).decode() if path.exists() else ""
+    def api_key(self, profile_id: str | None = None):
+        profile_id = profile_id or self.active_model_profile
+        keys = self._load_model_keys()
+        value = str(keys.get(profile_id) or '').strip()
+        if value:
+            return value
+        # Legacy migration runs once at startup. An unconfigured card must
+        # never inherit another card's legacy key, including after a restart.
+        return ''
+
+    def save_model_profile(self, profile_id: str, profile: ModelProfile, api_key: str = '', activate: bool = True):
+        if profile_id not in MODEL_PROFILE_IDS:
+            raise ValueError('模型卡片不存在')
+        profile = ModelProfile.model_validate(profile)
+        supplied_key = api_key.strip()
+        existing_key = self.api_key(profile_id)
+        if activate and self.settings.enabled and not (supplied_key or existing_key):
+            raise ValueError('启用自动回复前，请先为当前模型卡片配置 API Key')
+        self._model_profiles[profile_id] = profile
+        if supplied_key:
+            keys = self._load_model_keys()
+            keys[profile_id] = supplied_key
+            self._save_model_keys(keys)
+        if activate:
+            self.active_model_profile = profile_id
+        self._write_model_profiles()
+        if activate:
+            updated = self.settings.model_copy(update=profile.model_dump())
+            self.save(updated, profile_id=profile_id)
+        return self.public()
 
     def image_api_key(self):
         path = self.directory / 'image-api-key.enc'
@@ -357,13 +545,23 @@ class Config:
                 values[name] = value.strip()
         private_write(self.directory / 'tieba-credentials.enc', self.fernet.encrypt(json.dumps(values).encode()).decode())
 
-    def save(self, settings: Settings, api_key: str = ""):
+    def save(self, settings: Settings, api_key: str = "", *, profile_id: str | None = None):
+        settings=settings.model_copy(update={'autonomy_enabled':True})
         if settings.enabled and not settings.allowed_chat_ids:
             raise ValueError("先选择允许回复的会话")
-        if settings.enabled and not (api_key.strip() or self.api_key()):
+        profile_id = profile_id or self.active_model_profile
+        if profile_id not in MODEL_PROFILE_IDS:
+            raise ValueError('模型卡片不存在')
+        if settings.enabled and not (api_key.strip() or self.api_key(profile_id)):
             raise ValueError("先配置模型 API Key")
         if api_key.strip():
+            keys = self._load_model_keys()
+            keys[profile_id] = api_key.strip()
+            self._save_model_keys(keys)
             private_write(self.directory / "api-key.enc", self.fernet.encrypt(api_key.strip().encode()).decode())
+        self.active_model_profile = profile_id
+        self._model_profiles[profile_id] = self._profile_from_settings(settings)
+        self._write_model_profiles()
         private_write(self.path, settings.model_dump_json(indent=2))
         self.sync_authority(settings)
         self.settings = settings
@@ -388,6 +586,8 @@ class Config:
                 "moments_asset_ids": settings.moments_asset_ids}))
 
     def public(self):
-        return {**self.settings.model_dump(), "api_key_configured": bool(self.api_key()),
+        return {**self.settings.model_dump(), 'active_model_profile': self.active_model_profile,
+                'model_profiles': self.model_profiles_public(),
+                "api_key_configured": bool(self.api_key()),
                 "image_api_key_configured": bool(self.image_api_key()),
                 "search_api_key_configured": bool(self.search_api_key())}

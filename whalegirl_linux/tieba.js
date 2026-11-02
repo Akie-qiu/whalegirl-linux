@@ -190,7 +190,7 @@
       if(!s.pictures.length)pictures.append(el('p','hint','图片识别后进入独立的贴吧素材库，图片文件发送不等于微信原生表情'));
       shares.replaceChildren();for(const sh of s.shares){
         const row=el('article','record tieba-share');row.append(el('strong','',({queued:'待分享',sending:'正在发送',sent:'已确认发送',failed:'发送失败',uncertain:'结果待核对',cancelled:'已取消'}[sh.state]||sh.state)+' · '+chatName(sh.chat)),el('p','tieba-meme-copy',sh.text),el('p','hint',sh.error||fmt(sh.created)));
-        if(sh.state==='queued')row.append(el('p','hint',s.enabled?'等待空闲发送，仍遵守分享时段、每日条数和间隔设置':'贴吧总开关关闭，发送已暂停'));
+        if(sh.state==='queued')row.append(el('p','hint',(sh.waiting?.reason||(s.enabled?'等待空闲发送':'贴吧总开关关闭，发送已暂停'))+(sh.waiting?.retry_at?' · 最早 '+fmt(sh.waiting.retry_at):'')));
         if(sh.state==='queued')row.append(button('取消这条',async()=>{await api('tieba/shares/'+sh.id,'POST',{op:'cancel'});await load();}));
         if(sh.state==='uncertain')for(const [op,title] of [['received','确认已收到'],['not_received','确认未收到']])row.append(button(title,async()=>{await api('tieba/shares/'+sh.id,'POST',{op});await load();}));
         if(['failed','cancelled'].includes(sh.state))row.append(button('重试这条分享',async()=>{await api('tieba/shares/'+sh.id,'POST',{op:'retry'});notice('已重新排队，按当前分享限制发送');await load();}));

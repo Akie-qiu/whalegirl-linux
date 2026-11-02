@@ -22,9 +22,10 @@ class Store:
                 sender TEXT NOT NULL, content TEXT NOT NULL, timestamp REAL NOT NULL,
                 state TEXT NOT NULL, reply TEXT NOT NULL DEFAULT '',
                 receipt TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
-                updated REAL NOT NULL
+                updated REAL NOT NULL, received_at REAL NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS inbox_state ON inbox(state,timestamp);
+            CREATE INDEX IF NOT EXISTS inbox_account_state ON inbox(account,state);
             CREATE TABLE IF NOT EXISTS baselines(account TEXT,chat TEXT,PRIMARY KEY(account,chat));
             CREATE TABLE IF NOT EXISTS poll_progress(
                 account TEXT,chat TEXT,after_time REAL NOT NULL,after_id INTEGER NOT NULL,
@@ -51,6 +52,7 @@ class Store:
                 kind TEXT NOT NULL,reply TEXT NOT NULL,state TEXT NOT NULL,sent_at REAL NOT NULL,
                 receipt TEXT NOT NULL DEFAULT '',error TEXT NOT NULL DEFAULT '');
             CREATE INDEX IF NOT EXISTS outbound_actions_account ON outbound_actions(account,sent_at);
+            CREATE INDEX IF NOT EXISTS outbound_actions_inbox ON outbound_actions(inbox_key);
             CREATE TABLE IF NOT EXISTS archive_progress(
                 account TEXT,chat TEXT,before_time REAL,before_id INTEGER,completed REAL NOT NULL DEFAULT 0,
                 last_read REAL NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '',PRIMARY KEY(account,chat));
@@ -65,6 +67,10 @@ class Store:
         if 'after_id' not in {r[1] for r in self.db.execute('PRAGMA table_info(archive_progress)')}:
             self.db.execute('ALTER TABLE archive_progress ADD COLUMN after_id INTEGER NOT NULL DEFAULT 0')
         columns = {r[1] for r in self.db.execute('PRAGMA table_info(inbox)')}
+        if 'received_at' not in columns:
+            # Historical updated values may include waits/retries; do not
+            # fabricate a first-receipt time for pre-migration messages.
+            self.db.execute('ALTER TABLE inbox ADD COLUMN received_at REAL NOT NULL DEFAULT 0')
         for table in ('inbox','message_log'):
             if 'payload_json' not in {r[1] for r in self.db.execute('PRAGMA table_info('+table+')')}:
                 self.db.execute('ALTER TABLE '+table+" ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}'")
@@ -300,9 +306,10 @@ class Store:
                     if commit:
                         self.db.commit()
                 return bool(retry)
+            received_at = time.time()
             cursor = self.db.execute(
-                "INSERT OR IGNORE INTO inbox(key,account,chat,sender,content,timestamp,state,updated,local_id,sender_id,trigger,payload_json,error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (event["key"], event["account"], event["chat"], event["sender"], event["content"], event["timestamp"], state, time.time(),event.get('local_id'),event.get('sender_id',''),event.get('trigger',''),event.get('payload_json','{}'),event.get('read_reason','')[:300]),
+                "INSERT OR IGNORE INTO inbox(key,account,chat,sender,content,timestamp,state,updated,local_id,sender_id,trigger,payload_json,error,received_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (event["key"], event["account"], event["chat"], event["sender"], event["content"], event["timestamp"], state, received_at,event.get('local_id'),event.get('sender_id',''),event.get('trigger',''),event.get('payload_json','{}'),event.get('read_reason','')[:300],received_at),
             )
             if commit:
                 self.db.commit()

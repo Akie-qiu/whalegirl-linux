@@ -124,13 +124,16 @@ class ResponsesHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(self.requests[0].content)["text"]["format"],
                          {"type": "json_schema", **schema})
 
-    async def test_incomplete_output_is_not_sent_or_retried(self):
+    async def test_token_limit_retries_once_but_never_returns_partial_output(self):
         self.transport(lambda _: httpx.Response(200, json={"status": "incomplete",
             "incomplete_details": {"reason": "max_output_tokens"}, "usage": USAGE, "output": [
                 {"type": "message", "content": [{"type": "output_text", "text": '{"act'}]}]}))
         self.assertEqual(await self.engine.chat([{"role": "user", "content": "test"}]), "")
         self.assertIn("Token", self.engine.last_error)
-        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(len(self.requests), 2)
+        self.assertGreater(json.loads(self.requests[1].content)['max_output_tokens'],
+                           json.loads(self.requests[0].content)['max_output_tokens'])
+        self.assertEqual([event['status'] for event in self.events], ['error','error'])
         self.assertEqual(self.events[0]["status"], "error")
         self.assertEqual(self.events[0]["total_tokens"], 130)
 

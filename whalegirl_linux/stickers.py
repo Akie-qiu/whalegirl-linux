@@ -49,21 +49,35 @@ def sticker_emotional_signal(profile=None, fallback=''):
 
 def parse_json(text):
     text = str(text or '').strip().lstrip('\ufeff')
-    cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.I).strip()
     try:
-        return json.loads(cleaned)
+        # Valid JSON is authoritative, including literal tags inside strings.
+        return json.loads(text)
     except json.JSONDecodeError as original:
-        # Some compatible endpoints add a short preamble/trailer even in JSON
-        # mode. Recover one complete top-level value if the model provided it.
         decoder = json.JSONDecoder()
-        start = next((index for index, char in enumerate(cleaned) if char in '{['), None)
-        if start is not None:
-            try:
-                value, _ = decoder.raw_decode(cleaned[start:])
-                if isinstance(value, (dict, list)):
+        idx = 0
+        n = len(text)
+        while idx < n:
+            # Skip only an external complete thought block. JSON payloads are
+            # decoded intact below; this scan never rewrites their contents.
+            if text[idx:idx + 7].lower() == '<think>':
+                end = text.lower().find('</think>', idx + 7)
+                if end < 0:
+                    raise original
+                idx = end + len('</think>')
+                continue
+            if text[idx] in '{[':
+                try:
+                    value, _ = decoder.raw_decode(text, idx)
                     return value
-            except json.JSONDecodeError:
-                pass
+                except json.JSONDecodeError:
+                    # Providers sometimes prefix a short [annotation]. It is
+                    # prose, not permission to salvage nested, broken JSON.
+                    note = re.match(r'\[[A-Za-z_\-\u3400-\u9fff\s·：:]{1,40}\]', text[idx:]) if text[idx] == '[' else None
+                    if note:
+                        idx += note.end()
+                        continue
+                    raise original
+            idx += 1
         raise original
 
 

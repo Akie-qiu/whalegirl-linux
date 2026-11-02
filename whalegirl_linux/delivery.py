@@ -31,6 +31,7 @@ async def send_native(gateway, kind, chat, **values):
     if not gateway.ui_jobs_directory:
         return Receipt(False, error='原生发送尚未配置', definite_failure=True)
     operation = {'text': 'send_text', 'sticker': 'send_sticker', 'image': 'send_image'}[kind]
+    from .fast_send import current
     attempts_log = []
     for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
         details = {key: values[key] for key in ('text', 'md5', 'asset_id') if key in values}
@@ -41,26 +42,46 @@ async def send_native(gateway, kind, chat, **values):
         try:
             # Capture the baseline only after earlier UI jobs have finished.
             # Receipt polling itself never owns the shared UI lock.
-            async with gateway.ui_lock:
-                details['ui_lock_seconds'] = round(time.monotonic() - locked_at, 3)
-                before = await gateway.messages(chat)
-                details['before_ids'] = [outbound_identity(m) for m in before]
-                details['before_local_id'] = max((int(m.get('localId') or 0) for m in before), default=0)
-                submitted_at = time.monotonic()
-                crossed_boundary = True
-                result = await gateway.ui_job(operation, chat, **values)
-                details['ui_seconds'] = round(time.monotonic() - submitted_at, 3)
-                details['ui_timing'] = result.get('ui_timing') or {}
-                details['job_id'] = result.get('job_id', '')
-                details['submit_state'] = result.get('state', '')
-                details['submitted_at'] = time.time()
+            session=current(gateway,chat) if kind in ('text','sticker') else None
+            if session:
+                before=await gateway.messages(chat)
+                details['before_ids']=[outbound_identity(m) for m in before]
+                details['before_local_id']=max((int(m.get('localId') or 0) for m in before),default=0)
+                submitted_at=time.monotonic()
+                result=await session.submit(kind,values)
+                details['ui_seconds']=round(time.monotonic()-submitted_at,3)
+                if result is not None:
+                    crossed_boundary=result.get('state') not in ('failed_before_send',)
+                    details.update(ui_timing=result.get('ui_timing') or {},fast_session=True,
+                        job_id=result.get('job_id',''),part_index=result.get('part_index'),
+                        submit_state=result.get('state',''),submitted_at=time.time())
+            else:result=None
+            if result is None:
+                async with gateway.ui_lock:
+                    details['ui_lock_seconds'] = round(time.monotonic() - locked_at, 3)
+                    before = await gateway.messages(chat)
+                    details['before_ids'] = [outbound_identity(m) for m in before]
+                    details['before_local_id'] = max((int(m.get('localId') or 0) for m in before), default=0)
+                    submitted_at = time.monotonic()
+                    crossed_boundary = True
+                    result = await gateway.ui_job(operation, chat, **values)
+                    details['ui_seconds'] = round(time.monotonic() - submitted_at, 3)
+                    details['ui_timing'] = result.get('ui_timing') or {}
+                    details['job_id'] = result.get('job_id', '')
+                    details['submit_state'] = result.get('state', '')
+                    details['submitted_at'] = time.time()
+            if result.get('cancelled'):
+                details['cancelled']=True
+                return Receipt(False,error=result.get('error','本轮已取消，未发送'),definite_failure=True,
+                               retryable=False,attempts=attempt,details=details)
             if result.get('state') != 'submitted':
-                receipt = Receipt(False, error='微信原生任务未确认提交',
+                receipt = Receipt(False, error=result.get('error') or '微信原生任务未确认提交',
                                   definite_failure=result.get('state') == 'failed_before_send',
                                   attempts=attempt, details=details)
             else:
                 deadline = time.monotonic() + (3 if kind == 'image' else 2)
                 failed_local_id = None
+                pending_reads = 0
                 while time.monotonic() < deadline:
                     try:
                         rows = await asyncio.wait_for(gateway.messages(chat),max(.05,deadline-time.monotonic()))
@@ -93,7 +114,12 @@ async def send_native(gateway, kind, chat, **values):
                             failed_local_id = None
                     elif len(fresh) > 1:
                         break  # No unique correspondence; never guess a receipt.
-                    await asyncio.sleep(.2)
+                    # Most accepted rows acquire their server ID within the
+                    # first fraction of a second. Recheck those twice sooner;
+                    # keep the same deadline and unique server receipt rules.
+                    delay=(.05,.1)[pending_reads] if pending_reads<2 else .2
+                    pending_reads+=1
+                    await asyncio.sleep(min(delay,max(0,deadline-time.monotonic())))
                 receipt = Receipt(False, error='已提交微信，回执待核实；后续聊天继续，不自动重发',
                                   attempts=attempt, details=details)
         except UIJobError as exc:
@@ -121,7 +147,8 @@ def reconcile_outbound(store, account, chat, rows):
     from .runtime import timestamp
 
     pending = store.db.execute("SELECT * FROM outbound_actions WHERE account=? AND chat=? "
-                              "AND state='uncertain' AND sent_at>? ORDER BY sent_at,id",
+                              "AND (state='uncertain' OR (state='failed' AND kind='image' AND inbox_key LIKE 'picture:%')) "
+                              "AND sent_at>? ORDER BY sent_at,id",
                               (account, chat, time.time() - 86400)).fetchall()
     if not pending:
         return []
@@ -129,6 +156,8 @@ def reconcile_outbound(store, account, chat, rows):
     for saved in pending:
         action = dict(saved)
         details = json.loads(action['details_json'] or '{}')
+        if action['state'] == 'failed' and not details.get('local_id'):
+            continue  # Only the exact previously rejected native row can recover.
         if action['kind'] not in ('text', 'sticker', 'image') or 'before_ids' not in details:
             continue
         candidates = [m for m in rows if matches_message(action['kind'], details, m)
@@ -147,6 +176,8 @@ def reconcile_outbound(store, account, chat, rows):
         if counts[outbound_identity(row)] != 1:
             continue
         confirmed = server_acknowledged(row)
+        if action['state'] == 'failed' and not confirmed:
+            continue
         if not confirmed and row.get('nativeStatus') != 5:
             continue
         state = 'sent' if confirmed else 'failed'
@@ -154,6 +185,16 @@ def reconcile_outbound(store, account, chat, rows):
                        confirmation='native_poll', final_result=state)
         store.action_finish(action['id'], state, message_id(row) if confirmed else '',
                             '' if confirmed else '微信后续确认发送失败（原生状态5）', details=details)
+        if action['kind'] == 'image' and action['inbox_key'].startswith('picture:') and store.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='picture_jobs'").fetchone():
+            # Image tasks and their outbound action must share the final receipt.
+            # Reuse the normal poll; do not wait longer or submit a second image.
+            with store.lock, store.db:
+                store.db.execute("""UPDATE picture_jobs SET state=?,receipt=?,error=?,updated=?
+                    WHERE id=? AND account=? AND chat=? AND asset_id=? AND state IN ('uncertain','failed')""",
+                    (state, message_id(row) if confirmed else '',
+                     '' if confirmed else '微信后续确认发送失败（原生状态5）', time.time(),
+                     action['inbox_key'].removeprefix('picture:'), account, chat, details.get('asset_id', '')))
         metric = store.db.execute('SELECT metrics FROM reply_metrics WHERE key=?', (action['inbox_key'],)).fetchone()
         if metric:
             metrics = json.loads(metric[0])

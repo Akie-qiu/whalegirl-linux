@@ -89,7 +89,10 @@ class InitiativeContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls),1)
 
     async def test_cached_image_is_attached_and_bound_description_saved(self):
-        row={**self.message(2),'kind':3,'content':'[图片]','timestamp':time.time()-1900}
+        # Proactive image reads cover recent photos; old messages remain text
+        # context. An idle delay must not hide this recent-photo fixture.
+        self.configure(proactive_idle_minutes=0)
+        row={**self.message(2),'kind':3,'content':'[图片]','timestamp':time.time()-60}
         self.store.observe([row]);stream=BytesIO();Image.new('RGB',(32,32),'blue').save(stream,'PNG')
         self.store.cache_image(row['key'],{'data':base64.b64encode(stream.getvalue()).decode(),'format':'png'})
         calls=self.capture({'should_reply':False,'actions':[],
@@ -111,6 +114,7 @@ class InitiativeContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(calls[0][0][0]['content'],str)
 
     async def test_changing_history_does_not_change_the_static_prompt(self):
+        self.configure(sticker_usage_target=75)
         calls=self.capture();await self.service.run_once()
         self.store.observe([{**self.message(2),'content':'现在聊另外一件事','timestamp':time.time()-1900}])
         self.service.touch(proactive.CHAT,last_decision=0)
@@ -118,6 +122,15 @@ class InitiativeContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls),2)
         self.assertEqual(calls[0][1]['system_prompt'],calls[1][1]['system_prompt'])
         self.assertNotEqual(calls[0][0],calls[1][0])
+
+    async def test_initiative_uses_the_same_frequency_reference_in_one_request(self):
+        self.configure(sticker_usage_target=75,sticker_aggressiveness='very_high')
+        self.runtime.stickers.entries={'a'*32:'开心'};self.runtime.stickers.available=['a'*32]
+        calls=self.capture();self.assertTrue(await self.service.run_once())
+        self.assertEqual(len(calls),1)
+        self.assertNotIn('期望约75%',str(calls[0][0]))
+        self.assertIn('很愿意',calls[0][1]['system_prompt'])
+        self.assertNotIn('【表情节奏参考】',calls[0][1]['system_prompt'])
 
     async def test_unanswered_opener_is_not_repeated_after_midnight(self):
         old=time.time()-3*86400

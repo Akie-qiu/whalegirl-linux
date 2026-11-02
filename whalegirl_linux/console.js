@@ -3,6 +3,7 @@ const $ = id => document.getElementById(id);
 let token = sessionStorage.getItem('whalegirl-access') || '';
 let cfg = null, chats = [], selected = new Set(), modes = new Map();
 let state = null, pollTimer = null, updating = false;
+let modelProfiles = {}, activeModelProfile = 'custom', draftModelKeys = {};
 let qrShownAt = 0, lastQr = '', recordsSignature = '', noticeTimer;
 let lastStabilityFetch = 0;
 if ($('records-scope')) {
@@ -23,7 +24,7 @@ function notice(message, error = false) {
   text('notice', message); $('notice').className = error ? 'error' : ''; $('notice').hidden = false;
   noticeTimer = setTimeout(() => { $('notice').hidden = true; }, error ? 9000 : 4000);
 }
-async function api(path, method = 'GET', body) {
+async function api(path, method = 'GET', body, timeoutMs = 45000) {
   let response;
   try {
     const headers = { 'Content-Type': 'application/json' };
@@ -31,7 +32,7 @@ async function api(path, method = 'GET', body) {
     response = await fetch('/api/' + path, {
       method, headers,
       body: body === undefined ? undefined : JSON.stringify(body), cache: 'no-store',
-      signal: AbortSignal.timeout(45000)
+      signal: AbortSignal.timeout(timeoutMs)
     });
   } catch (error) {
     throw new Error(error.name === 'TimeoutError' ? '请求超时，请稍后重试。' : '无法连接服务器，请重新运行一键入口，恢复 SSH 连接。');
@@ -63,12 +64,7 @@ function populateSettings() {
   $('global-memory').checked = cfg.global_memory;
   $('vision-enabled').checked = cfg.vision_enabled;
   $('context-count').value = Math.max(10, Math.min(100, Number(cfg.context_messages) || 40));
-  $('api-url').value = cfg.api_url; $('model').value = cfg.model;
-  $('api-style').value = cfg.api_style || 'auto';
-  $('reasoning-effort').value = cfg.reasoning_effort || 'default';
-  $('model-stream-enabled').checked = cfg.model_stream_enabled ?? false;
-  syncModelPreset();
-  $('max-tokens').value = cfg.max_tokens;
+  populateModelProfiles(cfg);
   $('cooldown').value = cfg.chat_cooldown; $('send-interval').value = cfg.min_send_interval;
   $('quick-enabled').checked = cfg.enabled;
   $('safety-enabled').checked = cfg.safety_enabled ?? true;
@@ -83,6 +79,7 @@ function populateSettings() {
   if (window.habits) window.habits.populate();
   window.learning?.populate();
   window.memoryHub?.populate();
+  window.growthConsole?.populate();
   window.improvements?.populate();
   window.affection?.populate();
   window.stickerLibrary?.populate();
@@ -94,39 +91,70 @@ function populateSettings() {
 }
 const MODEL_PRESETS = {
   flash: { url: 'https://api.deepseek.com/chat/completions', model: 'deepseek-flash', style: 'openai' },
-  pro: { url: 'https://api.deepseek.com/chat/completions', model: 'deepseek-v4-pro', style: 'openai' }
+  pro: { url: 'https://api.deepseek.com/chat/completions', model: 'deepseek-v4-pro', style: 'openai' },
+  responses: { url: 'https://api.deepseek.com/responses', model: 'deepseek-chat', style: 'responses' },
+  custom: { url: 'https://api.deepseek.com/chat/completions', model: 'deepseek-chat', style: 'auto' }
 };
-function syncModelPreset(force = '') {
-  const url=$('api-url').value.trim().replace(/\/$/,'');
-  const model=$('model').value.trim();
-  const style=$('api-style').value;
-  const responses=style==='responses'||(style==='auto'&&/\/responses$/i.test(url));
-  const match=Object.entries(MODEL_PRESETS).find(([,preset])=>preset.url===url&&preset.model===model);
-  const active=force||(responses?'responses':match?.[0])||'custom';
-  for(const button of document.querySelectorAll('[data-model-preset]'))
-    button.setAttribute('aria-pressed',String(button.dataset.modelPreset===active));
-  text('api-style-hint',responses?
-    '使用 Responses 协议；支持 /responses 完整地址或 /v1 基础地址。Token 上限包含推理消耗，过低时可能没有正文。':
-    '自动识别会根据地址选择协议；中转站需提供对应接口。切换在保存后生效。');
+const MODEL_PROFILE_IDS = Object.keys(MODEL_PRESETS);
+function normalizeModelUrl(value) { return String(value || '').trim().replace(/\/$/, ''); }
+function modelProfileDefaults(id) {
+  const preset = MODEL_PRESETS[id] || MODEL_PRESETS.custom;
+  return { api_url: preset.url, api_style: preset.style, model: preset.model, max_tokens: 220,
+    reasoning_effort: 'default', model_stream_enabled: false, api_key_configured: false };
+}
+function normalizedModelProfile(id, value = {}) {
+  return { ...modelProfileDefaults(id), ...(value || {}), api_url: normalizeModelUrl(value?.api_url ?? modelProfileDefaults(id).api_url),
+    api_style: value?.api_style || modelProfileDefaults(id).api_style, model: String(value?.model ?? modelProfileDefaults(id).model),
+    max_tokens: Number(value?.max_tokens || 220), reasoning_effort: value?.reasoning_effort || 'default',
+    model_stream_enabled: value?.model_stream_enabled ?? false, api_key_configured: !!value?.api_key_configured };
+}
+function currentModelDraft() {
+  return { api_url: normalizeModelUrl($('api-url').value), api_style: $('api-style').value || 'auto', model: $('model').value.trim(),
+    max_tokens: Number($('max-tokens').value || 220), reasoning_effort: $('reasoning-effort').value || 'default',
+    model_stream_enabled: $('model-stream-enabled').checked, api_key_configured: !!modelProfiles[activeModelProfile]?.api_key_configured };
+}
+function rememberCurrentModelDraft() {
+  if (!$('api-url')) return;
+  modelProfiles[activeModelProfile] = normalizedModelProfile(activeModelProfile, currentModelDraft());
+  draftModelKeys[activeModelProfile] = $('api-key').value;
+}
+function loadModelProfile(id) {
+  activeModelProfile = MODEL_PROFILE_IDS.includes(id) ? id : 'custom';
+  const profile = modelProfiles[activeModelProfile] = normalizedModelProfile(activeModelProfile, modelProfiles[activeModelProfile]);
+  $('api-url').value = profile.api_url; $('api-style').value = profile.api_style; $('model').value = profile.model;
+  $('max-tokens').value = profile.max_tokens; $('reasoning-effort').value = profile.reasoning_effort;
+  $('model-stream-enabled').checked = !!profile.model_stream_enabled;
+  $('api-key').value = Object.prototype.hasOwnProperty.call(draftModelKeys, activeModelProfile) ? draftModelKeys[activeModelProfile] : '';
+  text('key-status', profile.api_key_configured ? '服务器已保存此模型卡片的 API Key；留空不会覆盖。' : '此模型卡片尚未配置 API Key。');
+  syncModelPreset();
+}
+function populateModelProfiles(config) {
+  modelProfiles = {};
+  draftModelKeys = {};
+  const raw = config.model_profiles || {};
+  for (const id of MODEL_PROFILE_IDS) modelProfiles[id] = normalizedModelProfile(id, raw[id]);
+  activeModelProfile = MODEL_PROFILE_IDS.includes(config.active_model_profile) ? config.active_model_profile : 'custom';
+  loadModelProfile(activeModelProfile);
+}
+function syncModelPreset() {
+  for (const button of document.querySelectorAll('[data-model-preset]'))
+    button.setAttribute('aria-pressed', String(button.dataset.modelPreset === activeModelProfile));
+  const responses = $('api-style').value === 'responses' || /\/responses$/i.test(normalizeModelUrl($('api-url').value));
+  text('api-style-hint', responses ?
+    '使用 Responses 协议；此卡片单独保存自己的地址、密钥和模型名。':
+    '支持 HTTP / HTTPS 中转，可填 /v1 基础地址或完整接口地址；每张模型卡片分别保存。');
 }
 for (const button of document.querySelectorAll('[data-model-preset]')) {
   button.addEventListener('click', () => {
-    const name=button.dataset.modelPreset,preset=MODEL_PRESETS[name];
-    if(preset){$('api-url').value=preset.url;$('model').value=preset.model;$('api-style').value=preset.style;$('reasoning-effort').value='default';}
-    if(name==='responses'){
-      $('api-style').value='responses';
-      $('api-url').value=$('api-url').value.trim().replace(/\/(?:chat\/completions|messages)\/?$/i,'/responses');
-    }
-    if(name==='custom')$('api-style').value='auto';
-    syncModelPreset(name);
-    text('test-result','有未保存的模型修改，点击“保存模型”后生效');
-    if(name==='custom')$('model').focus();
+    rememberCurrentModelDraft();
+    loadModelProfile(button.dataset.modelPreset);
+    text('test-result', '已切换到独立模型卡片；保存后启用该卡片的地址、Key 和模型名。');
   });
 }
-for (const id of ['api-url','model','api-style','reasoning-effort','model-stream-enabled']) $(id).addEventListener('input', () => {
-  syncModelPreset();
-  text('test-result','有未保存的模型修改，点击“保存模型”后生效');
-});
+for (const id of ['api-url','model','api-style','max-tokens','reasoning-effort','model-stream-enabled']) {
+  const markModelDraft = () => { rememberCurrentModelDraft(); syncModelPreset(); text('test-result','有未保存的模型修改，点击“保存模型”后生效'); };
+  $(id).addEventListener('input', markModelDraft); $(id).addEventListener('change', markModelDraft);
+}
 function chatName(id) { const c = chats.find(c => c.id === id); return c ? c.remark || c.name || id : id; }
 function renderChats() {
   const query = $('chat-search').value.trim().toLocaleLowerCase();
@@ -177,7 +205,7 @@ async function refreshChats(silent = false) {
   } catch (error) { renderChats(); if (!silent) throw error; }
 }
 async function saveSubset(values, apiKey = '', searchKey = '') {
-  const current = await api('config'); delete current.api_key_configured; delete current.image_api_key_configured; delete current.search_api_key_configured;
+  const current = await api('config'); delete current.api_key_configured; delete current.image_api_key_configured; delete current.search_api_key_configured; delete current.model_profiles; delete current.active_model_profile;
   cfg = await api('config', 'POST', { settings: { ...current, ...values }, api_key: apiKey, search_api_key: searchKey });
   await update();
   return cfg;
@@ -195,14 +223,14 @@ function renderRecords(rows) {
     const mediaWaiting = row.state === 'queued' && (row.error || '').startsWith('图片加载中');
     const status = document.createElement('span'); status.textContent = (mediaWaiting ? '等待图片传输' : recordLabels[row.state] || row.state) + ' · ' + new Date(row.updated * 1000).toLocaleString('zh-CN', { hour12: false });
     top.append(who, status); article.append(top);
-    for (const [content, isReply] of [[row.content, false], [row.reply, true]]) {
-      if (!content) continue;
-      if(isReply){
-        const hint=document.createElement('p');hint.className='hint';
-        hint.textContent=['sent','partial'].includes(row.state)?'已确认发送的内容':row.state==='uncertain'?'发送结果待核对的内容':'生成内容（请以发送状态为准）';
-        article.append(hint);
-      }
-      const message = document.createElement('div'); message.className = 'message' + (isReply ? ' reply' : ''); message.textContent = content; article.append(message);
+    if (row.content) {
+      const message = document.createElement('div'); message.className = 'message'; message.textContent = row.content; article.append(message);
+    }
+    if (row.reply) {
+      const hint = document.createElement('p'); hint.className = 'hint';
+      hint.textContent = ['sent', 'partial'].includes(row.state) ? '已确认发送的内容' : row.state === 'uncertain' ? '发送结果待核对的内容' : '生成内容（请以发送状态为准）';
+      article.append(hint);
+      const message = document.createElement('div'); message.className = 'message reply'; message.textContent = row.reply; article.append(message);
     }
     for(const item of row.actions || []){
       const detail=document.createElement('p');detail.className=['sent','uncertain','sending'].includes(item.state)?'hint':'error-text';
@@ -225,6 +253,7 @@ function renderState(s) {
   if (window.habits) window.habits.stateUpdated(s);
   window.learning?.stateUpdated(s);
   window.memoryHub?.stateUpdated(s);
+  window.growthConsole?.stateUpdated(s);
   window.affection?.stateUpdated(s);
   window.stickerLibrary?.stateUpdated(s);
   window.proactiveChat?.refresh().catch(() => {});
@@ -251,6 +280,7 @@ function renderState(s) {
   const memoryNote = memoryRecall ? ' · 分级记忆 ' + memoryRecall.count + ' 条' + (memoryRecall.ids.length ? '（#' + memoryRecall.ids.join('、#') + '）' : '') + (memoryRecall.estimated_tokens != null ? ' · 记忆输入约 ' + memoryRecall.estimated_tokens + '/' + memoryRecall.budget + ' Token' : '') + (memoryRecall.skipped_for_budget ? ' · 预算未载入 ' + memoryRecall.skipped_for_budget + ' 条' : '') : '';
   text('timing-detail', timing.total_seconds == null ? '等待下一次实际回复，文字和表情的耗时会分别统计。' : '发现 ' + (timing.detected_after_seconds || 0).toFixed(1) + 's · 上下文 ' + (timing.context_seconds || 0).toFixed(1) + 's · 模型 ' + (timing.model_seconds || 0).toFixed(1) + 's · 发送确认 ' + (timing.send_readback_seconds || 0).toFixed(1) + 's' + memoryNote);
   if(timing.first_reply_seconds!=null)$('timing-detail').append(document.createTextNode(' · 首条确认 '+timing.first_reply_seconds.toFixed(1)+'s'));
+  if(timing.total_seconds!=null)$('timing-detail').append(document.createTextNode(' · 整轮确认 '+timing.total_seconds.toFixed(1)+'s'+(timing.delivery_queue_seconds!=null?' · 待发 '+timing.delivery_queue_seconds.toFixed(1)+'s':'')+(timing.pre_model_seconds!=null?' · 准备 '+timing.pre_model_seconds.toFixed(1)+'s':'')));
   const stickers = s.stickers || {};
   if (timing.quoted) $('timing-detail').append(document.createTextNode(' · 原生引用回复'));
   else if (timing.quote_fallback) $('timing-detail').append(document.createTextNode(' · 引用不可用，已直接回复'));
@@ -389,10 +419,17 @@ $('save-chats').onclick = () => action($('save-chats'), async () => {
   text('chat-save-note', '会话设置已保存 · ' + new Date().toLocaleTimeString('zh-CN')); notice('会话与唤醒设置已保存。');
 });
 $('save-model').onclick = () => action($('save-model'), async () => {
-  await saveSubset({ api_url: $('api-url').value.trim(), api_style: $('api-style').value, model: $('model').value.trim(), max_tokens: Number($('max-tokens').value),
-    reasoning_effort: $('reasoning-effort').value, model_stream_enabled: $('model-stream-enabled').checked }, $('api-key').value.trim());
-  syncModelPreset();text('test-result','模型设置已保存');
-  $('api-key').value = ''; text('key-status', cfg.api_key_configured ? '服务器已保存 API Key；留空不会覆盖。' : '尚未配置 API Key。'); notice('模型设置已保存。');
+  rememberCurrentModelDraft();
+  const response = await api('model-profiles', 'POST', {
+    profile_id: activeModelProfile,
+    profile: { api_url: modelProfiles[activeModelProfile].api_url, api_style: modelProfiles[activeModelProfile].api_style,
+      model: modelProfiles[activeModelProfile].model, max_tokens: modelProfiles[activeModelProfile].max_tokens,
+      reasoning_effort: modelProfiles[activeModelProfile].reasoning_effort,
+      model_stream_enabled: modelProfiles[activeModelProfile].model_stream_enabled },
+    api_key: draftModelKeys[activeModelProfile] || '', activate: true
+  });
+  cfg = response; draftModelKeys[activeModelProfile] = '';
+  populateSettings(); text('test-result','模型卡片已保存并启用'); notice('当前模型卡片已保存；其他卡片的地址、Key 和模型名保持独立。');
 });
 $('save-timing').onclick = () => action($('save-timing'), async () => { await saveSubset({ chat_cooldown: Number($('cooldown').value), min_send_interval: Number($('send-interval').value) }); notice('回复节奏已保存。'); });
 $('save-safety').onclick = () => action($('save-safety'), async () => {
@@ -552,12 +589,13 @@ document.addEventListener('DOMContentLoaded', () => {
   const ignoreDirtyIds=new Set([
     'chat-search','records-scope','learning-query','learning-filter-chat','learning-filter-kind','learning-filter-state',
     'memory-search','memory-show-archived','memory-filter-chat','persona-live-chat','inbox-chat','inbox-query',
+    'hub-style-chat','hub-chat','hub-person','hub-tier','hub-status','hub-kind','hub-query',
     'quick-enabled','quick-affection-enabled','affection-enabled','pc-search','autonomy-enabled'
   ]);
   contentGrid.addEventListener('input',markDirty);
   contentGrid.addEventListener('change',markDirty);
   function markDirty(e){
-    const el=e.target;if(!el||ignoreDirtyIds.has(el.id)||el.type==='search')return;
+    const el=e.target;if(!el||ignoreDirtyIds.has(el.id)||el.type==='search'||el.closest('dialog'))return;
     const panel=el.closest('.panel');if(!panel||!panelSaveMap[panel.id])return;
     dirtyPanelId=panel.id;
     const h2=panel.querySelector('h2')?.textContent?.trim()||'当前面板';

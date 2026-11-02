@@ -11,10 +11,14 @@ import time
 import uuid
 
 from .stickers import parse_json
+from .moments_creativity import MOMENTS_STORY_RULES, publication_references, story_brief, story_metadata
+from .moments_world import MomentsWorld, WORLD_RULES
+from .image_canvas import CANVAS_RULES, canvas
 
-_MOMENTS_JSON_KEYS = 'participate|text|media_mode|asset_ids|image_prompt|post_topic|post_angle|visual_concept'
+_MOMENTS_JSON_KEYS = ('participate|text|media_mode|asset_ids|image_prompt|post_topic|post_angle|visual_concept|'
+                     'story_seed|story_hook|story_progress|image_aspect_ratio')
 _MOMENTS_STR_FIELD_RE = re.compile(
-    r'("(?:text|image_prompt|post_topic|post_angle|visual_concept)"\s*:\s*")(.*?)("(?=\s*(?:,\s*"(?:'
+    r'("(?:text|image_prompt|post_topic|post_angle|visual_concept|story_seed|story_hook|story_progress|image_aspect_ratio)"\s*:\s*")(.*?)("(?=\s*(?:,\s*"(?:'
     + _MOMENTS_JSON_KEYS + r')"\s*:|\}\s*$)))',
     re.DOTALL,
 )
@@ -233,6 +237,7 @@ class MomentsBook:
                 'time': datetime.fromtimestamp(row['updated'], TZ).isoformat(),
                 'topic': payload.get('post_topic', ''), 'angle': payload.get('post_angle', ''),
                 'visual_concept': payload.get('visual_concept', ''), 'assets': payload.get('assets', []),
+                **{key: payload.get(key, '') for key in ('story_seed', 'story_hook', 'story_progress')},
                 'image_prompt': payload.get('image_prompt', '') or prompts.get(row['id'], '')[:500]})
         return result
 
@@ -241,6 +246,7 @@ class MomentsService:
     def __init__(self, runtime):
         self.runtime = runtime
         self.book = MomentsBook(runtime.store)
+        self.world = MomentsWorld(runtime)
         self.lock = asyncio.Lock()
         self.last_scan = 0.0
         self.last_cache_scan = 0.0
@@ -647,6 +653,10 @@ class MomentsService:
                         'recent_own_posts': [p['text'] for p in self.posts if p.get('own')][:4]}
                 if kind != 'publish':
                     post = payload['post']
+                    if kind == 'reply_own' and (world_post := self.world.post_context(post.get('id'))):
+                        data['life_world_post'] = world_post
+                        public_rules += ('这条是你以大肥鱼第一人称发布的公寓生活漫画，life_world_post提供本篇真实的创作档案。'
+                                         '小龙娘、小克、小星是世界里的伙伴，不是现实评论者。自然接住这条评论，不复述整段剧情。')
                     data['source'] = {'post': {k: post.get(k) for k in
                         ('id', 'author', 'name', 'own', 'text', 'title', 'kind', 'image_count', 'created')}}
                     data.pop('recent_own_posts')
@@ -661,9 +671,17 @@ class MomentsService:
                             '理解对方具体在回应哪句话，再自然接话；缺少父评论时不要编造上文。'
                             '不要重复自己已经说过的话；如果问题已被回答或插话不合适，可以不参与。')
                 history = self.publication_history(identity) if kind == 'publish' else []
+                life_world = self.world.prepare() if kind == 'publish' else None
                 if kind == 'publish':
-                    data['recent_publications'] = history
+                    data.pop('recent_own_posts')
+                    data['recent_publications'] = publication_references(history)
                     data['variety_days'] = s.moments_variety_days
+                    data['story_brief'] = story_brief(history, identity)
+                    if life_world:
+                        data['life_world'] = life_world
+                        public_rules += WORLD_RULES
+                    else:
+                        public_rules += MOMENTS_STORY_RULES
                     public_rules += ('发新动态前参考recent_publications中的已发与待发内容：每天都应有新的主要内容，'
                         '从人设和兴趣中换具体话题、观点、情绪、句式与配图场景。不能只把昨天的句子换几个词，'
                         '也不能文案换了但仍每天画同一姿势、背景、构图；同一兴趣可以换真正不同的切入点。'
@@ -671,6 +689,8 @@ class MomentsService:
                         '另返回post_topic、post_angle、visual_concept，各用不超过60字记录本次具体话题、表达角度和画面构思。')
                 if kind == 'publish' and s.moments_image_pick_enabled and not payload['assets']:
                     library = self.runtime.images.candidates(' '.join(s.moments_topics), limit=24)
+                    if life_world:
+                        library = self.world.palette(library)
                     used = {asset for item in history for asset in item.get('assets', [])}
                     data['image_library'] = sorted([{**a, 'recently_used': a['id'] in used} for a in library],
                                                    key=lambda a: a['recently_used'])[:16]
@@ -678,6 +698,7 @@ class MomentsService:
                                      'recently_used=true的图片仅供了解历史，不要重新选择；不合适时留空，不必强行配图。')
                 can_generate = False
                 if kind == 'publish':
+                    public_rules += CANVAS_RULES
                     if s.image_references_enabled and hasattr(self.runtime.images, 'references'):
                         style = style + self.runtime.images.references.self_prompt()
                     remaining = max(0, s.image_per_day - self.runtime.images.generation_count()) if s.moments_image_generate_enabled else 0
@@ -700,7 +721,8 @@ class MomentsService:
                 engine = self.runtime.engine_factory(api_url=s.api_url, api_key=self.runtime.config.api_key(),
                     api_style=s.api_style,
                     reasoning_effort=s.reasoning_effort, stream_enabled=s.model_stream_enabled,
-                    model=s.model, max_tokens=1000 if kind == 'publish' else 320,
+                    model=s.model, max_tokens=(2400 if not life_world['established'] else 1600) if life_world
+                        else 1000 if kind == 'publish' else 320,
                     temperature=.85 if kind == 'publish' else .7, timeout=45, max_retries=2)
                 engine.usage_callback = lambda event: self.runtime.token_ledger.record(s.account_id, event)
                 try:
@@ -731,12 +753,24 @@ class MomentsService:
                         if isinstance(chosen,list) and media_mode == 'library':
                             payload['assets']=list(dict.fromkeys(a for a in chosen if isinstance(a,str) and a in allowed))[:9]
                     if kind == 'publish':
+                        if life_world:
+                            payload['world_episode'] = self.world.episode(value, life_world)
+                            if media_mode == 'library' and payload['assets']:
+                                permitted = {a['id'] for a in data.get('image_library', [])
+                                    if set(payload['world_episode']['cast_ids']).issubset(a.get('story_cast', []))}
+                                permitted.update(payload.get('assets_authorized', []))
+                                if any(a not in permitted for a in payload['assets']):
+                                    raise ValueError('所选旧图与本篇出场角色不匹配，未用单人图代替生活漫画')
+                            self.world.establish(value, life_world)
+                        payload.update(story_metadata(value, data['story_brief']))
                         for key in ('post_topic', 'post_angle', 'visual_concept'):
                             payload[key] = str(value.get(key) or '').strip()[:60]
                         if wants_generation and any(similar_publication(image_prompt, item.get('image_prompt', '')) for item in history):
                             self.book.change(identity, 'skipped', text=text, error='新配图构思与近期生成内容高度相似，本轮跳过')
                             return self.book.get(s.account_id, identity)
                         payload['image_prompt'] = image_prompt if wants_generation else ''
+                        if wants_generation:
+                            payload['image_aspect_ratio'] = canvas(s.image_size, value.get('image_aspect_ratio') or 'auto')['aspect_ratio']
                         payload['media_mode'] = 'generate' if wants_generation else 'library' if payload['assets'] else 'none'
                         for asset_id in payload.get('assets',[]):
                             self.runtime.images.stage(asset_id, chat='', admin=asset_id in payload.get('assets_authorized',[]))
@@ -749,7 +783,8 @@ class MomentsService:
                         try:
                             variant = s.image_character_variant
                             enqueue_args = {'kind': 'generate', 'prompt': image_prompt,
-                                'destination': 'moments', 'moment_id': identity, 'source_key': 'moments:' + identity}
+                                'destination': 'moments', 'moment_id': identity, 'source_key': 'moments:' + identity,
+                                'aspect_ratio': payload.get('image_aspect_ratio', 'auto')}
                             if variant:
                                 enqueue_args['character_variant'] = variant
                             if hasattr(self.runtime.images, 'references'):
@@ -859,6 +894,12 @@ class MomentsService:
                 definite = isinstance(exc, UIJobError) and exc.state == 'failed_before_send'
                 self.book.change(identity, 'failed' if definite else 'uncertain',
                     error=str(exc)[:240] if definite else '提交状态未知，请核对，系统不会自动重发')
+            # Native confirmation is already recorded. World bookkeeping must
+            # never turn a delivered post into an uncertain/replayed send.
+            try:
+                self.world.reconcile()
+            except Exception as exc:
+                self.error = '朋友圈发送记录已保存，生活事件待恢复入档：' + type(exc).__name__
             return self.book.get(s.account_id, identity)
 
     async def tick(self):

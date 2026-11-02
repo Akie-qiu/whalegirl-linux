@@ -114,6 +114,7 @@ class MemoryHub:
                     occurred REAL NOT NULL,excerpt TEXT NOT NULL DEFAULT '',receipt TEXT NOT NULL DEFAULT '{}',
                     UNIQUE(memory_id,source_key,source_type));
                 CREATE INDEX IF NOT EXISTS memory_evidence_source ON memory_evidence(account,source_key);
+                CREATE INDEX IF NOT EXISTS memory_evidence_style ON memory_evidence(account,memory_id,occurred);
                 CREATE TABLE IF NOT EXISTS memory_origins(
                     account TEXT NOT NULL,source TEXT NOT NULL,origin_id TEXT NOT NULL,
                     memory_id INTEGER NOT NULL,origin_version INTEGER NOT NULL DEFAULT 0,
@@ -135,6 +136,10 @@ class MemoryHub:
             self.db.execute("UPDATE memories SET status=CASE WHEN archived=1 THEN 'forgotten' ELSE 'active' END WHERE status=''")
             self.db.execute("UPDATE memory_work_queue SET state='queued' WHERE state='processing'")
             self.db.commit()
+        from .memory_layers import MemoryLayers
+        self.layers=MemoryLayers(self)
+        from .chat_style import ChatStyle
+        self.chat_style=ChatStyle(self)
 
     @property
     def settings(self):
@@ -174,7 +179,8 @@ class MemoryHub:
             if value.get('expires_at') and value['expires_at']<=time.time():value['expires_at']=0
         if state not in STATES:
             raise ValueError('记忆状态无效')
-        if actor != 'admin' and data.get('op') == 'update' and (old or {}).get('status') != 'active':
+        growth_accept=(actor=='growth' and (old or {}).get('status')=='pending' and data.get('status')=='active')
+        if actor != 'admin' and data.get('op') == 'update' and (old or {}).get('status') != 'active' and not growth_accept:
             raise ValueError('不能自动恢复已停用的记忆')
         prop = str(data.get('property_key', (old or {}).get('property_key', '')) or '').strip()
         if len(prop) > 80:
@@ -187,20 +193,28 @@ class MemoryHub:
         venue = data.get('venue', (old or {}).get('venue', 'any'))
         if venue not in ('any', 'group', 'private'):
             raise ValueError('适用场合无效')
-        if actor != 'admin' and not old and value['kind'] in ROLE_KINDS and not value['chat'].endswith('@chatroom'):
+        if actor != 'admin' and not old and value['kind'] in ROLE_KINDS and not value['chat'].endswith('@chatroom') and value['chat']!='@world-learning':
             venue = 'private'
         role = (old or {}).get('role_id') or (self.role() if value['kind'] in ROLE_KINDS else '')
         value.update(tier=tier, status=state, property_key=prop, venue=venue, role_id=role,
                      locked=int(bool(data.get('locked', (old or {}).get('locked', 0)))),
                      valid_from=(old or {}).get('valid_from') or value.get('created') or time.time(),
                      valid_until=(old or {}).get('valid_until', 0), confidence=(old or {}).get('confidence', 1))
+        if actor == 'experience' and isinstance(data.get('_experience'), dict):
+            value['source_class'] = 'experience'
+            value['projection_json'] = json.dumps(data['_experience'], ensure_ascii=False)
         return value
 
     def written(self, value, old, data, actor):
         self.db.execute('''UPDATE memories SET tier=:tier,status=:status,property_key=:property_key,
             venue=:venue,role_id=:role_id,locked=:locked,valid_from=:valid_from,
             valid_until=:valid_until,confidence=:confidence WHERE id=:id''', value)
-        self.evidence(value, data.get('source_key', ''), 'admin' if actor == 'admin' else 'message')
+        if actor == 'experience' and isinstance(data.get('_experience'), dict):
+            self.db.execute("UPDATE memories SET source_class='experience',projection_json=? WHERE id=?",
+                            (value['projection_json'], value['id']))
+            self.evidence(value, data.get('source_key', ''), 'interaction', data['_experience'].get('evidence', ''))
+        else:
+            self.evidence(value, data.get('source_key', ''), 'admin' if actor == 'admin' else 'message')
         if not old or old['content'] != value['content']:
             # Explicit property keys allow temporal replacement without guessing
             # whether two semantically similar sentences contradict each other.
@@ -223,16 +237,19 @@ class MemoryHub:
         elif data.get('op') == 'restore':
             self.db.execute('UPDATE memory_suppressions SET active=0 WHERE memory_id=?', (value['id'],))
         elif old and old['content'] != value['content']:
-            self.suppress(old)
+            # A developing episode replaces its interpretation, not the real
+            # messages that explain the correction (including its new evidence).
+            self.suppress(old, content_only=actor == 'experience')
         self.project_learning(value)
 
-    def suppress(self, row, visited=None):
+    def suppress(self, row, visited=None, *, content_only=False):
         visited = set() if visited is None else visited
         if row['id'] in visited:
             return
         visited.add(row['id'])
-        keys = {r[0] for r in self.db.execute('SELECT source_key FROM memory_evidence WHERE memory_id=?', (row['id'],))}
-        keys.add(row.get('source_key', ''))
+        keys = {''} if content_only else {r[0] for r in self.db.execute('SELECT source_key FROM memory_evidence WHERE memory_id=?', (row['id'],))}
+        if not content_only:
+            keys.add(row.get('source_key', ''))
         signature = hashlib.sha256(json.dumps([row['account'], row['chat'], row['subject'], normalized(row['content'])], ensure_ascii=False).encode()).hexdigest()
         for key in keys:
             self.db.execute('''INSERT INTO memory_suppressions(memory_id,account,source_key,signature,active)
@@ -255,12 +272,12 @@ class MemoryHub:
                 self.suppress(after, visited)
                 self.project_learning(after)
 
-    def blocked(self, account, chat, subject, content, source_key='', kind=''):
+    def blocked(self, account, chat, subject, content, source_key='', kind='', *, except_memory_id=0):
         signature = hashlib.sha256(json.dumps([account, chat, subject, normalized(content)], ensure_ascii=False).encode()).hexdigest()
         return bool(self.db.execute('''SELECT 1 FROM memory_suppressions s JOIN memories m ON m.id=s.memory_id
-            WHERE s.account=? AND s.active=1 AND (s.signature=? OR
+            WHERE s.account=? AND s.active=1 AND s.memory_id!=? AND (s.signature=? OR
             (s.source_key!='' AND s.source_key=? AND (?='' OR m.kind=?))) LIMIT 1''',
-            (account, signature, source_key,kind,kind)).fetchone())
+            (account, except_memory_id, signature, source_key,kind,kind)).fetchone())
 
     def suppressed_sources(self, account, allowed):
         if not allowed:
@@ -509,9 +526,14 @@ class MemoryHub:
 
     def visible(self,row,chat,subjects,shared):
         if not row or not self.enabled():return False
+        if row.get('source_class') == 'experience' and self.settings and not self.settings.experience_growth_enabled:
+            return False
         if row.get('role_id') and row['role_id']!=self.role():return False
         venue='group' if chat.endswith('@chatroom') or chat=='moments' else 'private'
         if row.get('venue','any') not in ('any',venue):return False
+        if row.get('source_class')=='world_learning':
+            return bool(self.settings and self.settings.growth_enabled
+                        and row['role_id']==self.role() and self.book.active(row))
         return self.book.visible(row,chat,subjects,shared)
 
     def recall(self, account, allowed, subject, question, *, chat=None, subjects=(), shared=True,
@@ -554,11 +576,15 @@ class MemoryHub:
         words = recall_terms(question)
         lowered = str(question).casefold()
         def score(row):
+            if (row['source_class'] == 'experience' and self.settings
+                    and not getattr(self.settings, 'experience_growth_enabled', True)):
+                return 0
             related = sum(w in row['content'].casefold() for w in words)
             tags = [t.strip() for t in re.split(r'[,，、\s/#]+', row['triggers']) if len(t.strip()) >= 2]
             related += 2 * sum(t.casefold() in lowered for t in tags)
             personal = row['subject'] in people and row['scope'] == 'profile'
-            style = row['kind'] in ('chat_style', 'interaction_rule', 'nickname')
+            style = row['kind'] in ('chat_style','interaction_rule','nickname','persona','expression') and (
+                row['subject'] in people or row['subject'] in ('self','',account))
             # Preserve legacy room-scoped administrator corrections without
             # turning an unresolved old nickname into a shared wxid profile.
             room_correction = row['actor']=='admin' and row['kind'] in FACT_KINDS and row['scope']=='chat' and row['chat']==chat
@@ -568,11 +594,14 @@ class MemoryHub:
                 return 0
             if row['kind'] in ('event', 'joke', 'meme_usage', 'slang', 'shared_moment', 'self_stance') and not related:
                 return 0
-            age = max(0, (now - row['updated']) / 86400)
+            growing=bool(self.settings and self.settings.growth_enabled)
+            age = max(0, (now - (max(row['updated'],row.get('last_used',0)) if growing else row['updated'])) / 86400)
             strength = {'core': 12, 'stable': 6, 'ordinary': 1, 'cold': 0}[row['tier']]
             decay = max(.2, .5 ** (age / max(3,half_life_days))) if row['tier'] == 'ordinary' else 1
             affinity = 2*min(2,max(0,personal_priority)) if related and personal else 0
-            return (min(related, 12) * 8 + 10 * personal + strength + affinity + (2 if row['actor'] == 'admin' else 0)) * decay
+            from .memory_layers import usage_boost
+            return (min(related, 12) * 8 + 10 * personal + strength + affinity + (2 if row['actor'] == 'admin' else 0)
+                    + (usage_boost(row) if growing else 0)) * decay
         ranked = sorted(((score(r), r) for r in rows), key=lambda p: (p[0], p[1]['updated'], p[1]['id']), reverse=True)
         return [r for score_value, r in ranked if score_value > 0][:min(50, limit)]
 

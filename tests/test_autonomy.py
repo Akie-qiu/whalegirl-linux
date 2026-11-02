@@ -55,20 +55,13 @@ class AutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.gateway.sent, [('sticker','a'*32)])
         self.assertEqual(engine.calls, 1)
 
-    async def test_switch_restores_old_participation_and_pairing(self):
+    async def test_legacy_flag_cannot_restore_heuristic_participation(self):
         event = self.event(content='大家聊', trigger='natural')
         self.store.observe([event])
-        actions = [{'type':'text','text':'接住了'}]
-        decision = {'sticker_suggestion':'a'*32}
-        new = self.config.settings.model_copy(update={'quiet_start_hour':0,'quiet_end_hour':23})
-        self.assertTrue(participation(new,self.store,event,[event],now=1770000000)[0])
-        self.assertEqual(len(pair_sticker(decision,actions,{'a'*32:'开心'},new,draw=1)[0]), 2)
-        old = new.model_copy(update={'autonomy_enabled':False})
-        self.assertFalse(participation(old,self.store,event,[event],now=1770000000)[0])
-        self.assertEqual(len(pair_sticker(decision,actions,{'a'*32:'开心'},old,draw=1)[0]), 2)
         self.configure(autonomy_enabled=False)
-        self.assertEqual(self.service.static_prompt(), '')
-        self.assertEqual(self.service.dynamic_prompt(event), '')
+        self.assertTrue(self.config.settings.autonomy_enabled)
+        self.assertTrue(participation(self.config.settings,self.store,event,[event],now=time.time())[0])
+        self.assertIn('自主参与接口',self.service.static_prompt())
 
     async def test_direct_request_is_not_filtered_by_natural_request_pacing(self):
         event = self.event()
@@ -86,7 +79,7 @@ class AutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.get(event['key'])['state'], 'queued')
         self.assertIn(event['chat'], self.service.waiting_chats())
         self.configure(autonomy_enabled=False)
-        self.assertEqual(self.service.waiting_chats(), set())
+        self.assertIn(event['chat'],self.service.waiting_chats())
 
     async def test_intentions_are_grounded_deduplicated_and_can_be_completed(self):
         event = self.event(content='我明天下午答辩')
@@ -110,10 +103,10 @@ class AutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.service.accept(foreign,[foreign], {'intent_ops':[{'op':'cancel','id':existing['id']}]})
         self.assertEqual(len(self.service.pending('account',event['chat'])), 1)
 
-    async def test_switch_pauses_due_intentions_without_erasing_them(self):
+    async def test_old_mode_flag_does_not_hide_due_intentions(self):
         event = self.event(); self.store.observe([event]); self.intention(event)
         self.configure(autonomy_enabled=False)
-        self.assertEqual(self.service.pending('account',event['chat'],due=True,now=time.time()+7200), [])
+        self.assertEqual(len(self.service.pending('account',event['chat'],due=True,now=time.time()+7200)),1)
         self.assertEqual(len(self.service.snapshot()['intents']), 1)
         self.configure(autonomy_enabled=True)
         self.assertEqual(len(self.service.pending('account',event['chat'],due=True,now=time.time()+7200)), 1)
@@ -150,13 +143,13 @@ class AutonomyTests(unittest.IsolatedAsyncioTestCase):
         config=self.config
         class SlowEngine(Engine):
             async def chat(self,*args,**kwargs):
-                config.save(config.settings.model_copy(update={'autonomy_enabled':False}))
+                config.save(config.settings.model_copy(update={'learning_enabled':False}))
                 return json.dumps({'learning_proposals':[]})
         self.runtime.engine_factory=SlowEngine
         self.assertFalse(await self.service.grow_once())
         self.assertEqual(self.service.snapshot()['events'], [])
 
-    async def test_admin_api_switches_both_directions_and_keeps_existing_settings(self):
+    async def test_admin_api_migrates_old_mode_flag_and_keeps_existing_settings(self):
         app = create_app(self.folder/'console', gateway=habit_fixtures.Gateway(),
                          engine_factory=Engine, run_background=False)
         config = app.state.config
@@ -168,7 +161,7 @@ class AutonomyTests(unittest.IsolatedAsyncioTestCase):
                 values['autonomy_enabled'] = active
                 self.assertEqual(client.post('/api/config',headers=headers,json={'settings':values}).status_code, 200)
                 state = client.get('/api/autonomy',headers=headers).json()
-                self.assertEqual(state['enabled'], active)
+                self.assertTrue(state['enabled'])
                 self.assertEqual(config.settings.context_messages, 40)
                 self.assertEqual(config.settings.proactive_chat_ids, [])
 
@@ -184,7 +177,7 @@ class AutonomyTests(unittest.IsolatedAsyncioTestCase):
                 'autonomy_enabled':False,'participation':'quiet','proactive_enabled':True,
                 'proactive_per_day':17,'proactive_chat_ids':['room@chatroom']}})
             self.assertEqual(response.status_code,200)
-            self.assertFalse(config.settings.autonomy_enabled)
+            self.assertTrue(config.settings.autonomy_enabled)
             self.assertTrue(config.settings.proactive_enabled)
             self.assertEqual(config.settings.proactive_chat_ids,['room@chatroom'])
             self.assertEqual(config.settings.participation,'quiet')

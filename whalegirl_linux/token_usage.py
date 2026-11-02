@@ -68,7 +68,7 @@ class TokenLedger:
         where='account=? AND created>=?';args=(account,since)
         columns=','.join('sum('+k+') AS '+k+',count('+k+') AS '+k+'_reports' for k in FIELDS)
         aggregates=("count(*) AS requests,sum(status='success') AS successful,sum(status!='success') AS failed,"
-            "sum(operation NOT IN ('search','fetch')) AS model_requests,sum(operation IN ('search','fetch')) AS search_requests,"
+            "sum(operation NOT IN ('search','fetch','growth_search','growth_fetch')) AS model_requests,sum(operation IN ('search','fetch','growth_search','growth_fetch')) AS search_requests,"
             "avg(elapsed_ms) AS average_ms,sum(CASE WHEN cached_tokens IS NOT NULL THEN input_tokens ELSE 0 END) AS cache_input,"+columns)
         with self.store.lock:
             started=self.store.db.execute("SELECT value FROM model_token_meta WHERE key='started_at'").fetchone()[0]

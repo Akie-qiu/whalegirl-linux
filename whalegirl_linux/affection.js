@@ -10,9 +10,11 @@
   const enabledStatus=el('p','hint');enabledStatus.id='affection-enabled-status';enabledStatus.setAttribute('aria-live','polite');
   const privateStyle=el('select');for(const [v,t] of [['close','熟悉后可更亲近，跟随对方语气'],['warm','始终保持温暖朋友语气']]){const o=el('option','',t);o.value=v;privateStyle.append(o);}
   const privateLabel=el('label','','私聊表达');privateLabel.append(privateStyle);
+  const ownerIdsInput=el('input');ownerIdsInput.type='text';ownerIdsInput.id='affection-owner-ids';ownerIdsInput.maxLength=400;ownerIdsInput.placeholder='例如：wxid_xxx（多个用逗号分隔）';
+  const ownerIdsLabel=el('label','','主人专属微信 ID（仅私聊放开亲昵与敏感边界）');ownerIdsLabel.append(ownerIdsInput);
   const settingsBox=el('details','settings-drawer');settingsBox.append(el('summary','','⚙️ 好感度计分规则与私聊语气设置'));
   const settingsGrid=el('div','two-fields');settingsGrid.style.marginTop='10px';
-  settingsGrid.append(privateLabel);
+  settingsGrid.append(privateLabel,ownerIdsLabel);
   const inputs={};for(const [name,title,min,max] of [
     ['affection_initial_score','未建立记录的新人物初始好感度',0,100],
     ['affection_daily_gain','每人每天最多增加',0,20],['affection_daily_loss','每人每天最多降低',0,20],
@@ -20,7 +22,8 @@
     const label=el('label','',title),input=el('input');input.type='number';input.min=min;input.max=max;input.step=1;inputs[name]=input;label.append(input);settingsGrid.append(label);
   }
   const saveRuleBtn=button('保存好感度规则',async()=>{
-    const values={affection_private_style:privateStyle.value};
+    const ownerIds=ownerIdsInput.value.split(/[,，\s]+/).map(s=>s.trim()).filter(Boolean).slice(0,20);
+    const values={affection_private_style:privateStyle.value,owner_ids:ownerIds};
     for(const [n,input] of Object.entries(inputs))values[n]=Number(input.value);
     await saveSubset(values);await load();notice('好感度规则已保存');
   });
@@ -47,7 +50,7 @@
     finally{toggling=false;for(const input of controls)input.disabled=false;}
   }
   enabled.onchange=()=>toggle(enabled);
-  function populate(){if(!cfg)return;syncEnabled();privateStyle.value=cfg.affection_private_style;for(const [n,input] of Object.entries(inputs))input.value=cfg[n];}
+  function populate(){if(!cfg)return;syncEnabled();privateStyle.value=cfg.affection_private_style;ownerIdsInput.value=Array.isArray(cfg.owner_ids)?cfg.owner_ids.join(', '):'';for(const [n,input] of Object.entries(inputs))input.value=cfg[n];}
   async function history(person,box){
     const r=await api('affection/revisions?subject='+encodeURIComponent(person.subject));box.replaceChildren();
     if(!r.revisions.length)box.append(el('p','hint','还没有变化记录'));

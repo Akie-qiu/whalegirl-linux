@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 import uuid
+from contextlib import asynccontextmanager
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -71,26 +72,38 @@ class AgentGateway:
         self._status_at = 0.0
         self._members_cache = {}
 
-    async def ui_job(self,operation,chat,**values):
+    async def ui_job(self,operation,chat,_job_id=None,**values):
         if not self.ui_jobs_directory:return {}
         from .settings import private_write
-        nonce=uuid.uuid4().hex;path=self.ui_jobs_directory/(nonce+'.json')
+        nonce=_job_id or uuid.uuid4().hex
+        if not re.fullmatch('[0-9a-f]{32}',nonce):raise ValueError('Invalid UI job identity')
+        path=self.ui_jobs_directory/(nonce+'.json')
         private_write(path,json.dumps({'operation':operation,'chat':chat,'created':time.time(),**values},ensure_ascii=False))
         response=await self.client.post(f"/api/chats/{quote(chat+'::whalejob::'+nonce,safe='')}/open",params={'clearUnreads':'false'},timeout=35)
         response.raise_for_status();value=response.json()
         result = json.loads(path.read_text())
         if value.get('ok') is not True:
             completed=(operation=='reset_ui' and result.get('state')=='recovered' and result.get('main_ready') is True
-                       or operation=='open_chat' and result.get('state')=='done')
+                       or operation=='open_chat' and result.get('state')=='done'
+                       or operation=='send_session' and result.get('state')=='done' and result.get('session_complete') is True)
             if (value.get('error')=='No action selected' and completed and result.get('operation')==operation
                     and result.get('chat')==chat and not result.get('error')):
-                # The native task can finish before the upstream planner runs
-                # out of actions. Only navigation/recovery may use this receipt.
+                # Native completion can precede the planner. Session completion
+                # is transport-only; every message still needs its DB receipt.
                 result['transport_warning']='planner_exhausted_after_native_completion'
             else:
                 raise UIJobError(str(result.get('error') or value.get('error') or 'Native UI job failed')[:200],result.get('state',''))
         result['job_id'] = nonce
         return result
+
+    @asynccontextmanager
+    async def send_turn(self,chat,allowed):
+        from .fast_send import CURRENT,FastSendSession
+        session=FastSendSession(self,chat,allowed);token=CURRENT.set(session)
+        try:yield session
+        finally:
+            try:await session.close()
+            finally:CURRENT.reset(token)
 
     def warm_send_status(self):
         # One account observation overlaps model generation. Polling and the
@@ -214,14 +227,14 @@ class AgentGateway:
         response.raise_for_status()
         return response.json()
 
-    async def media(self, chat, local_id, quality="thumbnail", kind=3,server_id=''):
+    async def media(self, chat, local_id, quality="thumbnail", kind=3,server_id='',*,navigate=True):
         if kind==3 and self.ui_jobs_directory:
             async with self.ui_lock:
                 moved=False
                 try:
                     result=await self.ui_job('read_image',chat,local_id=int(local_id),server_id=str(server_id))
                     for attempt in range(4):
-                        if result.get('data') or result.get('quality') not in ('not_visible','partly_visible'):break
+                        if not navigate or result.get('data') or result.get('quality') not in ('not_visible','partly_visible'):break
                         moved=True
                         await self.ui_job('open_chat',chat,scroll='latest' if attempt==0 else 'up')
                         result=await self.ui_job('read_image',chat,local_id=int(local_id),server_id=str(server_id))

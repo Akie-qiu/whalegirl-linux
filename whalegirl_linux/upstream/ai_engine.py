@@ -1,6 +1,7 @@
 """AI 引擎：Chat Completions、Responses 和 Anthropic 兼容格式。"""
 
 import asyncio
+import hashlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -15,6 +16,18 @@ from ..time_context import CLOCK_RULE, clock_messages, user_context_block
 
 class IncompleteModelResponse(ValueError):
     """A paid response began but cannot be safely used as an action plan."""
+
+
+class OutputTokenLimit(IncompleteModelResponse):
+    """A terminal token limit, safe to recompute before any action executes."""
+
+
+class EmptyModelResponse(ValueError):
+    """No usable text or callable function was returned; no action was run."""
+
+
+class InvalidAPIResponse(ValueError):
+    """The endpoint returned a page or an incompatible HTTP response."""
 
 
 @dataclass
@@ -72,6 +85,7 @@ class AIEngine:
         self._clients: dict[int, httpx.AsyncClient] = {}
         self._available = True
         self.last_error = ""
+        self.last_response_meta = {}
         self.last_first_token_ms: int | None = None
 
     @staticmethod
@@ -210,6 +224,21 @@ class AIEngine:
         return result
 
     @staticmethod
+    def _json_response(response):
+        try:
+            data=response.json()
+        except ValueError as exc:
+            if not response.content.strip():
+                raise EmptyModelResponse('模型接口返回空响应，请稍后重试') from exc
+            kind=response.headers.get('content-type','').lower()
+            if 'text/html' in kind or response.text.lstrip().startswith('<'):
+                raise InvalidAPIResponse('模型接口返回了网页，不是模型数据；请检查 API 地址，Chat Completions 通常使用 /v1/chat/completions') from exc
+            raise InvalidAPIResponse('模型接口未返回有效 JSON 数据，请检查接口协议和地址') from exc
+        if not isinstance(data,dict):
+            raise InvalidAPIResponse('模型接口的 JSON 结构不兼容，请检查接口协议和地址')
+        return data
+
+    @staticmethod
     def _responses_text(data: dict) -> str:
         # output_text is an SDK helper; HTTP responses contain typed output items.
         parts = []
@@ -223,6 +252,70 @@ class AIEngine:
                     parts.append(block.get("refusal", ""))
         return "\n".join(parts).strip()
 
+    @staticmethod
+    def _message_text(value) -> str:
+        if isinstance(value,str):
+            return value.strip()
+        if isinstance(value,list):
+            return '\n'.join(block['text'] for block in value
+                if isinstance(block,dict) and block.get('type') in ('text','output_text')
+                and isinstance(block.get('text'),str)).strip()
+        return ''
+
+    def _request_fingerprint(self, payload):
+        """Describe cacheable request shapes without retaining prompts or keys."""
+        if self.api_style == 'responses':
+            system = payload.get('instructions') or ''
+        elif self.api_style == 'anthropic':
+            system = payload.get('system') or ''
+        else:
+            system = '\n'.join(message.get('content') or '' for message in payload.get('messages', ())
+                               if message.get('role') == 'system')
+        tools = json.dumps(payload.get('tools') or [],ensure_ascii=False,sort_keys=True,separators=(',',':'))
+        return {'system_sha256':hashlib.sha256(system.encode('utf-8')).hexdigest(),
+                'tools_sha256':hashlib.sha256(tools.encode('utf-8')).hexdigest(),
+                'system_chars':len(system),'api_style':self.api_style}
+
+    def _response_meta(self, choice, message, attempt, request_fingerprint=None):
+        # Store shapes only. Never log private content, tool arguments or thinking.
+        self.last_response_meta={
+            'finish_reason':str(choice.get('finish_reason') or '')[:60],
+            'content_chars':len(self._message_text(message.get('content'))),
+            'tool_names':[str((c.get('function') or {}).get('name') or '')[:80]
+                          for c in message.get('tool_calls') or [] if isinstance(c,dict)
+                          and isinstance(c.get('function'),dict)],
+            'has_reasoning':bool(message.get('reasoning_content')),
+            'attempts':attempt+1,
+        }
+        if request_fingerprint is not None:
+            self.last_response_meta['request_fingerprint']=request_fingerprint
+        return self.last_response_meta
+
+    def _output_budget(self, requested, *, stream=False):
+        """Reserve reasoning space without changing configured reply style/effort.
+
+        DeepSeek thinking shares max_tokens between reasoning and text. Unknown
+        providers stay unchanged unless an effort was selected. Streaming keeps
+        its existing budget and completion handling.
+        """
+        requested = int(requested or self.max_tokens)
+        model = self.model.lower()
+        thinking = (self.reasoning_effort != 'default' or 'reasoner' in model
+                    or model.startswith(('deepseek-v4', 'deepseek-flash')))
+        if stream or not thinking or self.api_style not in ('openai', 'responses'):
+            return requested
+        return requested + (1024 if self.reasoning_effort == 'low' else 2048)
+
+    @staticmethod
+    def _expand_output_budget(payload):
+        field = 'max_output_tokens' if 'max_output_tokens' in payload else 'max_tokens'
+        current = payload[field]
+        increased = min(16384, max(current * 2, current + 1024))
+        if increased <= current:
+            return False
+        payload[field] = increased
+        return True
+
     def _build_payload(
         self,
         messages: list[dict],
@@ -234,7 +327,7 @@ class AIEngine:
     ) -> dict:
         payload = {
             "model": self.model,
-            "max_tokens": int(max_tokens or self.max_tokens),
+            "max_tokens": self._output_budget(max_tokens, stream=stream),
             "temperature": temperature if temperature is not None else self.temperature,
         }
         # Chat replies use Flash's direct-answer mode rather than its default reasoning pass.
@@ -392,6 +485,7 @@ class AIEngine:
 
         self.last_error = ""
         self.last_first_token_ms = None
+        self.last_response_meta = {}
 
         payload = self._build_payload(
             messages,
@@ -401,13 +495,17 @@ class AIEngine:
             max_tokens=max_tokens,
             response_format=response_format,
         )
+        request_fingerprint=self._request_fingerprint(payload)
 
         # 重试循环
         last_error = None
-        attempts = max(1, self.max_retries)
+        attempts = max(1, min(2,self.max_retries))
+        recovery = ''
         for attempt in range(attempts):
             started,created=time.monotonic(),time.time()
             raw_usage={};outcome='error'
+            attempt_budget = payload.get('max_output_tokens', payload.get('max_tokens'))
+            response_meta={'request_fingerprint':request_fingerprint,'attempts':attempt+1}
             try:
                 client = await self._get_client()
                 logger.debug(f"AI 请求: url={self.api_url}, model={self.model}, attempt={attempt + 1}")
@@ -420,34 +518,61 @@ class AIEngine:
                 response = await client.post(self.api_url, json=payload)
                 response.raise_for_status()
 
-                data = response.json()
+                data = self._json_response(response)
                 raw_usage=data.get('usage')
                 if self.api_style == "responses":
                     if data.get("status") in {"failed", "cancelled", "incomplete", "queued", "in_progress"}:
-                        self.last_error = "Responses 未完成：" + data["status"]
                         if (data.get("incomplete_details") or {}).get("reason") == "max_output_tokens":
-                            self.last_error += "（达到回复 Token 上限，请调高后重试）"
+                            raise OutputTokenLimit('Responses 未完成：length（达到输出 Token 上限）')
+                        self.last_error = "Responses 未完成：" + data["status"]
                         return ""
                     content = self._responses_text(data)
                     if not content:
                         self.last_error = "Responses 未返回文本，请检查模型能力或回复 Token 上限"
                         return ""
                 elif self.api_style == "anthropic":
+                    if data.get('stop_reason') == 'max_tokens':
+                        raise OutputTokenLimit('模型回复未完成：length（达到输出 Token 上限）')
+                    if data.get('stop_reason') == 'model_context_window_exceeded':
+                        raise IncompleteModelResponse('模型上下文超过容量，未执行未完成的回复')
                     content = "\n".join(
                         block.get("text", "")
                         for block in data.get("content", [])
                         if block.get("type") == "text"
                     ).strip()
                 else:
-                    content = data["choices"][0]["message"]["content"].strip()
+                    choice=(data.get('choices') or [{}])[0]
+                    message=choice.get('message') or {}
+                    response_meta=self._response_meta(choice,message,attempt,request_fingerprint)
+                    if choice.get('finish_reason') == 'length':
+                        raise OutputTokenLimit('模型回复未完成：length（达到输出 Token 上限）')
+                    if choice.get('finish_reason') == 'content_filter':
+                        raise IncompleteModelResponse('模型回复未完成：'+choice['finish_reason'])
+                    content=self._message_text(message.get('content'))
+                if not content:
+                    raise EmptyModelResponse('模型返回空内容（未提供可用文本）')
                 outcome='success'
+                self.last_error=''
                 logger.debug(f"AI 回复成功 (attempt {attempt + 1})")
                 return content
 
+            except InvalidAPIResponse as exc:
+                self.last_error=str(exc)
+                logger.warning(self.last_error)
+                return ""
+            except OutputTokenLimit as exc:
+                self.last_error = last_error = str(exc)
+                recovery = 'length'
+                if attempt + 1 < attempts and self._expand_output_budget(payload):
+                    continue  # Discard partial output; no external action has run.
+                return ""
             except IncompleteModelResponse as exc:
                 self.last_error = str(exc)
                 logger.warning(self.last_error)
                 return ""
+            except EmptyModelResponse as exc:
+                last_error=str(exc)
+                logger.warning(last_error+f' (attempt {attempt+1}/{attempts})')
             except httpx.TimeoutException:
                 last_error = f"请求超时 ({self.timeout}s)"
                 logger.warning(f"AI 请求超时 (attempt {attempt + 1}/{attempts})")
@@ -456,14 +581,18 @@ class AIEngine:
                 if e.response.status_code == 404:
                     last_error += "（模型或接口不可用，请核对模型名称和接口地址）"
                 self.last_error = last_error
-                logger.warning(f"AI 请求失败: {last_error} (attempt {attempt + 1}/{self.max_retries})")
+                logger.warning(f"AI 请求失败: {last_error} (attempt {attempt + 1}/{attempts})")
                 if 400 <= e.response.status_code < 500 and e.response.status_code not in (408, 409, 429):
                     logger.error("模型接口拒绝请求，请检查协议、模型、参数或凭据")
                     return ""
             except Exception as e:
                 last_error = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
-                logger.warning(f"AI 请求异常: {last_error} (attempt {attempt + 1}/{self.max_retries})")
+                logger.warning(f"AI 请求异常: {last_error} (attempt {attempt + 1}/{attempts})")
             finally:
+                response_meta['output_budget'] = attempt_budget
+                if recovery:
+                    response_meta['recovered_from'] = recovery
+                self.last_response_meta=response_meta
                 self.record_usage(raw_usage,started=started,created=created,status=outcome,operation=operation)
 
             # 指数退避
@@ -496,6 +625,7 @@ class AIEngine:
 
         self.last_error = ""
         self.last_first_token_ms = None
+        self.last_response_meta = {}
         payload = self._build_payload(
             messages,
             system_prompt,
@@ -504,60 +634,91 @@ class AIEngine:
             max_tokens=max_tokens,
             response_format=response_format,
         )
-        payload["tools"] = tools
-        payload["tool_choice"] = tool_choice
-        started, created = time.monotonic(), time.time()
-        raw_usage = {}
-        outcome = "error"
-        try:
-            client = await self._get_client()
-            response = await client.post(self.api_url, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            raw_usage = data.get("usage") or {}
-            choice = (data.get("choices") or [{}])[0]
-            if choice.get("finish_reason") in {"length", "content_filter"}:
-                raise IncompleteModelResponse("模型工具调用未完成：" + choice["finish_reason"])
-            message = choice.get("message") or {}
-            assistant_message = {
-                key: message[key] for key in ("role", "content", "tool_calls", "refusal", "reasoning_content")
-                if key in message
-            }
-            content = message.get("content")
-            if not isinstance(content, str):
-                content = ""
-            tool_calls = message.get("tool_calls")
-            if not isinstance(tool_calls, list):
-                tool_calls = []
-            if any(not isinstance(call, dict) or not call.get("id")
-                   or not isinstance(call.get("function"), dict)
-                   or not isinstance(call["function"].get("arguments"), str)
-                   for call in tool_calls):
-                raise IncompleteModelResponse("模型工具调用格式不完整，未执行动作")
-            assistant_message.setdefault("role", "assistant")
-            outcome = "success"
-            if self.last_first_token_ms is None:
-                self.last_first_token_ms = round((time.monotonic() - started) * 1000)
-            return {
-                "content": content.strip(),
-                "tool_calls": tool_calls,
-                "assistant_message": assistant_message,
-            }
-        except IncompleteModelResponse as exc:
-            self.last_error = str(exc)
-        except httpx.TimeoutException:
-            self.last_error = f"请求超时 ({self.timeout}s)"
-        except httpx.HTTPStatusError as exc:
-            self.last_error = f"HTTP {exc.response.status_code}"
-            if exc.response.status_code == 404:
-                self.last_error += "（模型或接口不可用，请核对模型名称和接口地址）"
-            logger.warning("模型工具调用请求失败: " + self.last_error)
-        except (httpx.HTTPError, ValueError, KeyError, IndexError) as exc:
-            self.last_error = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
-            logger.warning("模型工具调用请求异常: " + self.last_error)
-        finally:
-            self.record_usage(raw_usage, started=started, created=created,
-                              status=outcome, operation=operation)
+        if tools:
+            payload['tools']=tools
+            payload['tool_choice']=tool_choice
+        request_fingerprint=self._request_fingerprint(payload)
+        allowed={t.get('function',{}).get('name') for t in tools}
+        attempts=max(1,min(2,self.max_retries))
+        recovery=''
+        for attempt in range(attempts):
+            started,created=time.monotonic(),time.time()
+            raw_usage={};outcome='error'
+            attempt_budget = payload['max_tokens']
+            response_meta={'request_fingerprint':request_fingerprint,'attempts':attempt+1}
+            try:
+                client=await self._get_client()
+                response=await client.post(self.api_url,json=payload)
+                response.raise_for_status()
+                data=self._json_response(response);raw_usage=data.get('usage') or {}
+                choice=(data.get('choices') or [{}])[0]
+                message=choice.get('message') or {}
+                response_meta=self._response_meta(choice,message,attempt,request_fingerprint)
+                if recovery:response_meta['recovered_from']=recovery
+                if choice.get('finish_reason') == 'length':
+                    raise OutputTokenLimit('模型工具调用未完成：length（达到输出 Token 上限）')
+                if choice.get('finish_reason') == 'content_filter':
+                    raise IncompleteModelResponse('模型工具调用未完成：'+choice['finish_reason'])
+                tool_calls=message.get('tool_calls') or []
+                if not isinstance(tool_calls,list) or any(
+                    not isinstance(call,dict) or not call.get('id')
+                    or not isinstance(call.get('function'),dict)
+                    or not isinstance(call['function'].get('arguments'),str)
+                    for call in tool_calls):
+                    raise IncompleteModelResponse('模型工具调用格式不完整，未执行动作')
+                for call in tool_calls:
+                    try:
+                        arguments = json.loads(call['function']['arguments'])
+                    except (ValueError, TypeError):
+                        raise IncompleteModelResponse('模型工具参数不是完整JSON，未执行动作') from None
+                    if not isinstance(arguments, dict):
+                        raise IncompleteModelResponse('模型工具参数必须是JSON对象，未执行动作')
+                if any(call['function'].get('name') not in allowed for call in tool_calls):
+                    raise EmptyModelResponse('模型调用了本轮未提供的工具，未执行动作')
+                if payload.get('tool_choice','none')=='none' and tool_calls:
+                    raise EmptyModelResponse('模型重复请求已结束的工具，未执行动作')
+                content=self._message_text(message.get('content'))
+                if not content and not tool_calls:
+                    raise EmptyModelResponse('模型返回空内容（没有文本或工具调用）')
+                assistant_message={key:message[key] for key in
+                    ('role','content','tool_calls','refusal','reasoning_content') if key in message}
+                assistant_message.setdefault('role','assistant')
+                outcome='success';self.last_error=''
+                self.last_first_token_ms=round((time.monotonic()-started)*1000)
+                return {'content':content,'tool_calls':tool_calls,'assistant_message':assistant_message}
+            except InvalidAPIResponse as exc:
+                self.last_error=str(exc)
+                break
+            except OutputTokenLimit as exc:
+                self.last_error = str(exc)
+                recovery = 'length'
+                if attempt + 1 < attempts and self._expand_output_budget(payload):
+                    continue
+                break
+            except IncompleteModelResponse as exc:
+                self.last_error=str(exc)
+                break
+            except EmptyModelResponse as exc:
+                self.last_error=recovery=str(exc)
+                # A fresh final decision only. The system prefix, real history
+                # and attachments are unchanged, and no external tool was run.
+                if tools:payload={**payload,'tool_choice':'none'}
+            except httpx.TimeoutException:
+                self.last_error=f'请求超时 ({self.timeout}s)'
+            except httpx.HTTPStatusError as exc:
+                code=exc.response.status_code;self.last_error=f'HTTP {code}'
+                if code==404:self.last_error+='（模型或接口不可用，请核对模型名称和接口地址）'
+                if 400<=code<500 and code not in (408,409,429):break
+            except (httpx.HTTPError,ValueError,KeyError,IndexError) as exc:
+                self.last_error=type(exc).__name__
+            finally:
+                response_meta['output_budget'] = attempt_budget
+                if recovery:
+                    response_meta['recovered_from'] = recovery
+                self.last_response_meta=response_meta
+                self.record_usage(raw_usage,started=started,created=created,status=outcome,operation=operation)
+            logger.warning('模型工具调用未完成：'+self.last_error+f' (attempt {attempt+1}/{attempts})')
+            if attempt+1<attempts:await asyncio.sleep(.2)
         return {"content": "", "tool_calls": [], "assistant_message": {}}
 
     def record_usage(self,raw_usage=None, *, started,created,status='success',operation='chat'):
@@ -595,6 +756,7 @@ class AIEngine:
             max_tokens=max_tokens,
             response_format=response_format,
         )
+        request_fingerprint=self._request_fingerprint(payload)
 
         started,created=time.monotonic(),time.time();raw_usage={};outcome='error'
         try:
@@ -606,6 +768,7 @@ class AIEngine:
             self.last_error = str(e) if isinstance(e, IncompleteModelResponse) else "流式请求失败：" + type(e).__name__
             logger.error(self.last_error)
         finally:
+            self.last_response_meta={'request_fingerprint':request_fingerprint,'attempts':1}
             self.record_usage(raw_usage,started=started,created=created,status=outcome,operation=operation)
 
     async def test_connection(self) -> tuple[bool, str]:

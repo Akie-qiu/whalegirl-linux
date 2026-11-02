@@ -21,6 +21,7 @@ from .image_references import ReferenceLibrary, character_request, reference_req
 from .image_tools import ImageTools, generation_words, library_words, CHARACTER
 from .image_retention import ImageRetention, SOURCES
 from .resources import native_pressure
+from .image_canvas import canvas, reference_required
 
 TZ = timezone(timedelta(hours=8))
 ACTIVE = ('queued', 'generating', 'ready', 'sending')
@@ -38,14 +39,14 @@ def explicit_image_request(text):
     return None
 
 
-def normalize_image(raw):
-    if len(raw) > 24_000_000:
-        raise ValueError('图片文件超过24MB')
+def normalize_image(raw, *, max_edge=2048, max_bytes=24_000_000):
+    if len(raw) > max_bytes:
+        raise ValueError('图片文件超过' + str(max_bytes // 1_000_000) + 'MB')
     with Image.open(io.BytesIO(raw)) as source:
         if source.format not in ('PNG', 'JPEG', 'WEBP') or source.width * source.height > 25_000_000:
             raise ValueError('仅支持2500万像素以内的 PNG / JPG / WebP')
         image = ImageOps.exif_transpose(source).convert('RGB')
-        image.thumbnail((2048, 2048))
+        image.thumbnail((max_edge, max_edge))
         out = io.BytesIO()
         image.save(out, format='PNG')
         return out.getvalue(), image.width, image.height
@@ -89,6 +90,8 @@ class ImageService:
                 self.store.db.execute("ALTER TABLE picture_jobs ADD COLUMN notice_state TEXT NOT NULL DEFAULT ''")
             if 'reference_json' not in {r[1] for r in self.store.db.execute('PRAGMA table_info(picture_jobs)')}:
                 self.store.db.execute("ALTER TABLE picture_jobs ADD COLUMN reference_json TEXT NOT NULL DEFAULT '{}'")
+            if 'diagnostics_json' not in {r[1] for r in self.store.db.execute('PRAGMA table_info(picture_jobs)')}:
+                self.store.db.execute("ALTER TABLE picture_jobs ADD COLUMN diagnostics_json TEXT NOT NULL DEFAULT '{}'")
             # Never repeat a paid request or send interrupted at a non-idempotent boundary.
             self.store.db.execute("UPDATE picture_jobs SET state='uncertain',error='服务重启时请求尚未确认，不自动重新生成或发送' WHERE state IN ('generating','sending')")
             self.store.db.execute("UPDATE picture_assets SET state='pending' WHERE state='tagging'")
@@ -100,7 +103,7 @@ class ImageService:
         self.tools = ImageTools(self)
 
     def change(self, identity, **fields):
-        allowed = {'state', 'asset_id', 'error', 'receipt', 'model', 'usage_json', 'api_started', 'moment_id', 'notice_state'}
+        allowed = {'state', 'asset_id', 'error', 'receipt', 'model', 'usage_json', 'api_started', 'moment_id', 'notice_state', 'diagnostics_json'}
         if not fields or set(fields) - allowed:
             raise ValueError('Invalid picture job patch')
         with self.store.lock:
@@ -112,6 +115,27 @@ class ImageService:
         row = self.store.db.execute('SELECT * FROM picture_jobs WHERE id=? AND account=?',
                                     (identity, self.config.settings.account_id)).fetchone()
         return dict(row) if row else None
+
+    def diagnose(self, identity, **values):
+        """Stage/status only: never store provider bodies, signed URLs or keys."""
+        allowed = {'phase', 'http_status', 'download_attempts', 'error_type', 'original_error', 'admin_review'}
+        if set(values) - allowed:
+            raise ValueError('Invalid image diagnostic')
+        with self.store.lock:
+            job = self.get(identity)
+            if job:
+                data = json.loads(job['diagnostics_json'] or '{}')
+                data.update(values)
+                self.change(identity, diagnostics_json=json.dumps(data, ensure_ascii=False))
+
+    def review(self, identity, received):
+        job = self.get(identity)
+        if not job or job['state'] != 'uncertain':
+            raise ValueError('仅待核实任务可以人工确认')
+        self.diagnose(identity, original_error=job['error'], admin_review='received' if received else 'not_received')
+        # Review settles the task; do not send a delayed automated failure alert.
+        self.change(identity, state='sent' if received else 'failed', notice_state='reviewed',
+                    error='管理员核对；不会自动重新生成或发送')
 
     def assets(self, source=None, *, limit=500):
         sql = 'SELECT * FROM picture_assets WHERE account=? AND deleted_at=0'
@@ -167,7 +191,7 @@ class ImageService:
                    character_id='', character_variant=''):
         if source not in SOURCES:
             raise ValueError('无效图库来源')
-        data, width, height = normalize_image(raw)
+        data, width, height = normalize_image(raw, max_edge=4096, max_bytes=64_000_000) if source == 'generated' else normalize_image(raw)
         account = account or self.config.settings.account_id
         # Identical bytes with different provenance must not widen an existing scope.
         identity = hashlib.sha256(account.encode()+source.encode()+scope.encode()+scope_chat.encode()+data).hexdigest()
@@ -293,6 +317,11 @@ class ImageService:
     def search_terms(query):
         q = str(query or '').lower()
         q = re.sub(r'@[^\s\u2005]+[\s\u2005]*', ' ', q)
+        # Remove source/routing phrases before particles: stripping “吧” first
+        # turns 贴吧 into a spurious content requirement “贴”, hiding real images.
+        q = re.sub(r'绝区零内鬼吧|内鬼吧|贴吧(?:里面|里|内)?(?:的)?(?:素材|梗图|图片|照片|图)?|'
+                   r'吧里(?:的)?|(?:上传|生成)(?:的)?(?:图片)?图库(?:里)?|上传图片库|'
+                   r'素材库|素材图片|素材图|素材', ' ', q)
         for src, dst in (('碗粥', '挽昼'), ('瑞粥', '挽昼'), ('晚粥', '挽昼'), ('挽粥', '挽昼')):
             if src in q:
                 q = q.replace(src, dst)
@@ -337,15 +366,17 @@ class ImageService:
             (self.config.settings.account_id,since,int(pending))).fetchone()[0]
 
     def enqueue(self, *, kind, prompt='', asset_id='', chat='', source_key='', destination='library', moment_id='',
-                reference_ids=None, character=False, character_variant='', mode='auto', chat_reference_plan=None, admin_authorized=False):
+                   reference_ids=None, character=False, character_variant='', mode='auto', chat_reference_plan=None, admin_authorized=False,
+                   aspect_ratio='auto', cast_ids=None):
         with self.store.lock:
             return self._enqueue(kind=kind, prompt=prompt, asset_id=asset_id, chat=chat, source_key=source_key,
                 destination=destination, moment_id=moment_id, reference_ids=reference_ids, character=character,
                 character_variant=character_variant, mode=mode, chat_reference_plan=chat_reference_plan,
-                admin_authorized=admin_authorized)
+                admin_authorized=admin_authorized, aspect_ratio=aspect_ratio, cast_ids=cast_ids)
 
     def _enqueue(self, *, kind, prompt='', asset_id='', chat='', source_key='', destination='library', moment_id='',
-                   reference_ids=None, character=False, character_variant='', mode='auto', chat_reference_plan=None, admin_authorized=False):
+                   reference_ids=None, character=False, character_variant='', mode='auto', chat_reference_plan=None, admin_authorized=False,
+                   aspect_ratio='auto', cast_ids=None):
         s = self.config.settings
         if source_key:
             prior = self.store.db.execute('SELECT id FROM picture_jobs WHERE source_key=? AND account=?', (source_key,s.account_id)).fetchone()
@@ -366,6 +397,14 @@ class ImageService:
         if asset_id:
             self.stage(asset_id, chat=chat if destination == 'chat' else '', admin=admin_authorized or destination == 'library')
         plan = {}
+        story = None
+        if kind == 'generate' and destination == 'moments' and moment_id:
+            row = self.store.db.execute('SELECT payload FROM moments_actions WHERE id=? AND account=? AND kind=\'publish\'',
+                                        (moment_id, s.account_id)).fetchone()
+            payload = json.loads(row['payload']) if row else {}
+            story = payload.get('world_episode')
+            if aspect_ratio == 'auto':
+                aspect_ratio = payload.get('image_aspect_ratio') or 'auto'
         if kind == 'generate':
             # Only an explicit tool subject, an administrator's explicit character
             # request, or a Moments generation with configured character references
@@ -376,10 +415,10 @@ class ImageService:
             if destination == 'moments':
                 if not s.image_references_enabled or not self.references.selected(variant):
                     raise ValueError('朋友圈配图需要已开启的角色参考图，请先配置当前外观版本')
-                character = True
+                character = not story or 'whalegirl' in story.get('cast_ids', [])
             else:
                 character = character or bool(admin_authorized and character_request(prompt))
-            if character or reference_ids or chat_reference_plan and chat_reference_plan.get('sources'):
+            if character or story or reference_ids or chat_reference_plan and chat_reference_plan.get('sources'):
                 if not s.image_references_enabled:
                     raise ValueError('参考图功能已关闭，请在后台开启')
                 inputs = self.references.catalog_items(reference_ids or [])
@@ -388,7 +427,7 @@ class ImageService:
                     if not chosen:
                         raise ValueError('这套角色参考图尚未配置，请先在后台上传')
                     inputs += [{**v, 'source': 'character'} for v in chosen]
-                    if destination=='moments':
+                    if destination=='moments' and not story:
                         previous=self.store.db.execute("""SELECT * FROM picture_assets
                             WHERE account=? AND source='generated' AND character_id='whalegirl'
                             AND character_variant=? AND scope='global' AND enabled=1 AND deleted_at=0
@@ -398,15 +437,28 @@ class ImageService:
                             inputs.append({'id':previous['id'],'asset_id':previous['id'],
                                 'source':'character_generated','name':'此前生成的本人角色图',
                                 'role':'延续同一角色的脸型、发型与画风；服装、动作、场景和构图依本次要求变化，不照搬旧画面'})
+                if story:
+                    world = getattr(getattr(self.runtime, 'moments', None), 'world', None)
+                    if not world:
+                        raise ValueError('生活漫画的角色参考尚未就绪')
+                    inputs += world.references(story['cast_ids'], self.references)
                 if len(inputs) + len((chat_reference_plan or {}).get('sources', [])) > 8:
                     raise ValueError('一次最多使用8张参考图')
                 persona = s.system_prompt_override
                 if character and not persona and hasattr(self.runtime,'styles'):
                     persona = self.runtime.styles.get_active().system_prompt
                 plan = {**(chat_reference_plan or {}), 'inputs': inputs, 'character': bool(character),
+                        'destination': destination,
                         'variant': variant, 'mode': mode if mode != 'auto' else reference_mode(prompt, s.image_reference_mode),
                         'appearance': self.references.appearance(variant) if character else '',
                         'persona': persona if character else ''}
+                if story:
+                    plan['world_episode'] = story
+                    plan['world_canon'] = world.image_context(story['cast_ids'])
+            if cast_ids:
+                plan = self.bind_cast({**plan, 'destination': destination,
+                    'mode': plan.get('mode', reference_mode(prompt, s.image_reference_mode))}, cast_ids, variant)
+            plan['canvas'] = canvas(s.image_size, aspect_ratio)
         identity = uuid.uuid4().hex
         with self.store.lock:
             self.store.db.execute('''INSERT OR IGNORE INTO picture_jobs
@@ -418,6 +470,39 @@ class ImageService:
             self.store.db.commit()
         row = self.store.db.execute('SELECT id FROM picture_jobs WHERE source_key=?',(source_key or identity,)).fetchone()
         return row[0]
+
+    def bind_cast(self, plan, cast_ids, variant=None):
+        """Bind declared characters to the same pixels in chats and Moments."""
+        from .moments_world import CAST_IDS
+        if (not isinstance(cast_ids, list) or not cast_ids or len(cast_ids) > 4 or
+                any(not isinstance(c, str) or c not in CAST_IDS for c in cast_ids)):
+            raise ValueError('invalid_cast')
+        actors = list(dict.fromkeys(cast_ids))
+        s = self.config.settings
+        if not s.image_references_enabled:
+            raise ValueError('参考图功能已关闭，请在后台开启')
+        world = getattr(getattr(self.runtime, 'moments', None), 'world', None)
+        inputs = [v for v in plan.get('inputs', [])
+                  if v.get('source') not in ('character', 'story_character', 'character_generated')]
+        variant = variant or plan.get('variant') or s.image_character_variant
+        character = 'whalegirl' in actors
+        if character:
+            chosen = self.references.selected(variant)
+            if not chosen:
+                raise ValueError('这套角色参考图尚未配置，请先在后台上传')
+            inputs += [{**v, 'source': 'character'} for v in chosen]
+        if any(c != 'whalegirl' for c in actors):
+            if not world:
+                raise ValueError('生活漫画的角色参考尚未就绪')
+            inputs += world.references(actors, self.references)
+        if len(inputs) + len(plan.get('sources', [])) > 8:
+            raise ValueError('一次最多使用8张参考图')
+        persona = s.system_prompt_override
+        if character and not persona and hasattr(self.runtime, 'styles'):
+            persona = self.runtime.styles.get_active().system_prompt
+        return {**plan, 'inputs': inputs, 'cast_ids': actors, 'character': character,
+                'variant': variant, 'appearance': self.references.appearance(variant) if character else '',
+                'persona': persona if character else '', 'world_canon': world.image_context(actors) if world else {}}
 
     async def chat_request(self, first, batch):
         # Compatibility for callers of the former pre-model shortcut. Only the
@@ -502,6 +587,33 @@ class ImageService:
             await engine.close()
         return True
 
+    async def download_result(self, client, url, job_id):
+        """Retry only the already-created image GET, never its paid POST."""
+        parsed = httpx.URL(url)
+        if parsed.scheme != 'https' or not parsed.host:
+            raise GenerationUncertain('生成结果不是有效HTTPS图片地址，请在后台核对')
+        for attempt in range(2):
+            self.diagnose(job_id, phase='download', download_attempts=attempt + 1)
+            try:
+                async with client.stream('GET', str(parsed), follow_redirects=True) as result:
+                    self.diagnose(job_id, http_status=result.status_code)
+                    result.raise_for_status()
+                    chunks, size = [], 0
+                    async for chunk in result.aiter_bytes():
+                        size += len(chunk)
+                        if size > 64_000_000:
+                            raise GenerationUncertain('图片已生成，但结果超过64MB，未重新生成')
+                        chunks.append(chunk)
+                    if not size:
+                        raise GenerationUncertain('图片已生成，但下载结果为空，未重新生成')
+                    return b''.join(chunks)
+            except httpx.HTTPError as exc:
+                status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else 0
+                if attempt == 0 and (not status or status in (408, 429) or status >= 500):
+                    await asyncio.sleep(.2)
+                    continue
+                raise GenerationUncertain('图片已生成，但结果下载失败；未重复生成，请核对供应商结果') from exc
+
     async def generate(self, job):
         s = self.config.settings
         key = self.config.image_api_key()
@@ -514,7 +626,7 @@ class ImageService:
         if not endpoint.endswith('/v1'):
             endpoint += '/v1'
         plan = json.loads(job.get('reference_json') or '{}')
-        if plan and not s.image_references_enabled:
+        if reference_required(plan) and not s.image_references_enabled:
             raise ValueError('参考图功能已关闭，任务未调用生图接口')
         library = ReferenceLibrary(self.config, account=job['account'])
         while True:
@@ -530,7 +642,7 @@ class ImageService:
         references.sort(key=lambda v:v['source']=='character')
         if self.config.settings.account_id != job['account']:
             raise ValueError('账号已变化，未发起生图请求')
-        if not self.config.settings.image_generation_enabled or plan and not self.config.settings.image_references_enabled:
+        if not self.config.settings.image_generation_enabled or reference_required(plan) and not self.config.settings.image_references_enabled:
             raise ValueError('图片功能已关闭，未发起生图请求')
         if self.get(job['id'])['state'] == 'cancelled':
             raise ValueError('任务已取消，未调用生图接口')
@@ -541,11 +653,13 @@ class ImageService:
         if self.generation_count(pending=False) >= self.config.settings.image_per_day:
             raise ValueError('今日生图任务已达上限，未调用图片接口')
         self.change(job['id'],state='generating',api_started=time.time(),model=s.image_model)
+        self.diagnose(job['id'], phase='submit')
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(s.image_timeout,connect=15),trust_env=False) as client:
-                params = {'model':s.image_model,'prompt':prompt,'n':1,'size':s.image_size}
+                params = {'model':s.image_model,'prompt':prompt,'n':1,'size':(plan.get('canvas') or {}).get('size', s.image_size)}
                 options = {'data':{k:str(v) for k,v in params.items()},'files':files} if files else {'json':params}
                 response = await client.post(endpoint,headers={'Authorization':'Bearer '+key},**options)
+                self.diagnose(job['id'], phase='response', http_status=response.status_code)
                 if response.status_code >= 500:
                     raise GenerationUncertain('生图服务异常，可能已接单，不自动再次扣费生成')
                 if response.status_code >= 400:
@@ -560,25 +674,35 @@ class ImageService:
                     raise GenerationUncertain('接口没有直接返回图片；若返回任务ID，需要供应商的查询文档，暂不重复生成')
                 item = items[0]
                 if item.get('b64_json'):
-                    raw = base64.b64decode(item['b64_json'],validate=True)
+                    self.diagnose(job['id'], phase='decode')
+                    encoded = item['b64_json']
+                    if not isinstance(encoded, str):
+                        raise GenerationUncertain('接口图片编码无效，未重新生成，请核对供应商结果')
+                    if encoded.startswith('data:image/') and ';base64,' in encoded:
+                        encoded = encoded.split(';base64,', 1)[1]
+                    encoded = re.sub(r'\s+', '', encoded)
+                    if len(encoded) > 86_000_000:
+                        raise GenerationUncertain('图片已生成，但结果超过64MB，未重新生成')
+                    try:
+                        raw = base64.b64decode(encoded,validate=True)
+                    except ValueError as exc:
+                        raise GenerationUncertain('接口图片编码不完整，未重新生成，请核对供应商结果') from exc
                 elif item.get('url'):
-                    url = httpx.URL(item['url'])
-                    if url.scheme != 'https' or not url.host:
-                        raise GenerationUncertain('生成结果不是有效HTTPS图片地址，请在后台核对')
-                    async with client.stream('GET',str(url),follow_redirects=True) as result:
-                        result.raise_for_status(); chunks=[];size=0
-                        async for chunk in result.aiter_bytes():
-                            size+=len(chunk)
-                            if size>24_000_000:raise ValueError('生成图片超过24MB')
-                            chunks.append(chunk)
-                    raw=b''.join(chunks)
+                    raw = await self.download_result(client, item['url'], job['id'])
                 else:
                     raise GenerationUncertain('生成结果尚未包含图片，不自动重新调用')
-            public = bool(job['destination'] in ('library', 'moments') and plan.get('character') and not plan.get('sources') and
-                          all(v.get('source') == 'character' for v in plan.get('inputs', [])))
-            return await asyncio.to_thread(self.save_asset,raw,'generated',prompt=job['prompt'],model=s.image_model,account=job['account'],
+            public = bool(job['destination'] in ('library', 'moments') and not plan.get('sources') and
+                (plan.get('world_episode') or plan.get('character') and
+                 all(v.get('source') == 'character' for v in plan.get('inputs', []))))
+            self.diagnose(job['id'], phase='save')
+            asset = await asyncio.to_thread(self.save_asset,raw,'generated',prompt=job['prompt'],model=s.image_model,account=job['account'],
                 scope='global' if public else 'chat' if job['chat'] else 'admin', scope_chat='' if public else job['chat'],
-                character_id=CHARACTER if plan.get('character') else '', character_variant=plan.get('variant','') if plan.get('character') else '')
+                character_id=CHARACTER if plan.get('character') and not plan.get('world_episode') and
+                    not any(c != 'whalegirl' for c in plan.get('cast_ids', [])) else '',
+                character_variant=plan.get('variant','') if plan.get('character') and not plan.get('world_episode') and
+                    not any(c != 'whalegirl' for c in plan.get('cast_ids', [])) else '')
+            self.diagnose(job['id'], phase='ready')
+            return asset
         except (httpx.HTTPError, json.JSONDecodeError, UnicodeError) as exc:
             raise GenerationUncertain('请求超时或返回结果中断，可能已经产生费用；请核对供应商记录，不自动重试') from exc
 
@@ -628,10 +752,22 @@ class ImageService:
 
     def task_failed(self, job, exc):
         # Do not expose provider responses, signed URLs, keys or base64 in logs.
-        if self.get(job['id'])['state']=='cancelled':
+        current = self.get(job['id'])
+        if not current or current['state'] in ('cancelled', 'sent'):
             return
-        uncertain = isinstance(exc, GenerationUncertain)
+        actions = self.store.actions('picture:' + job['id'])
+        confirmed = next((a for a in actions if a['state'] == 'sent'), None)
+        if confirmed:
+            self.change(job['id'], state='sent', receipt=confirmed['receipt'], error='')
+            return
+        uncertain = isinstance(exc, GenerationUncertain) or current['state'] == 'sending'
         error = str(exc)[:220] if isinstance(exc,ValueError) else '图片处理失败：'+type(exc).__name__
+        if current['state'] == 'sending':
+            error = '图片发送回执待核实；继续聊天，不自动重发'
+            for action in actions:
+                if action['state'] == 'sending':
+                    self.store.action_finish(action['id'], 'uncertain', error=error)
+        self.diagnose(job['id'], error_type=type(exc).__name__, original_error=error)
         self.change(job['id'],state='uncertain' if uncertain else 'failed',error=error)
         self.moment_failed(job,error if uncertain else '图片处理失败，原文保留')
 
@@ -711,10 +847,14 @@ class ImageService:
             action_id=self.store.action_start('picture:'+job['id'],event,0,action)
         receipt=await self.runtime.gateway.send_image(job['chat'],job['asset_id'])
         state='sent' if receipt.confirmed else 'failed' if receipt.definite_failure else 'uncertain'
-        self.store.action_finish(action_id,state,receipt.message_id,receipt.error)
-        self.runtime.safety.outcome(s.account_id,receipt,s,chat=job['chat'])
-        self.runtime.last_send=time.time()
+        self.store.action_finish(action_id,state,receipt.message_id,receipt.error,details=receipt.details)
+        # The authoritative receipt must survive later accounting exceptions.
         self.change(job['id'],state=state,receipt=receipt.message_id,error=receipt.error)
+        self.runtime.safety.outcome(s.account_id,receipt,s,chat=job['chat'])
+        if state == 'uncertain':
+            self.runtime.safety.record(s.account_id, 'send_receipt_pending',
+                '图片已提交微信，等待后续消息轮询核实；继续聊天，不重复发送', chat=job['chat'], level='info')
+        self.runtime.last_send=time.time()
 
     async def attach_moment(self, job):
         async with self.runtime.moments.lock:
@@ -740,7 +880,9 @@ class ImageService:
         jobs=[dict(r) for r in self.store.db.execute('SELECT * FROM picture_jobs WHERE account=? ORDER BY created DESC LIMIT 50',(self.config.settings.account_id,))]
         for job in jobs:
             job['usage']=json.loads(job.pop('usage_json'))
+            job['diagnostics']=json.loads(job.pop('diagnostics_json') or '{}')
             plan=json.loads(job.pop('reference_json') or '{}')
+            job['canvas'] = plan.get('canvas', {})
             job['references']={'count':len(plan.get('inputs',[]))+len(plan.get('sources',[])),
                                'variant':plan.get('variant','') if plan.get('character') else '',
                                'mode':plan.get('mode','')}
@@ -788,54 +930,93 @@ class ImageService:
             except Exception:
                 await asyncio.sleep(3)
 
+    def next_notice(self):
+        # A submitted image with a pending receipt is not a generation failure.
+        # Existing native message polls settle its durable outbound action.
+        return self.store.db.execute("""SELECT * FROM picture_jobs WHERE account=? AND destination='chat'
+            AND (state='failed' OR (state='uncertain' AND asset_id='')) AND notice_state=''
+            ORDER BY created LIMIT 1""", (self.config.settings.account_id,)).fetchone()
+
+    def notice_current(self, job):
+        """Revalidate after every await; an old snapshot cannot send a false alert."""
+        fresh = self.get(job['id'])
+        s = self.config.settings
+        if (not fresh or fresh['notice_state'] not in ('', 'composing')
+                or fresh['state'] not in ('failed', 'uncertain')
+                or fresh['state'] == 'uncertain' and fresh['asset_id']
+                or any(fresh[k] != job[k] for k in ('state', 'error', 'asset_id'))
+                or time.time() - fresh['created'] > 1800
+                or not s.enabled or not s.images_chat_enabled or fresh['chat'] not in s.allowed_chat_ids
+                or s.images_allowed_chat_ids and fresh['chat'] not in s.images_allowed_chat_ids
+                or self.runtime.paused_reason or self.runtime.safety.held(s.account_id)):
+            return False
+        if any(a['state'] in ('sent', 'sending', 'uncertain') for a in self.store.actions('picture:' + job['id'])):
+            return False
+        # A newer completed request from this same person supersedes an old alert.
+        if fresh['requester_id'] and self.store.db.execute("""SELECT 1 FROM picture_jobs
+                WHERE account=? AND chat=? AND requester_id=? AND created>? AND state='sent' LIMIT 1""",
+                (fresh['account'], fresh['chat'], fresh['requester_id'], fresh['created'])).fetchone():
+            return False
+        try:
+            self.check_proactive_permission(fresh)
+        except ValueError:
+            return False
+        return True
+
+    def skip_notice(self, identity):
+        with self.store.lock, self.store.db:
+            self.store.db.execute("UPDATE picture_jobs SET notice_state='skipped' WHERE id=? AND notice_state IN ('','composing')", (identity,))
+
+    async def notice_once(self):
+        s = self.config.settings
+        row = self.next_notice()
+        if (not row or not s.enabled or self.runtime.processing or self.runtime.paused_reason
+                or self.runtime.safety.held(s.account_id) or time.time() < self.runtime.last_send + s.min_send_interval):
+            return False
+        job = dict(row)
+        if not self.notice_current(job):
+            self.skip_notice(job['id'])
+            return True
+        self.change(job['id'], notice_state='composing')
+        engine = self.new_engine()
+        try:
+            style = s.system_prompt_override or self.runtime.styles.get_active().system_prompt
+            text = await engine.chat([{'role':'user','content':json.dumps({'state':job['state'], 'error':job['error'],
+                'tool':'generate_image' if job['kind']=='generate' else 'send_library_image'},ensure_ascii=False)}],
+                system_prompt=style+'\n只写一句简短自然的图片任务状态通知，不用Markdown。只据给定状态与错误：uncertain表示结果未确认，不能说生成失败；failed表示本任务没成功。错误若为下载或发送，不得说没画好。不重复扣费或发送，不编造原因。',
+                max_tokens=120, operation='image')
+        except Exception:
+            self.skip_notice(job['id'])
+            raise
+        finally:
+            await engine.close()
+        if not text or len(text)>220 or not self.notice_current(job):
+            self.skip_notice(job['id']);return True
+        s = self.config.settings
+        check = self.runtime.safety.check(s.account_id,job['chat'],s,reply=text,kind='text')
+        if not check['allowed']:
+            self.skip_notice(job['id']);return True
+        auth = await self.runtime.gateway.status_for_send()
+        if not self.notice_current(job):
+            self.skip_notice(job['id']);return True
+        if auth.get('status')!='logged_in' or auth.get('loggedInUser')!=s.account_id:
+            self.change(job['id'],notice_state='');return False
+        self.change(job['id'],notice_state='sending')
+        action_id = self.store.action_start('picture-notice:'+job['id'],job,0,{'type':'text','display':text})
+        receipt = await self.runtime.gateway.send(job['chat'],text)
+        state = 'sent' if receipt.confirmed else 'failed' if receipt.definite_failure else 'uncertain'
+        self.store.action_finish(action_id,state,receipt.message_id,receipt.error,details=receipt.details)
+        self.change(job['id'],notice_state=state)
+        self.runtime.last_send=time.time()
+        self.runtime.safety.outcome(s.account_id,receipt,s,chat=job['chat'])
+        return True
+
     async def notice_loop(self):
-        """One brief failure result in the original chat; never resend uncertain notices."""
+        """Notify current failures only, never pending delivery or stale snapshots."""
         while True:
             try:
-                s=self.config.settings
-                row=self.store.db.execute("SELECT * FROM picture_jobs WHERE account=? AND destination='chat' AND state IN ('failed','uncertain') AND notice_state='' ORDER BY created LIMIT 1",(s.account_id,)).fetchone()
-                if (not row or not s.enabled or self.runtime.processing or self.runtime.paused_reason or
-                        self.runtime.safety.held(s.account_id)):
-                    await asyncio.sleep(3);continue
-                job=dict(row)
-                try:
-                    self.check_proactive_permission(job)
-                except ValueError:
-                    self.change(job['id'],notice_state='skipped');continue
-                if job['chat'] not in s.allowed_chat_ids or not s.images_chat_enabled:
-                    self.change(job['id'],notice_state='skipped');continue
-                if time.time()<self.runtime.last_send+s.min_send_interval:
-                    await asyncio.sleep(1);continue
-                self.change(job['id'],notice_state='composing')
-                engine = self.new_engine()
-                try:
-                    style = self.runtime.config.settings.system_prompt_override or self.runtime.styles.get_active().system_prompt
-                    text = await engine.chat([{'role':'user','content':json.dumps({'state':job['state'], 'error':job['error'],
-                        'tool':'generate_image' if job['kind']=='generate' else 'send_library_image'},ensure_ascii=False)}],
-                        system_prompt=style+'\n只写一句简短自然的图片任务失败通知，不用Markdown。只据给定状态：uncertain表示结果未确认、不重复扣费或发送；failed表示没成功。不能声称已画好或已发送，不编造原因。', max_tokens=120,
-                        operation='image')
-                finally:
-                    await engine.close()
-                if not text or len(text)>220 or self.config.settings.account_id != job['account']:
-                    self.change(job['id'],notice_state='skipped');continue
-                check=self.runtime.safety.check(s.account_id,job['chat'],s,reply=text,kind='text')
-                if not check['allowed']:
-                    self.change(job['id'],notice_state='skipped');continue
-                auth=await self.runtime.gateway.status_for_send()
-                try:
-                    self.check_proactive_permission(job)
-                except ValueError:
-                    self.change(job['id'],notice_state='skipped');continue
-                if auth.get('status')!='logged_in' or auth.get('loggedInUser')!=s.account_id:
-                    self.change(job['id'],notice_state='');await asyncio.sleep(3);continue
-                self.change(job['id'],notice_state='sending')
-                action_id=self.store.action_start('picture-notice:'+job['id'],job,0,{'type':'text','display':text})
-                receipt=await self.runtime.gateway.send(job['chat'],text)
-                state='sent' if receipt.confirmed else 'failed' if receipt.definite_failure else 'uncertain'
-                self.store.action_finish(action_id,state,receipt.message_id,receipt.error)
-                self.change(job['id'],notice_state=state)
-                self.runtime.last_send=time.time()
-                self.runtime.safety.outcome(s.account_id,receipt,s,chat=job['chat'])
+                if not await self.notice_once():
+                    await asyncio.sleep(3)
             except asyncio.CancelledError:
                 raise
             except Exception:

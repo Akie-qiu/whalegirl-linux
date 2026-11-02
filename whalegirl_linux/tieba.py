@@ -36,6 +36,17 @@ def active_hour(settings, now=None):
     return a == b or (a <= hour < b if a < b else hour >= a or hour < b)
 
 
+def share_window(settings, created):
+    """A queued night-time find gets a real opportunity in the next send window."""
+    first=created
+    if not active_hour(settings,created):
+        start=datetime.fromtimestamp(created,TZ).replace(
+            hour=settings.tieba_start_hour,minute=0,second=0,microsecond=0)
+        if start.timestamp()<created:start+=timedelta(days=1)
+        first=start.timestamp()
+    return first,first+6*3600
+
+
 def image_url(value):
     """Only fetch HTTPS images on the public Tieba image CDNs."""
     p = urlsplit(str(value or ''))
@@ -513,7 +524,7 @@ class TiebaService:
                         p = self.store.db.execute('SELECT * FROM tieba_posts WHERE account=? AND tid=?', (account, tid)).fetchone()
                         if p and p['score'] >= self.config.settings.tieba_share_threshold:
                             picked = self.queue_share(dict(p))
-                            break  # One interesting find per browsing run; never flush a backlog.
+                            if picked:break  # An already-shared top result must not hide the next new find.
                 self.execute("UPDATE tieba_runs SET state='done',read_count=?,picked_count=?,image_count=?,finished=? WHERE id=?",
                              (read, picked, image_count, time.time(), identity))
             except asyncio.CancelledError:
@@ -634,15 +645,60 @@ class TiebaService:
         for chat in s.tieba_share_chat_ids:
             if chat not in s.allowed_chat_ids:
                 continue
-            pending = self.store.db.execute("""SELECT 1 FROM tieba_shares WHERE account=? AND chat=?
-                AND state IN ('queued','sending','uncertain')""", (s.account_id, chat)).fetchone()
-            if pending:
+            if self.store.db.execute('SELECT 1 FROM tieba_shares WHERE account=? AND chat=? AND tid=?',
+                    (s.account_id,chat,post['tid'])).fetchone():continue
+            pending = self.store.db.execute("""SELECT s.*,m.origin FROM tieba_shares s
+                LEFT JOIN tieba_share_meta m ON m.share_id=s.id WHERE s.account=? AND s.chat=?
+                AND s.state IN ('queued','sending','uncertain')""", (s.account_id, chat)).fetchall()
+            blocked=False
+            for raw in pending:
+                row=dict(raw)
+                if row['state']=='uncertain':
+                    # Preserve the uncertain record, but it cannot block every
+                    # different future post forever. Its send still counts.
+                    blocked |= time.time()<max(row['sent_at'],row['created'])+s.tieba_share_cooldown_minutes*60
+                    continue
+                if row['state']=='sending':blocked=True;continue
+                expired=time.time()>share_window(s,row['created'])[1]
+                newer=(row.get('origin') in (None,'discovery') and row['tid']!=post['tid']
+                       and post.get('seen',0)>row['created'])
+                if (expired or newer) and not self.store.actions('tieba:'+row['id']):
+                    self.execute("UPDATE tieba_shares SET state='cancelled',error=? WHERE id=? AND state='queued'",
+                        ('未发送的旧候选已过期' if expired else '未发送的旧候选已由更新内容替换',row['id']))
+                else:blocked=True
+            if blocked:
                 continue
             text = self.share_preview(post) + '\n' + post['url']
             cur = self.execute('INSERT OR IGNORE INTO tieba_shares(id,account,tid,chat,text,state,created) VALUES(?,?,?,?,?,?,?)',
                                (uuid.uuid4().hex, s.account_id, post['tid'], chat, text, 'queued', time.time()))
             queued += cur.rowcount
         return queued
+
+    def share_wait(self,row):
+        """A cheap, read-only explanation for the queue and console."""
+        s=self.config.settings;now=time.time()
+        if row['chat'] not in s.allowed_chat_ids or row['chat'] not in s.tieba_share_chat_ids:
+            return {'code':'chat_not_authorized','reason':'目标会话未授权'}
+        if not (s.enabled and s.tieba_enabled and s.tieba_share_enabled and self.discovery_allowed(row)):
+            return {'code':'share_disabled','reason':'分享开关已关闭'}
+        if self.runtime.chat_control.active(s.account_id,row['chat']):
+            return {'code':'quiet','reason':'会话处于静默状态'}
+        if now>share_window(s,row['created'])[1]:
+            return {'code':'expired','reason':'候选已超过可分享时限'}
+        if not active_hour(s):
+            first,_=share_window(s,now)
+            return {'code':'outside_share_hours','reason':'等待允许分享的时段','retry_at':first}
+        if not s.tieba_share_per_day or self.share_count(s.account_id)>=s.tieba_share_per_day:
+            return {'code':'daily_limit','reason':'已达到每日分享总上限（所有目标会话合计）'}
+        latest=self.store.db.execute("SELECT max(sent_at) FROM tieba_shares WHERE account=? AND chat=? "
+            "AND state IN ('sent','sending','uncertain')",(s.account_id,row['chat'])).fetchone()[0] or 0
+        ready=max(latest+s.tieba_share_cooldown_minutes*60,
+            self.runtime.last_send+s.min_send_interval,
+            self.store.latest_sent(s.account_id,row['chat'])+s.chat_cooldown)
+        if now<ready:return {'code':'share_cooldown','reason':'等待分享间隔','retry_at':ready}
+        if self.runtime.paused_reason or self.runtime.safety.held(s.account_id):
+            return {'code':'paused','reason':'运行保护暂停，等待恢复'}
+        return {'code':'ready','reason':'等待聊天发送通道空闲'}
 
     def share_permission(self, chat, account):
         s = self.config.settings
@@ -780,8 +836,8 @@ class TiebaService:
                 continue
             if (row['chat'] not in s.allowed_chat_ids or row['chat'] not in s.tieba_share_chat_ids
                     or not self.retention.active(row['tid']) or not self.discovery_allowed(row)
-                    or time.time() - row['created'] > 6 * 3600):
-                self.execute("UPDATE tieba_shares SET state='cancelled',error='权限变化或超过六小时，停止分享' WHERE id=?", (row['id'],))
+                    or time.time()>share_window(s,row['created'])[1]):
+                self.execute("UPDATE tieba_shares SET state='cancelled',error='目标权限已改变或候选超过可分享时限' WHERE id=?", (row['id'],))
                 continue
             if not s.tieba_share_per_day or self.share_count(s.account_id) >= s.tieba_share_per_day:
                 return False
@@ -939,12 +995,15 @@ class TiebaService:
             FROM tieba_memes m LEFT JOIN tieba_meme_sources s ON s.meme_id=m.id
             LEFT JOIN tieba_meme_details d ON d.meme_id=m.id WHERE m.account=? ORDER BY m.created DESC LIMIT 100''', (account,))
             if self.retention.active(r['tid'])]
+        shares=rows('tieba_shares','created DESC',30)
+        for row in shares:
+            if row['state']=='queued':row['waiting']=self.share_wait(row)
         return {'enabled': self.config.settings.tieba_enabled, 'busy': self.busy, 'requested': self.requested,
                 'next_at': self.next_at(), 'login_configured': bool(self.config.tieba_credentials()),
                 'runs': rows('tieba_runs', 'started DESC', 12), 'posts': posts,
                 'archives': self.archives.summaries(), 'archive_stats': self.archives.stats(),
                 'memes': memes, 'pictures': pictures,
-                'shares': rows('tieba_shares', 'created DESC', 30), 'sent_today': self.share_count(account),
+                'shares': shares, 'sent_today': self.share_count(account),
                 'tools': self.tools.events(), 'tool_cache': self.tools.cache_snapshot(),
                 'retention': self.retention.snapshot(),
                 'memory_pressure': native_pressure(self.config), 'context_busy': self.context_busy}
@@ -975,8 +1034,9 @@ class TiebaService:
     async def dispatch_loop(self):
         while True:
             try:
-                await self.context_once()
-                await self.dispatch_once()
+                # A due durable share should not sit behind another 18-second
+                # optional topic-selection model request on every loop.
+                if not await self.dispatch_once():await self.context_once()
             except asyncio.CancelledError:
                 raise
             except Exception:

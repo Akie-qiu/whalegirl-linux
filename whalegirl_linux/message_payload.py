@@ -23,7 +23,9 @@ def xml_root(value):
         if text.startswith('<'):
             try:
                 root=ET.fromstring(re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]','',text))
-                for node in root.iter():node.tag=node.tag.rsplit('}',1)[-1]
+                for node in root.iter():
+                    if isinstance(node.tag, str):
+                        node.tag = node.tag.rsplit('}', 1)[-1]
                 return root
             except ET.ParseError:return None
         decoded=unescape(text)

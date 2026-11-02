@@ -129,6 +129,8 @@ class EngineAccountingTests(unittest.IsolatedAsyncioTestCase):
                 event=Runtime.event('account','group@chatroom',{'serverId':mid,'localId':mid,'sender':sender,
                     'senderName':sender,'type':1,'content':text,'isSelf':False,'timestamp':time.time()+turn})
                 event['trigger']=trigger;store.observe([event]);store.insert(event)
+                store.db.execute('UPDATE autonomy_chats SET last_considered=0')
+                store.db.commit()
                 await runtime.process_next()
             self.assertEqual(len(payloads),2)
             sys_0=payloads[0]['messages'][0]['content']
@@ -140,7 +142,7 @@ class EngineAccountingTests(unittest.IsolatedAsyncioTestCase):
             user_1=payloads[1]['messages'][1]['content']
             self.assertIn('【本轮动态上下文】',user_0)
             self.assertLess(user_0.index('【当前会话近期完整消息（含未@内容）】'),user_0.index('【本轮动态上下文】'))
-            reply_marker='\n【本次需要回复的消息】\n'
+            reply_marker='\n【本轮新发生的交流】\n'
             self.assertLess(user_0.index('【本轮动态上下文】'),user_0.index(reply_marker))
             self.assertIn('帮我想个晚饭',user_1)
         finally:
@@ -184,15 +186,17 @@ class EngineAccountingTests(unittest.IsolatedAsyncioTestCase):
                 event=Runtime.event('account','group@chatroom',{'serverId':mid,'localId':mid,'sender':f'user{mid}',
                     'senderName':f'群友{mid}','type':1,'content':text,'isSelf':False,'timestamp':time.time()})
                 event['trigger']=trigger;store.observe([event]);store.insert(event)
+                store.db.execute('UPDATE autonomy_chats SET last_considered=0')
+                store.db.commit()
                 await runtime.process_next()
             self.assertEqual(len(prompts),2)
             self.assertEqual(engine.calls,2)
-            self.assertEqual(formats,[None,{'type':'json_object'}])
+            self.assertEqual(formats,[{'type':'json_object'},{'type':'json_object'}])
             static_0=prompts[0].split('\n【本轮动态上下文】',1)[0]
             static_1=prompts[1].split('\n【本轮动态上下文】',1)[0]
             self.assertTrue(static_1.startswith(static_0))
-            self.assertNotIn('只输出JSON',static_0)
-            self.assertIn('只输出JSON',static_1[len(static_0):])
+            self.assertEqual(static_0,static_1)
+            self.assertIn('只输出JSON',static_0)
         finally:
             await real_builder.close()
             await runtime.close()

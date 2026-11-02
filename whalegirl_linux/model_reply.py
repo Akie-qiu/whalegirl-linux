@@ -19,6 +19,27 @@ def decision(raw):
     return value
 
 
+def direct_text_decision(raw, *, explicit=False, image_keys=(), tool_calls=(), resumed=False):
+    """Wrap only an explicit, complete plain answer; preserve structured decisions."""
+    if not explicit or image_keys or tool_calls or resumed or not isinstance(raw,str):
+        return None
+    text=raw.strip().lstrip('\ufeff').strip()
+    if not text or text.startswith(('{','[','"','```')) or '```' in text:
+        return None
+    # Malformed protocol output must keep the bounded format-repair path.
+    if re.search(r'<\|[^>]*\|>|</?(?:think|analysis|reasoning|tool_call|function|assistant)\b',text,re.I):
+        return None
+    if re.search(r'^[ \t]*(?:analysis|reasoning|assistant|tool_call|function_call)\s*:',text,re.I|re.M):
+        return None
+    if re.search(r'["\'](?:should_reply|actions|image_request|search_query|memory_ops)["\']\s*:',text):
+        return None
+    marker=text.strip(' \t\r\n。.!！?？').casefold()
+    if marker in {'no_reply','no_response','silent','silence','skip','none','null','true','false',
+                  '沉默','旁观','不回复','无需回复','保持安静','保持沉默','暂不回复'}:
+        return None
+    return {'should_reply':True,'actions':[{'type':'text','text':raw}]}
+
+
 async def guarded_chat(engine,messages,*,diagnostics,stage,**options):
     """No additional model request on valid output; never execute a tool here."""
     options={**options,'response_format':{'type':'json_object'}}
@@ -34,7 +55,7 @@ async def guarded_chat(engine,messages,*,diagnostics,stage,**options):
                'reply_starts_json':str(raw or '').lstrip().startswith(('{','['))}
         diagnostics['format_error']=error
         code=re.match(r'HTTP \d{3}',str(getattr(engine,'last_error','')))
-        if (not raw and code) or diagnostics.get('format_repair_attempts',0)>=1:
+        if (not raw and (code or 'length' in str(getattr(engine,'last_error','')))) or diagnostics.get('format_repair_attempts',0)>=1:
             if code:error['upstream_status']=code[0]
             raise ToolReplyFormatError(stage,type(exc).__name__) from exc
         diagnostics['format_repair_attempts']=diagnostics.get('format_repair_attempts',0)+1

@@ -12,14 +12,15 @@ import httpx
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .gateway import AgentGateway
 from .runtime import Runtime
-from .settings import Config, Settings
+from .settings import Config, ModelProfile, Settings
 from .store import Store
 from .stability import read_stability
 from .personas import PersonaLibrary, PersonaSpec, PersonaSaveRequest, PersonaActionRequest, compile_persona
@@ -31,6 +32,22 @@ class ConfigRequest(BaseModel):
     settings: Settings
     api_key: str = Field(default="", max_length=1024)
     search_api_key: str = Field(default='', max_length=1024, repr=False)
+
+    @field_validator('settings', mode='before')
+    @classmethod
+    def omit_profile_metadata(cls, values):
+        if isinstance(values, dict):
+            return {key: value for key, value in values.items()
+                    if key not in ('model_profiles', 'active_model_profile')}
+        return values
+
+
+class ModelProfileRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    profile_id: Literal['flash', 'pro', 'responses', 'custom']
+    profile: ModelProfile
+    api_key: str = Field(default='', max_length=1024, repr=False)
+    activate: bool = True
 
 
 class ReviewRequest(BaseModel):
@@ -199,6 +216,14 @@ class MomentsAssetRequest(BaseModel):
     name: str = Field(default='朋友圈配图', max_length=100)
 
 
+class MomentsWorldRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    enabled: bool
+    premise: str | None = Field(default=None, max_length=1800)
+    setting_text: str | None = Field(default=None, max_length=60000)
+    expected_setting_revision: str | None = Field(default=None, max_length=64)
+
+
 class ImageConfigRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
     values: dict = Field(default_factory=dict)
@@ -217,6 +242,7 @@ class ImageTaskRequest(BaseModel):
     character: bool = False
     character_variant: str = Field(default='', pattern='^(|chibi|girl|mature)$')
     mode: str = Field(default='auto', pattern='^(auto|edit|remix)$')
+    aspect_ratio: str = Field(default='auto', pattern='^(auto|1:1|4:3|3:4|16:9|9:16|3:2|2:3|4:5|5:4|2:1|1:2)$')
 
 
 class ReferenceUploadRequest(MomentsAssetRequest):
@@ -408,6 +434,28 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     async def memory_hub_script():
         return FileResponse(root/'whalegirl_linux'/'memory-hub.js',media_type='text/javascript')
 
+    @app.get('/growth.js')
+    async def growth_script():
+        return FileResponse(root/'whalegirl_linux'/'growth.js',media_type='text/javascript')
+
+    @app.get('/api/growth')
+    def growth_state():return runtime.growth.snapshot()
+
+    @app.post('/api/growth/run')
+    def growth_run(body:dict):
+        try:return runtime.growth.request(body.get('kind','world'))
+        except ValueError as exc:raise HTTPException(400,str(exc)) from exc
+
+    @app.get('/api/growth/journals/{identity}')
+    def growth_journal(identity:str):
+        try:return runtime.growth.journal(identity)
+        except ValueError as exc:raise HTTPException(404,str(exc)) from exc
+
+    @app.post('/api/growth/insights/{identity}')
+    def growth_edit(identity:int,body:dict):
+        try:return runtime.growth.edit(identity,body)
+        except ValueError as exc:raise HTTPException(409,str(exc)) from exc
+
     @app.get('/improvements.js')
     async def improvements_js():
         return FileResponse(root/'whalegirl_linux'/'improvements.js',media_type='text/javascript')
@@ -463,10 +511,10 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     @app.post('/api/proactive/config')
     async def proactive_config(body: ProactiveConfigRequest):
         allowed = {name for name in Settings.model_fields if name.startswith('proactive_')}
-        allowed.update({'autonomy_enabled', 'participation','stickers_enabled','sticker_aggressiveness',
+        allowed.update({'autonomy_enabled', 'experience_growth_enabled', 'participation','stickers_enabled','sticker_aggressiveness',
                         'sticker_cooldown_seconds','reply_max_parts','reply_part_interval','quiet_default_minutes'})
         allowed.update({'sticker_text_pair_eagerness','sticker_only_eagerness','sticker_reaction_eagerness',
-                        'sticker_max_per_reply','sticker_style_note'})
+                        'sticker_max_per_reply','sticker_style_note','sticker_usage_target','fast_reply_enabled'})
         if set(body.values) - allowed:
             raise HTTPException(400, '自主聊天设置包含未知参数')
         try:
@@ -736,8 +784,7 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
         elif body.op in ('received', 'not_received'):
             if row['state'] != 'uncertain':
                 raise HTTPException(409, '仅待核实任务可以人工确认')
-            state = 'sent' if body.op == 'received' else 'failed'
-            runtime.images.change(identity, state=state, error='管理员核对；不会自动重新生成或发送')
+            runtime.images.review(identity, body.op == 'received')
         else:
             raise HTTPException(400, '请在图片卡片上重新整理描述')
         return runtime.images.snapshot()
@@ -755,6 +802,51 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     @app.get('/api/moments')
     async def moments_state():
         return runtime.moments.snapshot()
+
+    @app.get('/api/moments/world')
+    async def moments_world_state():
+        return runtime.moments.world.snapshot()
+
+    @app.post('/api/moments/world')
+    async def moments_world_save(body: MomentsWorldRequest):
+        try:
+            async with runtime.moments.lock:
+                if body.setting_text is not None:
+                    await runtime.moments.world.import_document(body.setting_text, body.expected_setting_revision)
+                return runtime.moments.world.save(body.enabled, body.premise)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.get('/api/moments/world/document')
+    async def moments_world_document():
+        return runtime.moments.world.document()
+
+    @app.get('/api/moments/world/characters/{actor}/preview')
+    async def moments_world_reference(actor: str):
+        from .moments_world import CAST_IDS
+        if actor not in CAST_IDS:
+            raise HTTPException(404, '角色不存在')
+        library = runtime.images.references
+        if actor == 'whalegirl':
+            selected = library.selected(config.settings.image_character_variant)
+            identity = selected[0]['id'] if selected else ''
+        else:
+            cards = runtime.moments.world.configuration().get('characters', [])
+            identity = next((c.get('reference_id') for c in cards if c.get('id') == actor), '')
+        if not identity:
+            raise HTTPException(404, '角色参考图未配置')
+        path = library.path(identity)
+        if not path.is_file():
+            raise HTTPException(404, '角色参考图不可用')
+        import io
+        from PIL import Image
+        def thumbnail():
+            with Image.open(path) as image:
+                image.thumbnail((640, 420))
+                out = io.BytesIO()
+                image.convert('RGB').save(out, format='JPEG', quality=84)
+                return out.getvalue()
+        return Response(await asyncio.to_thread(thumbnail), media_type='image/jpeg')
 
     @app.post('/api/moments/scan')
     async def moments_scan():
@@ -799,6 +891,8 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
                 book.change(identity, 'sent' if body.op == 'received' else 'failed',
                             receipt='manual-confirmed' if body.op == 'received' else '',
                             error='管理员确认已发送' if body.op == 'received' else '管理员确认未发送，不自动重发')
+                if body.op == 'received':
+                    runtime.moments.world.confirm(identity)
             elif body.op == 'without_image':
                 if row['state'] != 'image_failed':
                     raise HTTPException(409, '只有配图失败的记录可以恢复')
@@ -864,6 +958,23 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     async def get_config():
         return config.public()
 
+    @app.get('/api/model-profiles')
+    async def get_model_profiles():
+        return {'active_model_profile': config.active_model_profile,
+                'profiles': config.model_profiles_public()}
+
+    @app.post('/api/model-profiles')
+    async def save_model_profile(body: ModelProfileRequest):
+        try:
+            result = config.save_model_profile(body.profile_id, body.profile, body.api_key, body.activate)
+            if body.activate:
+                runtime.poll_wake.set()
+                if runtime.paused_reason in ('模型凭据无效', '模型账户余额不足', '模型接口权限不足'):
+                    runtime.paused_reason = ''
+            return result
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     @app.post("/api/config")
     async def save_config(body: ConfigRequest):
         settings = body.settings
@@ -895,6 +1006,7 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
                 settings.active_persona_id = ''
                 settings.active_persona_revision = 0
             config.save(settings, body.api_key)
+            runtime.poll_wake.set()
             config.save_search_key(body.search_api_key)
             runtime.moments.settings_changed(previous_settings, settings)
         except ValueError as exc:
@@ -1144,6 +1256,13 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
             return runtime.learning.snapshot(state=state, query=q[:200], chat=chat, kind=kind)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+
+    @app.get('/api/chat-style')
+    def chat_style_state(chat: str):
+        try:
+            return runtime.memory_hub.chat_style.snapshot(config.settings,chat)
+        except ValueError as exc:
+            raise HTTPException(403,str(exc)) from exc
 
     @app.get('/api/persona-state')
     def get_persona_state(chat: str=''):

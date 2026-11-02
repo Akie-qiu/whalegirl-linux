@@ -148,8 +148,12 @@ class ProactiveSearchTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.engine_factory = lambda **kwargs: Engine()
         self.assertTrue(await self.service.run_once())
         self.assertEqual(len(calls), 2)
-        data = json.JSONDecoder().raw_decode(calls[0][0][0]['content'])[0]
-        self.assertRegex(data['recent_messages'][0]['timestamp'], r'^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$')
+        # Proactive and live turns share the complete chronological transcript;
+        # a second JSON copy would consume input and could contradict this one.
+        transcript = calls[0][0][0]['content']
+        self.assertIn('当前会话近期完整消息', transcript)
+        self.assertRegex(transcript, r'\[\d\d-\d\d \d\d:\d\d:\d\d｜')
+        self.assertIn('账号ID=', transcript)
         self.assertIn('search_query', calls[0][1]['system_prompt'])
         self.assertEqual(self.gateway.sent, [(proactive.CHAT,'有个新公告')])
 

@@ -31,6 +31,50 @@
   const tl=el('label','','发动态感兴趣的话题 / 每行一个');tl.append(topics);panel.append(tl);
   const prompt=el('textarea');prompt.rows=5;prompt.maxLength=8000;fields.moments_prompt=prompt;
   const pl=el('label','','朋友圈专用提示词');pl.append(prompt);panel.append(pl);
+  const worldBox=el('details','record');worldBox.id='moments-world';worldBox.append(el('summary','','生活世界与角色 · 四人日常漫画'));
+  const worldSwitch=el('input','toggle');worldSwitch.type='checkbox';worldSwitch.setAttribute('aria-label','启用生活世界与多人漫画');
+  const worldSwitchLabel=el('label','check-label','启用生活世界与多人漫画');worldSwitchLabel.append(worldSwitch);
+  const worldPremise=el('textarea');worldPremise.rows=3;worldPremise.maxLength=1800;worldPremise.setAttribute('aria-label','生活世界舞台设定');
+  const worldStatus=el('p','hint'),worldCards=el('div','settings-grid'),worldRelations=el('div'),worldEvents=el('div');
+  let worldDirty=false,documentDirty=false,documentLoaded=false,documentRevision='';
+  worldSwitch.addEventListener('change',()=>{worldDirty=true;});worldPremise.addEventListener('input',()=>{worldDirty=true;});
+  const documentBox=el('details','record'),documentSummary=el('summary','','完整角色设定 · 查看和编辑原文');documentBox.append(documentSummary);
+  const documentStatus=el('p','hint','展开后载入完整原文，自动刷新不会覆盖正在编辑的内容。');
+  const documentText=el('textarea');documentText.id='moments-world-document';documentText.rows=18;documentText.maxLength=60000;
+  documentText.spellcheck=false;documentText.disabled=true;documentText.setAttribute('aria-label','完整角色设定原文');documentText.style.cssText='width:100%;line-height:1.65;min-height:360px;resize:vertical';
+  documentText.addEventListener('input',()=>{documentDirty=true;documentStatus.textContent='有未保存的修改 · '+documentText.value.length+' 字';});
+  const documentSave=btn('保存并应用角色设定',async()=>{
+    documentText.disabled=true;documentSave.textContent='正在整理并保存…';
+    try{const world=await api('moments/world','POST',{enabled:worldSwitch.checked,setting_text:documentText.value,expected_setting_revision:documentRevision},90000);
+      documentDirty=false;worldDirty=false;documentRevision=world.document?.revision||'';worldSignature='';renderWorld(world);await readWorldDocument();notice('角色设定已保存，聊天、朋友圈和生图已使用新版摘要');
+    }finally{documentText.disabled=false;documentSave.textContent='保存并应用角色设定';}
+  });documentSave.disabled=true;
+  documentBox.append(documentStatus,el('p','hint','保存时调用一次当前模型整理人物、六组关系和剧情要点；原文完整保留并自动备份旧版。普通聊天只使用稳定摘要，不反复输入整份长文。'),documentText,documentSave);
+  async function readWorldDocument(){
+    const value=await api('moments/world/document');if(documentDirty)return;documentText.value=value.text||'';documentRevision=value.revision||'';documentLoaded=true;
+    documentText.disabled=false;documentSave.disabled=false;
+    documentStatus.textContent=(value.title||'尚未导入设定原文')+' · '+documentText.value.length+' 字'+(value.revision?' · 已应用':'');
+  }
+  documentBox.addEventListener('toggle',()=>{if(documentBox.open&&!documentLoaded)readWorldDocument().catch(e=>notice(e.message,true));});
+  worldBox.append(worldSwitchLabel,el('p','hint','大肥鱼以第一人称分享公寓日常。AI 自主设计关系与个人目标，已确认发布的事件才进入连续剧情；关闭后回到原有单人创作，世界记录保留。'),worldPremise,
+    btn('保存生活世界设置',async()=>{const world=await api('moments/world','POST',{enabled:worldSwitch.checked,premise:worldPremise.value});worldDirty=false;worldSignature='';renderWorld(world);notice('生活世界设置已保存');}),worldStatus,documentBox,worldCards,
+    el('h4','','AI 设计的相处关系'),worldRelations,el('h4','','最近发生的事'),worldEvents);panel.append(worldBox);
+  const worldThumbs=new Map();let worldSignature='';
+  async function worldThumbnail(actor,node){try{let url=worldThumbs.get(actor);if(!url){const r=await fetch('/api/moments/world/characters/'+actor+'/preview',{headers:{Authorization:'Bearer '+token}});if(!r.ok)return;url=URL.createObjectURL(await r.blob());worldThumbs.set(actor,url);}node.src=url;}catch{}}
+  function renderWorld(world){
+    const signature=JSON.stringify(world);if(signature===worldSignature)return;worldSignature=signature;
+    if(!worldDirty){worldSwitch.checked=!!world.enabled;worldPremise.value=world.premise||'';}
+    if(documentLoaded&&!documentDirty&&documentRevision!==(world.document?.revision||''))readWorldDocument().catch(e=>notice(e.message,true));
+    worldStatus.textContent=world.configured?(world.established?'关系与日常已建立 · 版本 '+world.version:'角色图已就绪 · 首次生成时由 AI 设计具体关系和目标'):'尚未导入完整角色参考图';
+    if(world.document?.configured)worldStatus.textContent+=' · '+world.document.title;
+    worldCards.replaceChildren();const names=new Map((world.characters||[]).map(c=>[c.id,c.name]));
+    for(const c of world.characters||[]){const card=el('article','record'),image=el('img');image.alt=c.name+'角色参考';image.style.cssText='width:100%;height:140px;object-fit:contain;background:var(--surface,#fff);border-radius:8px';if(c.has_reference)worldThumbnail(c.id,image);const title=({gpt:'GPT 娘 · ',claude:'Claude 娘 · ',gemini:'Gemini 娘 · '}[c.id]||'')+c.name;card.append(image,el('strong','',title),el('p','hint',c.personality));
+      const goal=(world.design?.goals||[]).find(g=>g.character_id===c.id);if(goal)card.append(el('p','','最近想做：'+goal.goal));worldCards.append(card);}
+    worldRelations.replaceChildren();for(const r of world.design?.relationships||[])worldRelations.append(el('p','',names.get(r.a)+' ↔ '+names.get(r.b)+' · '+r.stage+'\n'+r.dynamic));
+    if(!world.design?.relationships?.length)worldRelations.append(el('p','hint','首次生成后展示六组双人关系，遵守最新角色设定中的固定主线，再按已发生的日常逐渐发展。'));
+    worldEvents.replaceChildren();for(const event of world.recent_events||[])worldEvents.append(el('p','',event.location+' · '+event.summary));
+    if(!world.recent_events?.length)worldEvents.append(el('p','hint','还没有已确认发布的生活事件。草稿、配图失败和取消内容不会推进时间线。'));
+  }
   const friends=el('select');friends.multiple=true;friends.size=6;friends.setAttribute('aria-label','允许评论朋友圈的好友');
   const fl=el('label','','允许主动评论朋友圈的好友 / 按住 Ctrl 可多选');fl.append(friends);panel.append(fl,el('p','hint','没有选中好友时，不会主动评论任何好友动态。回复自己朋友圈下的评论不受这份名单限制。'));
   const upload=el('input');upload.type='file';upload.accept='image/png,image/jpeg,image/webp';
@@ -118,7 +162,7 @@
     }
     if(!posts.length)postsList.append(el('p','hint','当前缓存没有可展示的动态。只读取微信已同步到本机的朋友圈，不代表全部历史。'));
   }
-  async function load(){if(loading||!cfg)return;loading=true;try{const results=await Promise.all([api('moments'),api('moments/assets')]);assets=results[1].assets;renderAssets();render(results[0]);}finally{loading=false;}}
+  async function load(){if(loading||!cfg)return;loading=true;try{const results=await Promise.all([api('moments'),api('moments/assets'),api('moments/world')]);assets=results[1].assets;renderAssets();render(results[0]);renderWorld(results[2]);}finally{loading=false;}}
   window.moments={populate,refreshChatLabels};if(cfg)populate();
   setInterval(()=>{if(cfg&&!$('dashboard').hidden&&location.hash==='#moments-panel'&&!panel.contains(document.activeElement))load().catch(()=>{});},15000);
 })();

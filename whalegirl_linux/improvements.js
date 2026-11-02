@@ -2,114 +2,36 @@
 (() => {
   const element=(tag,cls,content) => {const e=document.createElement(tag);if(cls)e.className=cls;if(content)e.textContent=content;return e;};
   const button=(title,fn) => {const b=element('button','secondary',title);b.type='button';b.onclick=()=>action(b,fn);return b;};
-  const conversationFields={banter_level:'玩梗程度',play_along:'顺着演的意愿',callback_frequency:'旧梗回忆频率',assertiveness:'主见程度'};
-  const styleFields={reply_warmth:'回复温度',colloquialism:'口语程度',teasing:'吐槽强度',persona_density:'人设浓度',followup_questions:'反问频率',reply_length:'默认句长',...conversationFields};
-  const styleOptions={reply_warmth:[['low','平和简洁'],['normal','自然亲切'],['high','温暖热络']],sticker_after_text:[['off','关闭主动搭配'],['normal','适中 · 合适时搭配'],['high','积极 · 优先文字后配表情']],reply_length:[['short','简短'],['normal','适中'],['detailed','充分解释']]};
-  Object.assign(styleOptions,{
-    banter_level:[['low','偶尔轻松一句'],['normal','自然接梗'],['high','更爱嘴贫']],
-    play_along:[['low','点到为止'],['normal','愿意接一两轮'],['high','愿意继续演']],
-    callback_frequency:[['off','不主动提旧梗'],['low','很相关时偶尔提'],['normal','相关时自然提起'],['high','更愿意回忆共同梗']],
-    assertiveness:[['low','柔和表达'],['normal','有自己的喜恶'],['high','更坦率地表达意见']]
-  });
+  const styleFields={};
   const styleBox=element('div','settings-grid');
-  const conversationBox=element('div','settings-grid');
-  for(const [name,title] of Object.entries(styleFields)) {
-    const label=element('label','',title), select=element('select');select.id='style-'+name;
-    for(const [value,text] of styleOptions[name] || [['low','低'],['normal','适中'],['high','高']]) {
-      const o=element('option','',text);o.value=value;select.append(o);
-    }
-    label.append(select);(name in conversationFields ? conversationBox : styleBox).append(label);
-  }
   const stickerCooldownLabel=element('label','','同一表情候选冷却 / 秒'),stickerCooldown=element('input');
   stickerCooldown.type='number';stickerCooldown.id='style-sticker-cooldown';stickerCooldown.min=0;stickerCooldown.max=3600;stickerCooldown.step=1;
-  stickerCooldownLabel.append(stickerCooldown,element('span','hint','近期发过的同一表情暂不参与候选；运行保护中的重复内容限制仍独立生效。'));styleBox.append(stickerCooldownLabel);
-  const pairingHint=element('p','hint','文字、表情积极性、发送条数与表情冷却已统一在“自主与主动聊天”设置；这里仅保存说话风格和人设参数。');
-  styleBox.append(pairingHint);
-  const conversationSection=element('section','span-all');
-  conversationSection.style.gridColumn='1 / -1';conversationSection.style.minWidth='0';
-  conversationSection.append(element('h3','','接话与玩梗'),element('p','hint','玩梗控制自嘲、找补和顺势发挥；吐槽强度单独控制互损。共同梗只在原群使用，认真求助时收住玩笑。所有选择跟随当前角色，在同一次回复中完成。'),conversationBox);
-  styleBox.append(conversationSection);
+  stickerCooldownLabel.append(stickerCooldown);styleBox.append(stickerCooldownLabel);
   const humanLikeSection=element('section','record span-all');
-  humanLikeSection.style.gridColumn='1 / -1';humanLikeSection.style.minWidth='0';
-  humanLikeSection.style.borderTop='0';humanLikeSection.style.paddingTop='4px';
-  humanLikeSection.append(element('h3','','🌊 真人感动态状态与去人机感看板'),
-    element('p','hint','实时跟踪当前会话的小情绪起伏、后台生活小剧场、反套路熔断器与分群性格面具，全部注入动态上下文，不破坏提示词前缀缓存。'));
+  humanLikeSection.append(element('h3','','相处状态'),element('p','hint','人设由角色卡定义，群表达在“记忆与成长”查看。这里仅展示有来源的心情和群氛围，不再用随机剧场或语气档位指挥回复。'));
   const liveToolbar=element('div','chat-toolbar'),liveChatSelect=element('select');
-  liveChatSelect.id='persona-live-chat';liveChatSelect.setAttribute('aria-label','查看实时状态的会话');
+  liveChatSelect.id='persona-live-chat';liveChatSelect.setAttribute('aria-label','查看相处状态的会话');
   const liveSummary=element('div','live-monitor-grid');liveSummary.id='persona-live-summary';
-  liveSummary.textContent='正在读取实时情绪、生活小剧场与分群面具…';
-  function makeLiveCard(tag,title,desc,progress=null){
-    const c=element('div','live-stat-card');
-    c.append(element('small','',tag),element('strong','',title),element('p','',desc));
-    if(progress!=null){
-      const track=element('div','energy-bar-track'),fill=element('div','energy-bar-fill');
-      fill.style.width=Math.max(6,Math.min(100,Number(progress)||50))+'%';
-      track.append(fill);c.append(track);
-    }
-    return c;
-  }
   function renderPersonaLive(data){
-    if(!data)return;
-    liveSummary.replaceChildren();
-    const mood=data.mood||{};
-    const af=data.anti_formula||{};
-    const mask=data.group_mask||{};
-    const deltaText=v=>v>0?'+'+v:String(v||0);
-    const guardNames={relaxed:'熟人放松',normal:'正常边界',guarded:'稍微收敛'};
-    const hasBans=Boolean(af.banned_openers?.length||af.banned_self_refs?.length||af.ban_end_question);
-    liveSummary.append(
-      makeLiveCard('🌊 实时小情绪',mood.label||'🌊 平静摸鱼',`活力 ${mood.energy??58}/100 · ${mood.reason||'日常平稳'}`,mood.energy??58),
-      makeLiveCard('🏠 后台生活小剧场',data.life_scene||'正捧着小鲸鱼碗在深海待命','随北京时间作息与贴吧冲浪动态自然演化'),
-      makeLiveCard('🎭 分群性格面具',`防备度：${guardNames[mask.guard_level]||'正常边界'}`,`吐槽 ${deltaText(mask.teasing_delta)} 档 · 玩梗 ${deltaText(mask.banter_delta)} 档`+(mask.vibe_summary?` · ${mask.vibe_summary}`:'')),
-      makeLiveCard('🛡️ 反套路熔断器',hasBans?'⚡ 已激活句式去重保护':'✅ 近 5 轮句式自然',hasBans?`本轮禁用起手词 [${(af.banned_openers||[]).join('/')||'无'}] · 暂停自称 [${(af.banned_self_refs||[]).join('/')||'无'}]`+(af.ban_end_question?' · 禁句尾反问号':''):'无重复口头禅或连续反问审讯')
-    );
+    if(!data)return;liveSummary.replaceChildren();
+    const mood=data.mood||{},mask=data.group_mask||{};
+    liveSummary.append(element('p','',`当前心情：${mood.label||'平静'} · ${mood.reason||'日常平稳'}`),
+      element('p','',`群氛围：${mask.vibe_summary||'尚无特别记录'}`));
   }
-  async function refreshPersonaLive(){
-    const data=await api('persona-state?chat='+encodeURIComponent(liveChatSelect.value||''));
-    renderPersonaLive(data);
-  }
+  async function refreshPersonaLive(){renderPersonaLive(await api('persona-state?chat='+encodeURIComponent(liveChatSelect.value||'')));}
   liveChatSelect.onchange=()=>refreshPersonaLive().catch(e=>notice(e.message,true));
-  liveToolbar.append(
-    liveChatSelect,
-    button('刷新状态',refreshPersonaLive),
-    button('重置情绪为平静',async()=>{const d=await api('persona-state','POST',{op:'reset_mood',chat:liveChatSelect.value||''});renderPersonaLive(d);notice('该群小情绪已重置为平静摸鱼状态');}),
-    button('随机切换小剧场',async()=>{const d=await api('persona-state','POST',{op:'refresh_life_scene',chat:liveChatSelect.value||''});renderPersonaLive(d);notice('已切换新的后台生活小剧场');}),
-    button('重置本群面具',async()=>{const d=await api('persona-state','POST',{op:'reset_group_mask',chat:liveChatSelect.value||''});renderPersonaLive(d);notice('本群性格面具已恢复默认');})
-  );
-  const humanDrawer=element('details','settings-drawer');
-  humanDrawer.open=true;
-  humanDrawer.append(element('summary','','⚙️ 真人感小情绪、生活剧场与极简插话开关'));
-  const humanGrid=element('div','two-fields');humanGrid.style.marginTop='10px';
+  liveToolbar.append(liveChatSelect,button('刷新状态',refreshPersonaLive),button('重置心情为平静',async()=>{
+    renderPersonaLive(await api('persona-state','POST',{op:'reset_mood',chat:liveChatSelect.value||''}));notice('心情已重置');}));
   const moodCheck=element('input');moodCheck.type='checkbox';moodCheck.id='mood-engine-enabled';
-  const moodCheckLabel=element('label','check-label');moodCheckLabel.append(moodCheck,document.createTextNode('启用实时小情绪波动引擎（被夸得瑟、被怼炸毛、半夜犯困）'));
-  const lifeCheck=element('input');lifeCheck.type='checkbox';lifeCheck.id='daily-life-theater-enabled';
-  const lifeCheckLabel=element('label','check-label');lifeCheckLabel.append(lifeCheck,document.createTextNode('启用后台个人生活小剧场（随北京时间与贴吧动态自然带出近况）'));
-  const antiCheck=element('input');antiCheck.type='checkbox';antiCheck.id='anti-formula-guard-enabled';
-  const antiCheckLabel=element('label','check-label');antiCheckLabel.append(antiCheck,document.createTextNode('启用反套路熔断器（自动禁用近5轮重复起手词、自称与连续反问）'));
-  const chimeCheck=element('input');chimeCheck.type='checkbox';chimeCheck.id='chime-in-ultra-short';
-  const chimeCheckLabel=element('label','check-label');chimeCheckLabel.append(chimeCheck,document.createTextNode('群聊顺嘴插话强制极简模式（未被点名时控制在 2～18 字短反应，拒绝解释腔）'));
-  const volSelect=element('select');volSelect.id='mood-volatility';
-  for(const [v,t] of [['low','沉稳内敛'],['normal','自然波动（推荐）'],['high','易开心也易炸毛']]){const o=element('option','',t);o.value=v;volSelect.append(o);}
-  const volLabel=element('label','','小情绪敏感度');volLabel.append(volSelect);
+  const moodCheckLabel=element('label','check-label');moodCheckLabel.append(moodCheck,document.createTextNode('使用真实互动形成的心情'));
   const halfLifeInput=element('input');halfLifeInput.type='number';halfLifeInput.id='mood-half-life-minutes';halfLifeInput.min=5;halfLifeInput.max=180;halfLifeInput.step=1;
-  const halfLifeLabel=element('label','','小情绪自动平复半衰期 / 分钟');halfLifeLabel.append(halfLifeInput);
-  humanGrid.append(moodCheckLabel,lifeCheckLabel,antiCheckLabel,chimeCheckLabel,volLabel,halfLifeLabel);
-  humanDrawer.append(humanGrid);
-  humanLikeSection.append(liveToolbar,liveSummary,humanDrawer);
+  const halfLifeLabel=element('label','','心情平复半衰期 / 分钟');halfLifeLabel.append(halfLifeInput);
+  const saveMood=button('保存相处状态设置',async()=>{
+    if(!halfLifeInput.reportValidity())return;
+    await saveSubset({mood_engine_enabled:moodCheck.checked,mood_half_life_minutes:Number(halfLifeInput.value)});notice('相处状态设置已保存');});
+  saveMood.id='save-style-settings';
+  humanLikeSection.append(liveToolbar,liveSummary,moodCheckLabel,halfLifeLabel,saveMood);
   $('habits-panel').querySelector('.section-top').after(humanLikeSection);
-  const saveStyleBtn=button('保存说话风格与真人感设置',async()=>{
-    const values={};for(const n of Object.keys(styleFields))values[n]=$('style-'+n).value;
-    if(!halfLifeInput.checkValidity())throw new Error('小情绪半衰期需在 5～180 分钟之间');
-    values.mood_engine_enabled=moodCheck.checked;
-    values.daily_life_theater_enabled=lifeCheck.checked;
-    values.anti_formula_guard_enabled=antiCheck.checked;
-    values.chime_in_ultra_short=chimeCheck.checked;
-    values.mood_volatility=volSelect.value;
-    values.mood_half_life_minutes=Number(halfLifeInput.value);
-    await saveSubset(values);notice('说话风格与真人感设置已保存，下一轮生效');
-  });
-  saveStyleBtn.id='save-style-settings';
-  styleBox.append(saveStyleBtn);
   $('save-habits').parentElement.before(styleBox);
   const contextLabel=element('label','','上下文字符预算');const budget=element('input');budget.type='number';budget.id='context-char-budget';budget.min=4000;budget.max=40000;contextLabel.append(budget);
   const summaryLabel=element('label','check-label');const summary=element('input');summary.type='checkbox';summary.id='digest-enabled';summaryLabel.append(summary,document.createTextNode('后台增量整理话题摘要'));
@@ -202,10 +124,6 @@
     for(const n of Object.keys(styleFields))$('style-'+n).value=cfg[n] ?? (['reply_warmth','sticker_after_text'].includes(n)?'high':'normal');
     stickerCooldown.value=cfg.sticker_cooldown_seconds ?? 180;
     moodCheck.checked=cfg.mood_engine_enabled !== false;
-    lifeCheck.checked=cfg.daily_life_theater_enabled !== false;
-    antiCheck.checked=cfg.anti_formula_guard_enabled !== false;
-    chimeCheck.checked=cfg.chime_in_ultra_short !== false;
-    volSelect.value=cfg.mood_volatility || 'normal';
     halfLifeInput.value=cfg.mood_half_life_minutes ?? 25;
     budget.value=cfg.context_char_budget;
     summary.checked=cfg.background_digest_enabled;
@@ -220,5 +138,5 @@
     if(s?.persona_live && (!liveChatSelect.value || s.persona_live.chat===liveChatSelect.value)){renderPersonaLive(s.persona_live);}
     if(location.hash==='#inbox-panel' && Date.now()-lastInbox>10000){lastInbox=Date.now();loadInbox(false).catch(e=>notice(e.message,true));}
   }
-  window.improvements={stateUpdated,chatLabels,populate};if(cfg)populate();
+  window.improvements={stateUpdated,chatLabels,populate};if(cfg){populate();window.habits?.populate();}
 })();

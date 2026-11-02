@@ -52,7 +52,8 @@ class MemoryBook:
 
     def get(self, account, memory_id, allowed):
         row = self.store.db.execute('SELECT * FROM memories WHERE id=? AND account=?',(memory_id,account)).fetchone()
-        return dict(row) if row and row['chat'] in allowed else None
+        world=bool(row and row['source_class']=='world_learning' and row['role_id']==self.hub.role())
+        return dict(row) if row and (row['chat'] in allowed or world) else None
 
     def search(self, account, allowed, query='', subject='', *, archived=False, limit=30, chat=None, subjects=(), shared=True):
         if not allowed:
@@ -177,7 +178,7 @@ class MemoryBook:
         marks=','.join('?' for _ in allowed)
         legacy = [r[0] for r in self.store.db.execute(f'''SELECT DISTINCT source_key FROM memories
             WHERE account=? AND chat IN ({marks}) AND source_key!=''
-            AND (archived=1 OR version>1 OR (expires_at>0 AND expires_at<=?))''',
+            AND (archived=1 OR (version>1 AND source_class!='experience') OR (expires_at>0 AND expires_at<=?))''',
             (account,*allowed,time.time()))]
         return list(set(legacy) | set(self.hub.suppressed_sources(account, allowed)))
 
@@ -359,9 +360,14 @@ class MemoryBook:
                     if chat is not None and subject not in subjects:subject=''
                     result=self.hub.recall(account,allowed,subject,str(item.get('query',''))[:200],
                         chat=chat,subjects=subjects,shared=shared,limit=8,include_cold=True)
+                    growth=getattr(self.hub,'growth',None)
+                    if growth:result+=growth.search_memories(str(item.get('query',''))[:200],limit=3,include_cold=True)
                 elif op=='get':
                     result=self.get(account,item.get('id'),allowed)
                     if not self.active(result) or (chat is not None and not self.hub.visible(result,chat,subjects,shared)):result=None
+                    if result:result=self.hub.layers.expand(result,allowed,chat,subjects,shared)
+                    growth=getattr(self.hub,'growth',None)
+                    if result and growth and result.get('source_class')=='world_learning':result=growth.detail_memory(result)
                 else:
                     old=self.get(account,item.get('id'),allowed) if op!='create' else None
                     if old and chat is not None and not self.hub.visible(old,chat,subjects,shared):
@@ -406,6 +412,7 @@ def memory_static_prompt(settings):
         'core为管理员置顶，stable为稳定资料，ordinary为普通经历，cold需按需检索；等级不代表事实真假。'
         '人物印象标为主观，不把玩笑、引文、转发或你自己的推测当本人事实。'
         '当前载入的是本轮实际可用资料；loaded为0不代表整个记忆库为空。'
+        '条目有detail_ids时是多次经历的简短概括；问到时间、原话或细节时用get(id)展开，不凭概括编造细节。'
         '相关时自然使用偏好和相处经验，不宣告“根据记忆”，不照抄学到的梗，不描述简单表情画面。'
         '确实用到本轮载入的资料可在JSON附加memory_used_ids:[记忆id]；没用就留空，不为统计硬套旧事。'
         '\n需要深查时在memory_ops提交search(query,subject)或get(id)，actions留空，收到工具结果再答；不要每轮额外查。'
@@ -429,6 +436,7 @@ def consolidation_data(previous_summary, messages, memories):
 
 def memory_parts(book,settings,first,batch,affection=None,diagnostics=None):
     from .memory_hub import token_estimate
+    from .natural_chat import active as natural_active
     if not settings.memory_enabled:
         if diagnostics is not None:diagnostics.update(enabled=False,count=0,ids=[],estimated_tokens=0)
         return '', '', []
@@ -441,6 +449,11 @@ def memory_parts(book,settings,first,batch,affection=None,diagnostics=None):
         limit=min(50,settings.memory_item_limit*3),diagnostics=retrieval,
         personal_priority=affection.personal_priority(first['account'],first.get('sender_id',''),settings) if affection else 0,
         half_life_days=settings.memory_half_life_days)
+    rows=book.hub.layers.shallow(rows)
+    style_info={}
+    style_text=book.hub.chat_style.prompt(settings,first,style_info)
+    if natural_active(settings) and settings.chat_habits_enabled:
+        rows=[r for r in rows if r['kind'] not in ('chat_style','expression')]
     sources=[{'key':m['key'],'sender_id':m.get('sender_id',''),'sender':m.get('sender','')} for m in batch[-8:]]
     eagerness='\n学习积极性：'+str(settings.learning_eagerness if settings.learning_enabled and settings.memory_consolidation_enabled else 0)+'/100'
     def source_text():return '\n本次可引用的来源：'+json.dumps(sources,ensure_ascii=False)+eagerness
@@ -450,6 +463,10 @@ def memory_parts(book,settings,first,batch,affection=None,diagnostics=None):
     loaded=[];used=0
     for row in rows:
         brief={k:row.get(k) for k in ('id','version','subject','kind','scope','tier','content')}
+        if row.get('source_class') == 'experience':
+            from .experience import memory_brief
+            brief['experience'] = memory_brief(row)
+        if row.get('detail_ids'):brief['detail_ids']=row['detail_ids']
         cost=token_estimate(json.dumps(brief,ensure_ascii=False))
         if used+cost>budget:continue
         loaded.append(brief);used+=cost
@@ -458,10 +475,10 @@ def memory_parts(book,settings,first,batch,affection=None,diagnostics=None):
         return ('\n【本轮分级记忆】'+json.dumps(loaded,ensure_ascii=False)+base+
             '\n实际检索状态：'+json.dumps({'available_in_scope':retrieval.get('available_in_scope',0),'loaded':len(loaded)},ensure_ascii=False))
     while loaded and token_estimate(packed())>settings.memory_token_budget:loaded.pop()
-    dynamic=packed();ids=[r['id'] for r in loaded]
+    dynamic=style_text+packed();ids=list(dict.fromkeys([r['id'] for r in loaded]+style_info.get('chat_style_ids',[])))
     book.hub.mark_loaded(first['account'],ids)
     if diagnostics is not None:
-        diagnostics.update(retrieval,enabled=True,count=len(loaded),ids=ids,
+        diagnostics.update(retrieval,**style_info,enabled=True,count=len(ids),ids=ids,
             profiles=sum(r['scope']=='profile' for r in loaded),chat_memories=sum(r['scope']=='chat' for r in loaded),
             tiers={tier:sum(r['tier']==tier for r in loaded) for tier in ('core','stable','ordinary','cold')},
             joke_ids=[r['id'] for r in loaded if r['kind']=='joke'],skipped_for_budget=max(0,len(rows)-len(loaded)),

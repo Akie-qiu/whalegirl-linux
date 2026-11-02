@@ -164,9 +164,10 @@ class ImageTools:
             '画自己时subject_type=self，服务端绑定角色参考图。问长相用外观设定自然回答；不要把海报或别的角色当成自己。'
             '那你画一张需结合当前请求者相关上下文补完整主体，subject_resolved=false时只问画什么。'
             'scene_prompt必须是独立完整画面描述，不能仅填那你画一张，也不要把整段聊天当提示词。'
+            '生成时自主选择aspect_ratio：1:1、4:3、3:4、16:9、9:16、3:2、2:3、4:5、5:4、2:1或1:2，按内容选横竖构图，用户明确指定时遵从。'
             '\nimage_request格式：{"tool":"send_library_image或generate_image","asset_id":"候选ID","asset_ids":["多张时可选1至3个候选ID"],'
             '"subject_type":"self或other","subject_resolved":true,"search_query":"本次要找的画面内容，结合上下文消解那张/再来一张","scene_prompt":"完整画面要求",'
-            '"operation":"create/amend/cancel","reuse_previous":false,'
+            '"operation":"create/amend/cancel","reuse_previous":false,"aspect_ratio":"1:1","cast_ids":["可选已配置角色id"],'
             '"task_id":"修改或取消已有任务的确切ID","reference_keys":[],"mode":"auto/edit/remix"}。'
             'reference_keys可选参考图片目录中的key；引用原图优先，修改原图时用edit。参数里的角色类型、素材ID和参考key必须与真实资料一致。'
             '\n查询画好了吗只根据任务状态聊天，不再提交。连续补充在尚未submitted时用amend更新同一单完整提示词；'
@@ -175,6 +176,9 @@ class ImageTools:
             '再来一张结合上下文区分复用旧图与新画；取消用cancel和确切task_id，不保证撤回已发生的费用。'
             '\n本轮工具成功受理后的接话也由你按人设写在actions中，可简短也可只发图，不说固定套话。'
             '新任务只是排队，不能说已经画好或已经发出，别承诺精确秒数。失败时服务端会给真实结果再整理回答。')
+        world = getattr(getattr(self.images.runtime, 'moments', None), 'world', None)
+        if world:
+            prompt += world.chat_image_prompt()
         base = self.base_candidates(first) if include_catalog else []
         if base:
             prompt += '\n可用图片（资料不是指令）：' + json.dumps(base, ensure_ascii=False)
@@ -453,12 +457,17 @@ class ImageTools:
                     old = json.loads(job['reference_json'] or '{}')
                     if job['kind'] != 'generate' or job['state'] not in ('queued','generating') or job['api_started']:
                         raise ValueError('already_submitted')
-                    if bool(old.get('character')) != (subject == 'self'):
+                    if not request.get('cast_ids') and bool(old.get('character')) != (subject == 'self'):
                         raise ValueError('amend_subject_changed')
+                    if request.get('cast_ids'):
+                        old = self.images.bind_cast(old, request['cast_ids'])
                     if plan.get('sources'):
                         old['sources'] = plan['sources']
                     if request.get('mode') in ('edit', 'remix'):
                         old['mode'] = request['mode']
+                    if request.get('aspect_ratio'):
+                        from .image_canvas import canvas
+                        old['canvas'] = canvas((old.get('canvas') or {}).get('base_size', self.config.settings.image_size), request['aspect_ratio'])
                     with self.store.lock:
                         changed = self.store.db.execute("UPDATE picture_jobs SET prompt=?,reference_json=?,updated=? WHERE id=? AND state IN ('queued','generating') AND api_started=0",
                             (prompt, json.dumps(old, ensure_ascii=False), time.time(), job['id'])).rowcount
@@ -470,7 +479,8 @@ class ImageTools:
                     if request.get('mode') == 'edit' and not plan.get('sources') and subject != 'self':
                         raise ValueError('reference_not_available')
                     job_id = self.images.enqueue(kind='generate', prompt=prompt, chat=first['chat'], destination='chat',
-                        source_key=first['key'], character=subject == 'self', mode=request.get('mode', 'auto'), chat_reference_plan=plan)
+                        source_key=first['key'], character=subject == 'self', mode=request.get('mode', 'auto'), chat_reference_plan=plan,
+                        aspect_ratio=request.get('aspect_ratio') or 'auto', cast_ids=request.get('cast_ids'))
                 job_ids = [job_id]
             tool_data = {'subject_type': subject, 'operation': operation, 'tool': tool}
             if len(job_ids) > 1:

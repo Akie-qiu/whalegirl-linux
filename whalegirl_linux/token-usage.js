@@ -32,7 +32,7 @@
       extra.textContent='接口请求 '+r.requests+' 次（含重试） · 成功 '+r.successful+' / 失败 '+r.failed+' · 联网搜索与抓取 '+r.search_requests+' 次 · 平均耗时 '+(r.average_ms==null?'—':(r.average_ms/1000).toFixed(2)+'s');
       coverage.textContent='缓存写入 '+number(r.cache_write_tokens,r.requests)+' · 推理 '+number(r.reasoning_tokens,r.requests)+' · 总量回执 '+r.total_tokens_reports+' / '+r.requests+' 次 · 缓存字段回执 '+r.cached_tokens_reports+' / '+r.model_requests+' 次模型请求';
       status.textContent='从 '+new Date(s.started_at*1000).toLocaleString('zh-CN')+' 开始记录 · 北京时间 · 重启及切换模型后保留 · 更新于 '+new Date().toLocaleTimeString('zh-CN');error.textContent='';
-      rows(operationRows,s.operations||[],r=>({chat:'普通聊天',tool_followup:'工具结果整理',memory:'记忆整理',proactive:'主动聊天',moments:'朋友圈',tieba:'贴吧相关',image:'图片与识图',sticker:'表情包',connection_test:'模型连接测试',search:'联网搜索',fetch:'网页抓取'}[r.operation]||r.operation));
+      rows(operationRows,s.operations||[],r=>({growth_learn:'后台自主成长',growth_search:'成长联网搜索',growth_fetch:'成长网页读取',chat:'普通聊天',tool_followup:'工具结果整理',memory:'记忆整理',proactive:'主动聊天',moments:'朋友圈',tieba:'贴吧相关',image:'图片与识图',sticker:'表情包',connection_test:'模型连接测试',search:'联网搜索',fetch:'网页抓取'}[r.operation]||r.operation));
       rows(modelRows,s.models,r=>({search:'联网搜索',fetch:'网页抓取',tieba:'贴吧浏览 · '+r.model,tieba_image:'贴吧图片识别 · '+r.model}[r.operation]||r.operation)+' · '+r.provider);
       rows(dayRows,s.days,r=>r.day);
     }catch(e){error.textContent='用量读取失败：'+e.message;}finally{loading=false;refresh.disabled=false;period.disabled=false;}

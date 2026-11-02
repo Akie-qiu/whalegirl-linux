@@ -30,15 +30,25 @@ def normal(value):
     return unicodedata.normalize("NFKC", str(value or "")).strip()
 
 
-def tree():
+def tree(sticker_panel_ref=None):
     started = time.monotonic()
-    command = ["/opt/tools/a11y-dump", "--format", "json"]
-    if SKIP_MESSAGES:
-        command.append('--skip-messages')
-    result = run_process(command, capture_output=True, text=True, check=True, timeout=8)
+    if sticker_panel_ref:
+        # One guarded selector owns this short sequence. Reuse only its bus
+        # connection, never an old object tree or screen coordinates.
+        from native_panel_reader import read
+        value=read(sticker_panel_ref)
+    else:
+        command = ["/opt/tools/a11y-dump", "--format", "json"]
+        if SKIP_MESSAGES:
+            command.append('--skip-messages')
+        result = run_process(command, capture_output=True, text=True, check=True, timeout=8)
+        value = json.loads(result.stdout)
+    elapsed=time.monotonic()-started
     PROFILE['snapshots'] += 1
-    PROFILE['snapshot_seconds'] += time.monotonic() - started
-    value = json.loads(result.stdout)
+    PROFILE['snapshot_seconds'] += elapsed
+    if sticker_panel_ref:
+        PROFILE['panel_snapshots']=PROFILE.get('panel_snapshots',0)+1
+        PROFILE['panel_snapshot_seconds']=PROFILE.get('panel_snapshot_seconds',0)+elapsed
     return value.get("tree", value)
 
 
@@ -71,6 +81,12 @@ def selected(root, display_name, is_group=False):
                  and (n.get("bounds") or {}).get("x", -1) > right
                  and (n.get("bounds") or {}).get("y", 1000) < 100 for n in nodes)
     return matching_row and header
+
+
+def window_signature():
+    result=run_process(['xdotool','getactivewindow','getwindowgeometry','--shell'],
+                       capture_output=True,text=True,check=True,timeout=2)
+    return result.stdout.strip()
 
 
 def preview_windows():
@@ -259,6 +275,13 @@ def favorite_tile(tiles, index, total, known):
     return tiles[relative] if 0<=relative<len(tiles) else None
 
 
+def favorite_page_signature(tiles):
+    # Qt can keep the same accessible objects while their visible positions move.
+    return tuple((node.get('native_ref'), *(
+        (node.get('bounds') or {}).get(key) for key in ('x','y','width','height')))
+        for node in tiles)
+
+
 def _send_native_sticker(job,path,root,name,is_group):
     started=time.monotonic()
     md5=job.get('md5','')
@@ -277,6 +300,7 @@ def _send_native_sticker(job,path,root,name,is_group):
         if not tiles or len(lists)!=1:raise ValueError('Native favorite layout needs refresh')
         return tiles,lists[0]['bounds']
     def scroll(area,direction):
+        PROFILE['boundary_scroll']=PROFILE.get('boundary_scroll',0)+1
         run_process(['xdotool','mousemove',str(round(area['x']+area['width']/2)),str(round(area['y']+area['height']/2)),
                         'click','--repeat','40','--delay','5',direction],check=True,timeout=3)
         time.sleep(.15)
@@ -299,16 +323,48 @@ def _send_native_sticker(job,path,root,name,is_group):
     try:
         cached=json.loads(cache_path.read_text())
         if (panel_ref and cached.get('panel_ref')==panel_ref and cached.get('order')==order
-                and 0<=time.time()-cached.get('updated',0)<60):
+                and 0<=time.time()-cached.get('updated',0)<1800):
             known=cached.get('anchors') or {}
     except (OSError,ValueError):pass
+    partial_snapshot=False
+    def refresh_panel():
+        nonlocal partial_snapshot
+        # Only wheel events occur between these reads. The final click still
+        # requires a fresh full tree and destination check below.
+        if panel_ref and re.fullmatch(r':\d+\.\d+\|/org/a11y/atspi/accessible/[A-Za-z0-9_/]+',panel_ref):
+            partial_snapshot=True
+            return tree(sticker_panel_ref=panel_ref)
+        return tree()
     offsets={known[n['native_ref']]-i for i,n in enumerate(tiles) if n.get('native_ref') in known}
     shared=sum(n.get('native_ref') in known for n in tiles)
     offset=next(iter(offsets)) if len(offsets)==1 and shared>=2 else None
     relative=index-offset if offset is not None else -1
     chosen=tiles[relative] if 0<=relative<len(tiles) else None
+    if not clickable(chosen,area) and offset is not None and len(tiles)<len(order):
+        # A verified page already has absolute object indexes. Move from that
+        # page instead of first resetting to an extreme and walking back.
+        # Every move is still aligned against shared live objects before use.
+        first_index=offset
+        for _ in range(6):
+            if time.monotonic()-started>10:break
+            direction=('4' if chosen['bounds']['y']<area['y'] else '5') if chosen is not None else (
+                '4' if index<first_index else '5')
+            before_page=favorite_page_signature(tiles)
+            PROFILE['anchor_scroll']=PROFILE.get('anchor_scroll',0)+1
+            run_process(['xdotool','mousemove',str(round(area['x']+area['width']/2)),str(round(area['y']+area['height']/2)),
+                'click','--repeat','2','--delay','40',direction],check=True,timeout=3)
+            time.sleep(.1);root=refresh_panel();tiles,area=panel(root)
+            chosen=favorite_tile(tiles,index,len(order),known)
+            if clickable(chosen,area):
+                job['favorite_cache']='anchor_scroll'
+                break
+            offsets={known[n['native_ref']]-i for i,n in enumerate(tiles) if n.get('native_ref') in known}
+            shared=sum(n.get('native_ref') in known for n in tiles)
+            if len(offsets)!=1 or shared<2:break
+            first_index=next(iter(offsets))
+            if before_page==favorite_page_signature(tiles):break
     if clickable(chosen,area):
-        job['favorite_cache']='anchor_hit'
+        job.setdefault('favorite_cache','anchor_hit')
     elif len(tiles)==len(order):
         known={n['native_ref']:i for i,n in enumerate(tiles) if n.get('native_ref')}
         # A full grid has an exact native index. Keep the current scroll position
@@ -317,13 +373,13 @@ def _send_native_sticker(job,path,root,name,is_group):
         if not clickable(chosen,area):
             b=chosen['bounds']
             scroll(area,'4' if b['y']<area['y'] else '5')
-            root=tree();tiles,area=panel(root)
+            root=refresh_panel();tiles,area=panel(root)
             chosen=favorite_tile(tiles,index,len(order),known)
     else:
         # Use the nearest boundary. Starting every middle favorite at the top
         # can exhaust the locator budget before reaching its row.
         tail_first=index>=len(order)/2
-        scroll(area,'5' if tail_first else '4');root=tree();tiles,area=panel(root)
+        scroll(area,'5' if tail_first else '4');root=refresh_panel();tiles,area=panel(root)
         initial_index=index-(len(order)-len(tiles)) if tail_first else index
         first_index=len(order)-len(tiles) if tail_first else 0
         known={n['native_ref']:first_index+i for i,n in enumerate(tiles) if n.get('native_ref')}
@@ -339,10 +395,11 @@ def _send_native_sticker(job,path,root,name,is_group):
             for _ in range(16):
                 if time.monotonic()-started>12:break
                 before_index=first_index
-                before_refs=tuple(n.get('native_ref') for n in tiles)
+                before_page=favorite_page_signature(tiles)
+                PROFILE['alignment_scroll']=PROFILE.get('alignment_scroll',0)+1
                 run_process(['xdotool','mousemove',str(round(area['x']+area['width']/2)),str(round(area['y']+area['height']/2)),
                     'click','--repeat','1','--delay','20','4' if tail_first else '5'],check=True,timeout=3)
-                time.sleep(.06);root=tree();tiles,area=panel(root)
+                time.sleep(.06);root=refresh_panel();tiles,area=panel(root)
                 offsets={known[n['native_ref']]-i for i,n in enumerate(tiles) if n.get('native_ref') in known}
                 aligned=len(offsets)==1 and all(n.get('native_ref') for n in tiles)
                 if aligned:
@@ -352,15 +409,14 @@ def _send_native_sticker(job,path,root,name,is_group):
                 relative=index-first_index
                 chosen=tiles[relative] if aligned and 0<=relative<len(tiles) else None
                 if clickable(chosen,area):break
-                after_refs=tuple(n.get('native_ref') for n in tiles)
-                stagnant=stagnant+1 if before_refs==after_refs and first_index==before_index else 0
+                stagnant=stagnant+1 if before_page==favorite_page_signature(tiles) and first_index==before_index else 0
                 # Virtualized pages can briefly expose no shared anchor while
                 # WeChat rebuilds its tile list. Continue one wheel notch at a
                 # time; never infer an index from an ambiguous page.
                 wrong_direction=relative>=len(tiles) if tail_first else relative<0
                 if stagnant>=3 or aligned and first_index==before_index and wrong_direction:break
         if not clickable(chosen,area):
-            scroll(area,'5');root=tree();tiles,area=panel(root)
+            scroll(area,'5');root=refresh_panel();tiles,area=panel(root)
             tail_index=index-(len(order)-len(tiles))
             known={n['native_ref']:len(order)-len(tiles)+i for i,n in enumerate(tiles) if n.get('native_ref')}
             chosen=tiles[tail_index] if 0<=tail_index<len(tiles) else None
@@ -374,10 +430,18 @@ def _send_native_sticker(job,path,root,name,is_group):
         b=chosen['bounds']
         if clickable(chosen,area):break
         direction='4' if b['y']<area['y'] else '5'
+        PROFILE['visibility_scroll']=PROFILE.get('visibility_scroll',0)+1
         run_process(['xdotool','mousemove',str(round(area['x']+area['width']/2)),str(round(area['y']+area['height']/2)),
                         'click','--repeat','2','--delay','40',direction],check=True,timeout=3)
-        time.sleep(.1);root=tree();tiles,area=panel(root)
+        time.sleep(.1);root=refresh_panel();tiles,area=panel(root)
     if chosen is None:raise ValueError('Native favorite position became ambiguous before sending')
+    if partial_snapshot:
+        root=tree();tiles,area=panel(root)
+        current_panel=next((n.get('native_ref') for n in walk(root) if n.get('role')=='list'
+            and any(c.get('name')=='Custom Stickers' for c in n.get('children') or [])),None)
+        if current_panel!=panel_ref:raise ValueError('Native favorite panel changed before sending')
+        chosen=favorite_tile(tiles,index,len(order),known)
+        if chosen is None:raise ValueError('Native favorite identity changed before sending')
     b=chosen['bounds']
     if not clickable(chosen,area):
         raise ValueError('Requested favorite has no clickable visible area')
@@ -392,6 +456,9 @@ def _send_native_sticker(job,path,root,name,is_group):
             with os.fdopen(fd,'w') as stream:
                 json.dump({'panel_ref':panel_ref,'order':order,'updated':time.time(),'anchors':known},stream)
         except OSError:pass
+    if job.get('fast_session_nonce'):
+        from native_fast_turn_v1 import check_guard
+        check_guard(job,path)
     job['favorite_seconds']=round(time.monotonic()-started,3)
     job['state']='sending';path.write_text(json.dumps(job,ensure_ascii=False))
     # A favorite tile sends immediately as WeChat type 47; never paste an image instead.
@@ -401,11 +468,62 @@ def _send_native_sticker(job,path,root,name,is_group):
     job['state']='submitted'
 
 
+def send_native_text(job,path,root,name,is_group,target_id):
+    text=job.get('text')
+    if not isinstance(text,str) or not text.strip() or len(text)>2000:raise ValueError('Invalid text input')
+    job['quote_applied'] = False
+    if job.get('quote_to'):
+        try:
+            root = prepare_quote(job, root)
+        except (ValueError, OSError) as exc:
+            # Optional quoting must not prevent an otherwise valid text reply.
+            run_process(['xdotool','key','--clearmodifiers','Escape'],check=True,timeout=3)
+            job['quote_fallback'] = str(exc)[:180]
+            root = tree()
+    editors=[n for n in walk(root) if n.get('role')=='text' and 'EDITABLE' in (n.get('states') or [])
+             and (n.get('bounds') or {}).get('height',0)>35 and (n.get('bounds') or {}).get('y',0)>200]
+    if len(editors)!=1:raise ValueError('Composer was not uniquely identified')
+    b=editors[0]['bounds']
+    run_process(['/opt/tools/click',str(round(b['x']+b['width']/2)),str(round(b['y']+b['height']/2))],check=True,stdout=subprocess.DEVNULL,timeout=3)
+    run_process(['xdotool','key','--clearmodifiers','ctrl+a'],check=True,timeout=3)
+    if job.get('mentions'):
+        from native_group_mentions import insert_mentions, clear_generated_mentions
+        run_process(['xdotool','key','--clearmodifiers','BackSpace'],check=True,timeout=3)
+        try:
+            if not is_group:raise ValueError('私聊不发送群成员@提醒')
+            job['mentions_applied'] = insert_mentions(job,editors[0])
+        except (ValueError,OSError,subprocess.SubprocessError) as exc:
+            clear_generated_mentions()
+            job['mentions_applied'] = []
+            job['mention_fallback'] = str(exc)[:180]
+    run_process(['xclip','-selection','clipboard'],input=text.encode(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=3)
+    run_process(['xdotool','key','--clearmodifiers','ctrl+v'],check=True,timeout=3)
+    time.sleep(.1)
+    if job.get('mentions_applied'):
+        from native_group_mentions import mention_allowed, clear_generated_mentions
+        if not mention_allowed(target_id):
+            clear_generated_mentions()
+            run_process(['xclip','-selection','clipboard'],input=text.encode(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=3)
+            run_process(['xdotool','key','--clearmodifiers','ctrl+v'],check=True,timeout=3)
+            job['mentions_applied'] = []
+            job['mention_fallback'] = '发送前群聊@成员总开关已关闭'
+    checked=tree()
+    if not selected(checked,name,is_group):raise ValueError('Destination changed before send')
+    if job.get('fast_session_nonce'):
+        from native_fast_turn_v1 import check_guard
+        check_guard(job,path)
+    # Claim and persist the non-idempotent boundary before pressing Return once.
+    job['state']='sending';path.write_text(json.dumps(job,ensure_ascii=False))
+    run_process(['xdotool','key','--clearmodifiers','Return'],check=True,timeout=3)
+    job['state']='submitted'
+    return checked
+
+
 def run_job(path, target_id, name, is_group, root=None):
     job=json.loads(path.read_text())
     if job.get('chat')!=target_id or not 0<=time.time()-job.get('created',0)<30:
         raise ValueError('UI job destination or age is invalid')
-    if job.get('operation') not in ['send_text','send_image','send_sticker','collect_sticker','copy_image','read_image','open_chat','inspect_quote_menu']:
+    if job.get('operation') not in ['send_session','send_text','send_image','send_sticker','collect_sticker','copy_image','read_image','open_chat','inspect_quote_menu']:
         raise ValueError('Unknown UI job operation')
     previews=preview_windows();close_previews(previews)
     if root is None or previews:root=tree()
@@ -428,55 +546,16 @@ def run_job(path, target_id, name, is_group, root=None):
             run_process(['xdotool','key','--clearmodifiers','Escape'],check=True,timeout=3)
     elif job['operation']=='collect_sticker':
         collect_native_sticker(job,path,root,name,is_group)
+    elif job['operation']=='send_session':
+        from native_fast_turn_v1 import run_session
+        run_session(job,path,root,target_id,name,is_group,tree,selected,send_native_text,send_native_sticker,PROFILE,window_signature)
     elif job['operation']=='send_sticker':
         send_native_sticker(job,path,root,name,is_group)
     elif job['operation']=='send_image':
         from native_image_send import send_image
         send_image(job,path,root,name,is_group)
     elif job['operation']=='send_text':
-        text=job.get('text')
-        if not isinstance(text,str) or not text.strip() or len(text)>2000:raise ValueError('Invalid text input')
-        job['quote_applied'] = False
-        if job.get('quote_to'):
-            try:
-                root = prepare_quote(job, root)
-            except (ValueError, OSError) as exc:
-                # Optional quoting must not prevent an otherwise valid text reply.
-                run_process(['xdotool','key','--clearmodifiers','Escape'],check=True,timeout=3)
-                job['quote_fallback'] = str(exc)[:180]
-                root = tree()
-        editors=[n for n in walk(root) if n.get('role')=='text' and 'EDITABLE' in (n.get('states') or [])
-                 and (n.get('bounds') or {}).get('height',0)>35 and (n.get('bounds') or {}).get('y',0)>200]
-        if len(editors)!=1:raise ValueError('Composer was not uniquely identified')
-        b=editors[0]['bounds']
-        run_process(['/opt/tools/click',str(round(b['x']+b['width']/2)),str(round(b['y']+b['height']/2))],check=True,stdout=subprocess.DEVNULL,timeout=3)
-        run_process(['xdotool','key','--clearmodifiers','ctrl+a'],check=True,timeout=3)
-        if job.get('mentions'):
-            from native_group_mentions import insert_mentions, clear_generated_mentions
-            run_process(['xdotool','key','--clearmodifiers','BackSpace'],check=True,timeout=3)
-            try:
-                if not is_group:raise ValueError('私聊不发送群成员@提醒')
-                job['mentions_applied'] = insert_mentions(job,editors[0])
-            except (ValueError,OSError,subprocess.SubprocessError) as exc:
-                clear_generated_mentions()
-                job['mentions_applied'] = []
-                job['mention_fallback'] = str(exc)[:180]
-        run_process(['xclip','-selection','clipboard'],input=text.encode(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=3)
-        run_process(['xdotool','key','--clearmodifiers','ctrl+v'],check=True,timeout=3)
-        time.sleep(.1)
-        if job.get('mentions_applied'):
-            from native_group_mentions import mention_allowed, clear_generated_mentions
-            if not mention_allowed(target_id):
-                clear_generated_mentions()
-                run_process(['xclip','-selection','clipboard'],input=text.encode(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=3)
-                run_process(['xdotool','key','--clearmodifiers','ctrl+v'],check=True,timeout=3)
-                job['mentions_applied'] = []
-                job['mention_fallback'] = '发送前群聊@成员总开关已关闭'
-        if not selected(tree(),name,is_group):raise ValueError('Destination changed before send')
-        # Claim and persist the non-idempotent boundary before pressing Return once.
-        job['state']='sending';path.write_text(json.dumps(job,ensure_ascii=False))
-        run_process(['xdotool','key','--clearmodifiers','Return'],check=True,timeout=3)
-        job['state']='submitted'
+        send_native_text(job,path,root,name,is_group,target_id)
     elif job['operation'] in ('copy_image','read_image'):
         if job['operation']=='read_image':
             sys.path.insert(0,'/data/native-tools')
@@ -599,7 +678,7 @@ def select_chat():
             from native_recovery import run
             run(job_path, target_id)
             return {'ok':True, 'username':target_id, 'skipped':True}
-        SKIP_MESSAGES = (str(job_spec.get('operation','')).startswith('moments_') or job_spec.get('operation') in ('send_sticker','send_image','open_chat') or
+        SKIP_MESSAGES = (str(job_spec.get('operation','')).startswith('moments_') or job_spec.get('operation') in ('send_session','send_sticker','send_image','open_chat') or
                          job_spec.get('operation')=='send_text' and not job_spec.get('quote_to'))
         if str(job_spec.get('operation', '')).startswith('moments_'):
             try:

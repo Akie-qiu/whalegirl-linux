@@ -62,7 +62,9 @@ class NativePopupTests(unittest.TestCase):
         ambiguous=page([0,1,2,2,4])
         pages=iter([page(range(5)),ambiguous,page(range(3,8)),page(range(6,11))])
         path=Path(tempfile.mkdtemp(prefix='sticker-scroll-'))/'job.json'
-        order=[f'{i:032x}' for i in range(1,16)]
+        # Index 8 starts at the nearer top boundary; these pages model that
+        # direction. A 15-item order instead selects the bottom boundary.
+        order=[f'{i:032x}' for i in range(1,21)]
         job={'md5':order[8],'chat':'test'}
         with patch.object(ui,'native_read',return_value={'stickers':[{'md5':v} for v in order]}),\
              patch.object(ui,'tree',side_effect=lambda:next(pages)),\
