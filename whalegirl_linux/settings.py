@@ -24,6 +24,19 @@ class StickerChatPermission(BaseModel):
 MODEL_PROFILE_IDS = ('flash', 'pro', 'responses', 'custom')
 
 
+def validate_model_temperature(value, info):
+    if value is not None:
+        from .upstream.ai_engine import AIEngine
+        if AIEngine._resolve_api_style(info.data.get('api_url', ''), info.data.get('api_style', 'auto')) == 'anthropic' and value > 1:
+            raise ValueError('Anthropic Messages 接口的模型温度需为0～1')
+    return value
+
+
+def reply_temperature(settings, *, proactive=False):
+    """An unset field preserves the existing ordinary/proactive defaults."""
+    return (.65 if proactive else .55) if settings.model_temperature is None else settings.model_temperature
+
+
 class ModelProfile(BaseModel):
     """Non-secret settings for one model card.
 
@@ -35,8 +48,14 @@ class ModelProfile(BaseModel):
     api_style: Literal['auto', 'openai', 'responses', 'anthropic'] = 'auto'
     model: str = Field(default="deepseek-chat", min_length=1, max_length=100)
     max_tokens: int = Field(default=220, ge=32, le=1200)
+    model_temperature: float | None = Field(default=None, ge=0, le=2)
     reasoning_effort: Literal['default', 'low', 'medium', 'high'] = 'default'
     model_stream_enabled: bool = False
+
+    @field_validator('model_temperature')
+    @classmethod
+    def valid_temperature(cls, value, info):
+        return validate_model_temperature(value, info)
 
     @field_validator('api_url')
     @classmethod
@@ -86,12 +105,25 @@ class Settings(BaseModel):
     model_stream_enabled: bool = False
     model: str = Field(default="deepseek-chat", min_length=1, max_length=100)
     max_tokens: int = Field(default=220, ge=32, le=1200)
+    model_temperature: float | None = Field(default=None, ge=0, le=2)
+    @field_validator('model_temperature')
+    @classmethod
+    def valid_temperature(cls, value, info):
+        return validate_model_temperature(value, info)
+
     history_pairs: int = Field(default=5, ge=0, le=15)
     min_send_interval: float = Field(default=6, ge=0, le=120)
     fast_reply_enabled: bool = True
     chat_cooldown: float = Field(default=15, ge=0, le=300)
     poll_interval: float = Field(default=1, ge=0.25, le=60)
     context_messages: int = Field(default=40, ge=10, le=100)
+    fishtalk_enabled: bool = True
+    fishtalk_auto_learn: bool = True
+    fishtalk_reference_level: Literal['subtle', 'normal', 'strong'] = 'normal'
+    fishtalk_check_mode: Literal['off', 'observe', 'light'] = 'light'
+    fishtalk_sample_limit: int = Field(default=400, ge=40, le=1200)
+    fishtalk_sample_days: int = Field(default=14, ge=1, le=90)
+    fishtalk_excluded_sender_ids: list[str] = Field(default_factory=list, max_length=100)
     global_memory: bool = True
     memory_enabled: bool = True
     memory_consolidation_enabled: bool = True
@@ -118,6 +150,10 @@ class Settings(BaseModel):
     persona_density: Literal['low','normal','high'] = 'low'
     followup_questions: Literal['low','normal','high'] = 'low'
     reply_length: Literal['short','normal','detailed'] = 'short'
+    girlish_tone: Literal['off','natural','bright','soft'] = 'natural'
+    chat_short_replies_enabled: bool = True
+    chat_short_reply_sentences: int = Field(default=2, ge=1, le=5)
+    chat_short_reply_chars: int = Field(default=48, ge=10, le=200)
     reply_warmth: Literal['low','normal','high'] = 'high'
     banter_level: Literal['low','normal','high'] = 'normal'
     play_along: Literal['low','normal','high'] = 'high'
@@ -128,7 +164,8 @@ class Settings(BaseModel):
     affection_daily_gain: int = Field(default=4, ge=0, le=20)
     affection_daily_loss: int = Field(default=6, ge=0, le=20)
     affection_cooldown_seconds: int = Field(default=600, ge=60, le=86400)
-    affection_private_style: Literal['warm','close'] = 'close'
+    affection_private_style: Literal['warm','close','unreserved'] = 'close'
+    private_unreserved_enabled: bool = False
     owner_ids: list[str] = Field(default_factory=list, max_length=20)
     sticker_candidate_limit: int = Field(default=8, ge=4, le=20)
     sticker_cooldown_seconds: int = Field(default=180, ge=0, le=3600)
@@ -145,8 +182,7 @@ class Settings(BaseModel):
     sticker_cache_cleanup_enabled: bool = True
     sticker_failed_cache_hours: int = Field(default=24, ge=1, le=168)
     chat_habits_enabled: bool = True
-    # Accepted from older configuration files; there is no alternate engine.
-    autonomy_enabled: bool = True
+    autonomy_enabled: bool = False
     experience_growth_enabled: bool = True
     debounce_single_seconds: float = Field(default=0.65, ge=0, le=3)
     debounce_burst_seconds: float = Field(default=1.6, ge=0, le=5)
@@ -271,11 +307,6 @@ class Settings(BaseModel):
     tieba_archive_limit_mb: int = Field(default=512, ge=64, le=4096)
     expected_wechat_version: Literal["4.1.0.16", "4.1.1.8"] = "4.1.0.16"
 
-    @field_validator('autonomy_enabled', mode='before')
-    @classmethod
-    def unified_chat_engine(cls, value):
-        return True
-
     @field_validator("allowed_chat_ids", "keywords", "trigger_only_chat_ids", "interest_keywords", "moments_topics", "moments_friend_ids",
                      "tieba_forums", "tieba_interests", "tieba_share_chat_ids", "growth_interests",
                      "proactive_chat_ids", "proactive_strict_chat_ids", "owner_ids")
@@ -372,6 +403,7 @@ class Config:
             'api_style': settings.api_style,
             'model': settings.model,
             'max_tokens': settings.max_tokens,
+            'model_temperature': settings.model_temperature,
             'reasoning_effort': settings.reasoning_effort,
             'model_stream_enabled': settings.model_stream_enabled,
         })
@@ -546,7 +578,6 @@ class Config:
         private_write(self.directory / 'tieba-credentials.enc', self.fernet.encrypt(json.dumps(values).encode()).decode())
 
     def save(self, settings: Settings, api_key: str = "", *, profile_id: str | None = None):
-        settings=settings.model_copy(update={'autonomy_enabled':True})
         if settings.enabled and not settings.allowed_chat_ids:
             raise ValueError("先选择允许回复的会话")
         profile_id = profile_id or self.active_model_profile

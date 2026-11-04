@@ -623,7 +623,18 @@ def visible_chat(root, name):
                and (normal(n.get('name')) == name or normal(n.get('name')).startswith(name + ' '))]
     if len(matches) > 1:
         raise ValueError('Target chat is not uniquely visible in the native chat list')
-    return lists[0], matches[0] if matches else None
+    if not matches:
+        return lists[0], None
+    # Qt exposes partially recycled rows outside the viewport too. Never click
+    # their full geometric center: it can be in the search box or another pane.
+    viewport=lists[0].get('bounds') or {}
+    row=matches[0];bounds=row.get('bounds') or {}
+    left=max(bounds.get('x',0),viewport.get('x',0));top=max(bounds.get('y',0),viewport.get('y',0))
+    right=min(bounds.get('x',0)+bounds.get('width',0),viewport.get('x',0)+viewport.get('width',0))
+    bottom=min(bounds.get('y',0)+bounds.get('height',0),viewport.get('y',0)+viewport.get('height',0))
+    if right-left<12 or bottom-top<12:
+        return lists[0],None
+    return lists[0],{**row,'bounds':{'x':left,'y':top,'width':right-left,'height':bottom-top}}
 
 
 def locate_chat(root, name):
@@ -635,20 +646,32 @@ def locate_chat(root, name):
     if not bounds.get('width') or not bounds.get('height'):
         raise ValueError('Native chat list has no usable bounds')
     x, y = round(bounds['x'] + bounds['width'] / 2), round(bounds['y'] + bounds['height'] / 2)
-    run_process(['xdotool', 'mousemove', str(x), str(y), 'click', '--repeat', '80', '--delay', '1', '4'],
-                check=True, timeout=3)
-    previous = None
-    for _ in range(18):
-        time.sleep(.1)
-        listing, candidate = visible_chat(tree(), name)
-        if candidate:
-            return candidate
-        signature = tuple(normal(n.get('name')) for n in listing.get('children') or [] if n.get('role') == 'list-item')
-        if signature == previous:
-            break
-        previous = signature
-        run_process(['xdotool', 'mousemove', str(x), str(y), 'click', '--repeat', '4', '--delay', '20', '5'],
-                    check=True, timeout=3)
+    def signature(value):
+        return tuple((normal(n.get('name')),(n.get('bounds') or {}).get('y'),
+                      (n.get('bounds') or {}).get('height'))
+                     for n in value.get('children') or [] if n.get('role')=='list-item')
+    started=time.monotonic()
+    # A burst of 80 wheel ticks at 1ms was coalesced by the pinned Qt client.
+    # It often stopped halfway up, then the old search only visited older rows.
+    # Observe paced progress in both directions; one unchanged snapshot can be
+    # an animation delay, and does not establish a boundary.
+    for direction,rounds,steps in (('4',10,'10'),('5',20,'4')):
+        previous=signature(listing);stable=0
+        for _ in range(rounds):
+            if time.monotonic()-started>12:
+                raise ValueError('微信会话定位超时，尚未发送')
+            run_process(['xdotool','mousemove',str(x),str(y),'click','--repeat',steps,'--delay','25',direction],
+                        check=True,timeout=3)
+            PROFILE['chat_scrolls']=PROFILE.get('chat_scrolls',0)+1
+            time.sleep(.12)
+            listing,candidate=visible_chat(tree(),name)
+            if candidate:
+                PROFILE['chat_search_seconds']=time.monotonic()-started
+                return candidate
+            current=signature(listing)
+            stable=stable+1 if current==previous else 0
+            if stable>=2:break
+            previous=current
     raise ValueError('遍历微信会话列表后仍未找到目标会话，尚未发送')
 
 

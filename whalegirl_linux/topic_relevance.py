@@ -134,10 +134,10 @@ def select_topic_history(rows, batch, trigger='', *, now=None, limit=8, wake_wor
         return eligible[-limit:], 'live_group'
     if trigger == 'pat':
         eligible = [row for row in history if 0 <= now - float(row.get('timestamp') or 0) <= 180]
-        return eligible[-limit:], 'pat_context'
+        return eligible[-min(limit, 6):], 'pat_context'
 
     active = [row for row in history if 0 <= now - float(row.get('timestamp') or 0) <= 600]
     related = [row for row in active if related_topic(
         query, row.get('description') or row.get('content') or ''
     )]
-    return related[-limit:], 'topic_match' if related else 'new_topic'
+    return related[-min(limit, 6):], 'topic_match' if related else 'new_topic'

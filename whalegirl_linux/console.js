@@ -51,7 +51,6 @@ async function action(button, fn) {
   finally { button.disabled = false; }
 }
 function populateSettings() {
-  if($('quick-affection-enabled'))$('quick-affection-enabled').checked=!!cfg.affection_enabled;
   selected = new Set(cfg.allowed_chat_ids);
   const ids = new Set([...cfg.allowed_chat_ids, ...(cfg.trigger_only_chat_ids || []), ...chats.filter(c => c.isGroup).map(c => c.id)]);
   modes = new Map([...ids].map(id => [id, (cfg.trigger_only_chat_ids || []).includes(id) || (!cfg.natural_group_replies && cfg.require_mention_or_keyword) ? 'trigger' : 'natural']));
@@ -99,18 +98,20 @@ const MODEL_PROFILE_IDS = Object.keys(MODEL_PRESETS);
 function normalizeModelUrl(value) { return String(value || '').trim().replace(/\/$/, ''); }
 function modelProfileDefaults(id) {
   const preset = MODEL_PRESETS[id] || MODEL_PRESETS.custom;
-  return { api_url: preset.url, api_style: preset.style, model: preset.model, max_tokens: 220,
+  return { api_url: preset.url, api_style: preset.style, model: preset.model, max_tokens: 220, model_temperature:null,
     reasoning_effort: 'default', model_stream_enabled: false, api_key_configured: false };
 }
 function normalizedModelProfile(id, value = {}) {
   return { ...modelProfileDefaults(id), ...(value || {}), api_url: normalizeModelUrl(value?.api_url ?? modelProfileDefaults(id).api_url),
     api_style: value?.api_style || modelProfileDefaults(id).api_style, model: String(value?.model ?? modelProfileDefaults(id).model),
     max_tokens: Number(value?.max_tokens || 220), reasoning_effort: value?.reasoning_effort || 'default',
+    model_temperature:value?.model_temperature==null?null:Number(value.model_temperature),
     model_stream_enabled: value?.model_stream_enabled ?? false, api_key_configured: !!value?.api_key_configured };
 }
 function currentModelDraft() {
   return { api_url: normalizeModelUrl($('api-url').value), api_style: $('api-style').value || 'auto', model: $('model').value.trim(),
     max_tokens: Number($('max-tokens').value || 220), reasoning_effort: $('reasoning-effort').value || 'default',
+    model_temperature:$('model-temperature').value.trim()===''?null:Number($('model-temperature').value),
     model_stream_enabled: $('model-stream-enabled').checked, api_key_configured: !!modelProfiles[activeModelProfile]?.api_key_configured };
 }
 function rememberCurrentModelDraft() {
@@ -123,6 +124,7 @@ function loadModelProfile(id) {
   const profile = modelProfiles[activeModelProfile] = normalizedModelProfile(activeModelProfile, modelProfiles[activeModelProfile]);
   $('api-url').value = profile.api_url; $('api-style').value = profile.api_style; $('model').value = profile.model;
   $('max-tokens').value = profile.max_tokens; $('reasoning-effort').value = profile.reasoning_effort;
+  $('model-temperature').value = profile.model_temperature ?? '';
   $('model-stream-enabled').checked = !!profile.model_stream_enabled;
   $('api-key').value = Object.prototype.hasOwnProperty.call(draftModelKeys, activeModelProfile) ? draftModelKeys[activeModelProfile] : '';
   text('key-status', profile.api_key_configured ? '服务器已保存此模型卡片的 API Key；留空不会覆盖。' : '此模型卡片尚未配置 API Key。');
@@ -143,6 +145,10 @@ function syncModelPreset() {
   text('api-style-hint', responses ?
     '使用 Responses 协议；此卡片单独保存自己的地址、密钥和模型名。':
     '支持 HTTP / HTTPS 中转，可填 /v1 基础地址或完整接口地址；每张模型卡片分别保存。');
+  const anthropic=$('api-style').value==='anthropic' || ($('api-style').value==='auto' && /anthropic|\/messages\/?$/i.test(normalizeModelUrl($('api-url').value)));
+  $('model-temperature').max=anthropic?'1':'2';
+  text('model-temperature-hint',responses?'当前 Responses 接口不发送温度参数；此值可保存，但不会在该协议下生效。':
+    '普通回复与主动聊天共用此值；'+(anthropic?'此接口支持0～1。':'范围0～2，较高时表达通常更多样。')+'留空沿用原默认：普通0.55、主动0.65。');
 }
 for (const button of document.querySelectorAll('[data-model-preset]')) {
   button.addEventListener('click', () => {
@@ -151,7 +157,7 @@ for (const button of document.querySelectorAll('[data-model-preset]')) {
     text('test-result', '已切换到独立模型卡片；保存后启用该卡片的地址、Key 和模型名。');
   });
 }
-for (const id of ['api-url','model','api-style','max-tokens','reasoning-effort','model-stream-enabled']) {
+for (const id of ['api-url','model','api-style','max-tokens','model-temperature','reasoning-effort','model-stream-enabled']) {
   const markModelDraft = () => { rememberCurrentModelDraft(); syncModelPreset(); text('test-result','有未保存的模型修改，点击“保存模型”后生效'); };
   $(id).addEventListener('input', markModelDraft); $(id).addEventListener('change', markModelDraft);
 }
@@ -419,11 +425,13 @@ $('save-chats').onclick = () => action($('save-chats'), async () => {
   text('chat-save-note', '会话设置已保存 · ' + new Date().toLocaleTimeString('zh-CN')); notice('会话与唤醒设置已保存。');
 });
 $('save-model').onclick = () => action($('save-model'), async () => {
+  if($('model-temperature').value!=='' && !$('model-temperature').checkValidity())throw new Error('请填写当前接口支持范围内的模型温度，或留空沿用默认');
   rememberCurrentModelDraft();
   const response = await api('model-profiles', 'POST', {
     profile_id: activeModelProfile,
     profile: { api_url: modelProfiles[activeModelProfile].api_url, api_style: modelProfiles[activeModelProfile].api_style,
       model: modelProfiles[activeModelProfile].model, max_tokens: modelProfiles[activeModelProfile].max_tokens,
+      model_temperature:modelProfiles[activeModelProfile].model_temperature,
       reasoning_effort: modelProfiles[activeModelProfile].reasoning_effort,
       model_stream_enabled: modelProfiles[activeModelProfile].model_stream_enabled },
     api_key: draftModelKeys[activeModelProfile] || '', activate: true
@@ -438,14 +446,60 @@ $('save-safety').onclick = () => action($('save-safety'), async () => {
   await saveSubset(values);notice('本地运行保护设置已保存。');
 });
 $('save-limits').onclick = () => action($('save-limits'), async () => {
-  const values={safety_send_limits_enabled:$('safety-send-limits-enabled').checked};
-  for(const name of ['safety_per_minute','safety_per_hour','safety_chat_per_hour','safety_per_day']) values[name]=Number($(name.replaceAll('_','-')).value);
-  await saveSubset(values);text('limits-save-note','已保存 · '+new Date().toLocaleTimeString('zh-CN'));notice('发送上限已保存。');
+  for (const input of $('send-limits-panel').querySelectorAll('input, select')) {
+    if (!input.disabled && !input.checkValidity()) {
+      input.reportValidity?.();
+      throw new Error('请检查「发送与限制」中的数值范围');
+    }
+  }
+  const values = {
+    safety_send_limits_enabled: $('safety-send-limits-enabled').checked,
+    safety_enabled: $('safety-enabled').checked,
+    safety_duplicate_seconds: Number($('safety-duplicate-seconds').value),
+    chat_cooldown: Number($('cooldown').value),
+    min_send_interval: Number($('send-interval').value),
+  };
+  if ($('chat-short-replies-enabled')) {
+    values.chat_short_replies_enabled = $('chat-short-replies-enabled').checked;
+    if ($('chat-short-replies-enabled').checked) {
+      values.chat_short_reply_sentences = Number($('chat-short-reply-sentences').value);
+      values.chat_short_reply_chars = Number($('chat-short-reply-chars').value);
+    }
+  }
+  if ($('style-sticker-cooldown')) values.sticker_cooldown_seconds = Number($('style-sticker-cooldown').value);
+  for (const [id, key] of [
+    ['reply-max-parts', 'reply_max_parts'],
+    ['sticker-max-per-reply', 'sticker_max_per_reply'],
+    ['reply-part-interval', 'reply_part_interval'],
+    ['debounce-single-seconds', 'debounce_single_seconds'],
+    ['debounce-burst-seconds', 'debounce_burst_seconds'],
+    ['debounce-max-seconds', 'debounce_max_seconds'],
+    ['proactive-per-day', 'proactive_per_day'],
+    ['proactive-chat-per-day', 'proactive_chat_per_day'],
+    ['proactive-cooldown-minutes', 'proactive_cooldown_minutes'],
+    ['quiet-start-hour', 'quiet_start_hour'],
+    ['quiet-end-hour', 'quiet_end_hour'],
+    ['quiet-default-minutes', 'quiet_default_minutes'],
+    ['safety-per-minute', 'safety_per_minute'],
+    ['safety-per-hour', 'safety_per_hour'],
+    ['safety-chat-per-hour', 'safety_chat_per_hour'],
+    ['safety-per-day', 'safety_per_day'],
+    ['text-per-hour', 'text_per_hour'],
+    ['text-per-day', 'text_per_day'],
+    ['sticker-per-hour', 'sticker_per_hour'],
+    ['sticker-per-day', 'sticker_per_day'],
+  ]) {
+    if ($(id)) values[key] = Number($(id).value);
+  }
+  await saveSubset(values);
+  populateSettings();
+  window.dispatchEvent(new CustomEvent('whalegirl-panel-saved', { detail: 'send-limits-panel' }));
+  text('limits-save-note', '已保存 · ' + new Date().toLocaleTimeString('zh-CN'));
+  notice('全部发送、拆条、冷却与额度限制已统一保存！');
 });
 $('safety-check').onclick = () => action($('safety-check'), async () => { const result=await api('safety/check','POST');await update();notice(result.check_error || (result.hold_reason?'检测到需要人工处理的提示，已停止发送。':'客户端提示检查完成；结果不代表平台风控安全。'),!!result.check_error || !!result.hold_reason); });
 $('safety-resume').onclick = () => action($('safety-resume'), async () => { await api('safety/resume','POST');await update();notice('已恢复发送；历史跳过消息不会补发，现有发送限额继续生效。'); });
 $('quick-enabled').onchange = () => action($('quick-enabled'), async () => { try { await saveSubset({ enabled: $('quick-enabled').checked }); notice(cfg.enabled ? '自动回复已开启。' : '自动回复已关闭。'); } catch (error) { $('quick-enabled').checked = cfg.enabled; throw error; } });
-$('quick-affection-enabled')?.addEventListener('change',event=>window.affection?.toggle(event.currentTarget));
 $('test-model').onclick = () => action($('test-model'), async () => {
   text('test-result', '正在测试已保存的模型…');
   const result = await api('model/test', 'POST');
@@ -459,15 +513,189 @@ $('login').onclick = () => action($('login'), async () => { text('login-message'
 for (const link of document.querySelectorAll('nav a')) link.onclick = () => { for (const item of document.querySelectorAll('nav a')) item.classList.toggle('active', item === link); };
 if (token) connect().catch(error => { text('auth-error', error.message); $('auth').hidden = false; $('dashboard').hidden = true; });
 
+function buildUnifiedSendLimitsPanel() {
+  const panel = $('send-limits-panel');
+  if (!panel || panel.dataset.unified === 'true') return;
+  panel.dataset.unified = 'true';
+  const el = (tag, cls, txt) => { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
+  const top = panel.querySelector('.section-top');
+  const h2 = top?.querySelector('h2'); if (h2) h2.textContent = '发送与频次限制';
+  const idx = top?.querySelector('.section-index'); if (idx) idx.textContent = 'SENDING / UNIFIED LIMITS CENTER';
+  const desc = top?.querySelector('.muted');
+  if (desc) desc.textContent = '单轮拆条上限、短句字数、回复冷却、收发缓冲、账号总发送上限、文字/表情独立额度与防刷屏保护，全部集中在此处统一调节。';
+
+  const limitsToggleLabel = $('safety-send-limits-enabled')?.closest('label');
+  const accountGrid = panel.querySelector('.settings-grid');
+  const sendLimitCounts = $('send-limit-counts');
+  const sendLimitsHint = $('send-limits-hint');
+  const footer = panel.querySelector('.panel-footer');
+  if ($('save-limits')) text('save-limits', '保存全部发送与限制设置');
+
+  // Card 1: Per-turn bubble & length limits
+  const card1 = el('section', 'record span-all');
+  card1.append(
+    el('h3', '', '💬 一、单轮拆条与篇幅限制（防刷屏太吵）'),
+    el('p', 'hint', '控制每次回复最多拆成几条消息气泡、单轮闲聊目标句数与字数，以及同轮多条消息之间的发送间隔。')
+  );
+  const presetBar = el('div', 'chat-toolbar');
+  const applyBurstPreset = (parts, sentences, chars, interval, labelText) => {
+    if ($('reply-max-parts')) $('reply-max-parts').value = parts;
+    if ($('sticker-max-per-reply')) $('sticker-max-per-reply').value = 1;
+    if ($('reply-part-interval')) $('reply-part-interval').value = interval;
+    if ($('chat-short-replies-enabled')) {
+      $('chat-short-replies-enabled').checked = true;
+      $('chat-short-replies-enabled').dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    if ($('chat-short-reply-sentences')) $('chat-short-reply-sentences').value = sentences;
+    if ($('chat-short-reply-chars')) $('chat-short-reply-chars').value = chars;
+    if ($('reply-max-parts')) $('reply-max-parts').dispatchEvent(new Event('input', { bubbles: true }));
+    text('limits-save-note', `已套用「${labelText}」档位，点击右下角保存后生效`);
+  };
+  for (const [title, parts, sentences, chars, interval, shortName] of [
+    ['🟢 清爽自然（推荐：最多3条 · 2句/56字 · 间隔0.9s）', 3, 2, 56, 0.9, '清爽自然'],
+    ['🌿 极简安静（最多2条 · 1～2句/38字 · 间隔1.0s）', 2, 2, 38, 1.0, '极简安静'],
+    ['✨ 活泼连发（最多4条 · 3句/75字 · 间隔0.7s）', 4, 3, 75, 0.7, '活泼连发'],
+  ]) {
+    const btn = el('button', 'secondary', title);
+    btn.type = 'button';
+    btn.onclick = () => applyBurstPreset(parts, sentences, chars, interval, shortName);
+    presetBar.append(btn);
+  }
+  const grid1 = el('div', 'settings-grid');
+  for (const id of ['reply-max-parts', 'sticker-max-per-reply', 'reply-part-interval', 'chat-short-replies-enabled', 'chat-short-reply-sentences', 'chat-short-reply-chars']) {
+    const lbl = $(id)?.closest('label');
+    if (lbl) grid1.append(lbl);
+  }
+  const shortSec = $('expression-short-controls');
+  if (shortSec) {
+    shortSec.replaceChildren(
+      el('h3', '', '短句与单轮条数限制'),
+      el('p', 'hint', '短句字数、句数与每轮最多发送条数已统一收纳至「发送与限制」板块，方便集中调节。')
+    );
+    const jump = el('a', 'expression-link', '↥ 前往「发送与限制」统一调整条数、字数与间隔 →');
+    jump.href = '#send-limits-panel';
+    shortSec.append(jump);
+  }
+  card1.append(presetBar, grid1);
+
+  // Card 2: Cooldowns & debounce buffers
+  const card2 = el('section', 'record span-all');
+  card2.append(
+    el('h3', '', '⏱️ 二、回复冷却与收发缓冲（控制两轮间隔与等待合并）'),
+    el('p', 'hint', '控制同一会话或全局两轮回复之间的最短冷却间隔，以及对方连续打字时的合并等待缓冲（填 0 表示不额外等待）。')
+  );
+  const grid2 = el('div', 'settings-grid');
+  for (const [id, fallbackTitle] of [['cooldown', '同一会话最短回复间隔 / 秒'], ['send-interval', '所有会话两轮回复最短间隔 / 秒']]) {
+    const input = $(id);
+    if (input) {
+      const oldLbl = document.querySelector(`label[for="${id}"]`);
+      const titleText = oldLbl ? oldLbl.textContent : fallbackTitle;
+      oldLbl?.remove();
+      const wrap = el('label');
+      wrap.setAttribute('for', id);
+      const title = el('span', '', titleText);
+      title.dataset.controlLabel = id;
+      wrap.append(title, input);
+      grid2.append(wrap);
+    }
+  }
+  for (const id of ['style-sticker-cooldown', 'debounce-single-seconds', 'debounce-burst-seconds', 'debounce-max-seconds']) {
+    const lbl = $(id)?.closest('label');
+    if (lbl) grid2.append(lbl);
+  }
+  card2.append(grid2);
+  if ($('timing-detail')) card2.append($('timing-detail'));
+
+  // Card 3: Account total limits & text/sticker independent quotas
+  const card3 = el('section', 'record span-all');
+  card3.append(
+    el('h3', '', '📊 三、账号总发送上限与文字/表情独立额度（填 0 表示不限制）'),
+    el('p', 'hint', '直接控制机器人的总发送条数及文字、原生表情独立配额。表情不占文字额度，两类均计入账号总上限。')
+  );
+  if (limitsToggleLabel) card3.append(limitsToggleLabel);
+  if (accountGrid) {
+    for (const id of ['text-per-hour', 'text-per-day', 'sticker-per-hour', 'sticker-per-day']) {
+      const lbl = $(id)?.closest('label');
+      if (lbl) accountGrid.append(lbl);
+    }
+    card3.append(accountGrid);
+  }
+  if (sendLimitCounts) card3.append(sendLimitCounts);
+  if ($('category-counts')) card3.append($('category-counts'));
+  if (sendLimitsHint) card3.append(sendLimitsHint);
+
+  // Card 4: Proactive & quiet-hour limits
+  const card4 = el('section', 'record span-all');
+  card4.append(
+    el('h3', '', '🌙 四、主动开聊频次与安静免打扰限制'),
+    el('p', 'hint', '控制每天主动找人开聊的次数上限、会话冷却间隔，以及夜间减少无唤醒插话的安静时段（开始和结束相同表示关闭夜间安静）。')
+  );
+  const grid4 = el('div', 'settings-grid');
+  for (const id of ['proactive-per-day', 'proactive-chat-per-day', 'proactive-cooldown-minutes', 'quiet-start-hour', 'quiet-end-hour', 'quiet-default-minutes']) {
+    const lbl = $(id)?.closest('label');
+    if (lbl) grid4.append(lbl);
+  }
+  card4.append(grid4);
+
+  // Card 5: Local safety guards & duplicate filter
+  const card5 = el('section', 'record span-all');
+  const card5Top = el('div', 'section-top');
+  const card5Copy = el('div');
+  card5Copy.append(el('h3', '', '🛡️ 五、本地运行保护与重复拦截'), el('p', 'hint', '本地防刷屏总开关、相同回复拦截窗口与微信客户端异常检测。'));
+  card5Top.append(card5Copy);
+  if ($('safety-status')) card5Top.append($('safety-status'));
+  card5.append(card5Top);
+  const grid5 = el('div', 'settings-grid');
+  for (const id of ['safety-enabled', 'safety-duplicate-seconds']) {
+    const lbl = $(id)?.closest('label');
+    if (lbl) grid5.append(lbl);
+  }
+  card5.append(grid5);
+  for (const id of ['safety-counts', 'safety-reason', 'safety-check-status']) {
+    if ($(id)) card5.append($(id));
+  }
+  const safetyBtnRow = el('div', 'row');
+  if ($('safety-check')) safetyBtnRow.append($('safety-check'));
+  if ($('safety-resume')) safetyBtnRow.append($('safety-resume'));
+  card5.append(safetyBtnRow);
+  if ($('safety-events')) card5.append($('safety-events'));
+
+  panel.replaceChildren();
+  if (top) panel.append(top);
+  panel.append(card1, card2, card3, card4, card5);
+  if (footer) panel.append(footer);
+
+  // Clean up emptied legacy panels & nav links, and add jump links in habits/proactive
+  for (const oldPanelId of ['timing-panel', 'safety-panel', 'category-limits-panel']) {
+    const oldPanel = $(oldPanelId);
+    if (oldPanel) { oldPanel.hidden = true; oldPanel.remove(); }
+  }
+  for (const href of ['#safety-panel', '#category-limits-panel', '#timing-panel']) {
+    const link = document.querySelector(`nav a[href="${href}"]`);
+    if (link) { link.hidden = true; link.remove(); }
+  }
+  for (const targetPanelId of ['habits-panel', 'proactive-panel']) {
+    const tp = $(targetPanelId);
+    if (tp) {
+      const banner = el('p', 'hint');
+      const a = el('a', 'expression-link', '↥ 单轮拆条条数、缓冲间隔、安静时段与发送额度已统一集中到「发送与限制」板块 →');
+      a.href = '#send-limits-panel';
+      banner.append(a);
+      tp.querySelector('.section-top')?.after(banner);
+    }
+  }
+}
+
 // Run after the feature scripts have appended their navigation links. Move the
 // existing anchors so feature-specific click handlers and deep links survive.
 document.addEventListener('DOMContentLoaded', () => {
+  buildUnifiedSendLimitsPanel();
   document.body.classList.add('tabbed-workspace');
   const mainEl=document.querySelector('main'),contentGrid=document.querySelector('.content-grid');
   const sidebar=document.querySelector('.sidebar'),nav=sidebar.querySelector('nav');
   const groups=[
-    ['connection','连接与会话','🏠','概览连接',['#login-panel','#chats','#send-limits-panel','#safety-panel']],
-    ['persona','角色与记忆','🐋','角色记忆',['#persona','#habits-panel','#memory-panel','#affection-panel','#category-limits-panel']],
+    ['connection','连接与会话','🏠','概览连接',['#login-panel','#chats','#send-limits-panel']],
+    ['persona','角色与记忆','🐋','角色记忆',['#persona','#expression-panel','#habits-panel','#memory-panel','#affection-panel']],
     ['interaction','互动与内容','✨','互动内容',['#proactive-panel','#sticker-library-panel','#sticker-profile-panel','#images-panel','#moments-panel','#tieba-panel']],
     ['model','模型与用量','🧠','模型搜索',['#model-panel','#web-search-panel','#token-usage-panel']],
     ['activity','日志与记录','📋','消息日志',['#records-panel','#inbox-panel','#stability-panel']]
@@ -575,7 +803,8 @@ document.addEventListener('DOMContentLoaded', () => {
     'model-panel':['save-model'],
     'timing-panel':['save-timing'],
     'web-search-panel':['save-web-search'],
-    'habits-panel':['save-style-settings','save-context-strategy','save-habits'],
+    'expression-panel':['save-style-settings'],
+    'habits-panel':['save-context-strategy','save-habits'],
     'proactive-panel':['save-proactive'],
     'category-limits-panel':['save-category-limits'],
     'learning-panel':['learning-save'],
@@ -589,13 +818,12 @@ document.addEventListener('DOMContentLoaded', () => {
   const ignoreDirtyIds=new Set([
     'chat-search','records-scope','learning-query','learning-filter-chat','learning-filter-kind','learning-filter-state',
     'memory-search','memory-show-archived','memory-filter-chat','persona-live-chat','inbox-chat','inbox-query',
-    'hub-style-chat','hub-chat','hub-person','hub-tier','hub-status','hub-kind','hub-query',
-    'quick-enabled','quick-affection-enabled','affection-enabled','pc-search','autonomy-enabled'
+    'quick-enabled','pc-search','autonomy-enabled','expression-view-mode'
   ]);
   contentGrid.addEventListener('input',markDirty);
   contentGrid.addEventListener('change',markDirty);
   function markDirty(e){
-    const el=e.target;if(!el||ignoreDirtyIds.has(el.id)||el.type==='search'||el.closest('dialog'))return;
+    const el=e.target;if(!el||ignoreDirtyIds.has(el.id)||el.type==='search')return;
     const panel=el.closest('.panel');if(!panel||!panelSaveMap[panel.id])return;
     dirtyPanelId=panel.id;
     const h2=panel.querySelector('h2')?.textContent?.trim()||'当前面板';
@@ -620,7 +848,7 @@ document.addEventListener('DOMContentLoaded', () => {
   toggle.onclick=()=>{const open=sidebar.classList.toggle('nav-expanded');toggle.setAttribute('aria-expanded',String(open));toggle.setAttribute('aria-label',open?'收起功能导航':'展开功能导航');};
   function active(rawHref){
     let href=rawHref||'#overview';
-    if(href==='#timing-panel')href='#model-panel';
+    if(['#timing-panel','#safety-panel','#category-limits-panel'].includes(href))href='#send-limits-panel';
     const target=links.find(a=>a.getAttribute('href')===href)||overview;
     const resolvedHref=target?.getAttribute('href')||'#overview';
     updating=true;

@@ -8,7 +8,6 @@ import time
 
 sys.path.insert(0, '/data/native-tools')
 import chat_select_linux as ui
-import native_group_mentions as native
 from a11y_safe import A11yBus, DESKTOP
 
 
@@ -47,45 +46,16 @@ def main():
         except Exception:pass
     visit(DESKTOP)
     if values!=['']:raise RuntimeError('Existing draft preserved; no typing')
-    roster=ui.native_read('/members',chat=chat['id']).get('members',[])
-    alias=None
-    aliases={}
-    for member in roster:
-        for value in member.get('aliases',[])+[member.get('name','')]:
-            if value:aliases.setdefault(ui.normal(value),[]).append(member)
-    for member in roster:
-        for value in member.get('aliases',[])+[member.get('name','')]:
-            if value and len(aliases.get(ui.normal(value),[]))==1:
-                alias=value;break
-        if alias:break
-    if not alias:raise RuntimeError('Current group has no uniquely searchable member')
+    def identity(n):return (n.get('role'),n.get('name'),json.dumps(n.get('bounds'),sort_keys=True))
+    previous = {identity(n) for n in ui.walk(root)}
     try:
         ui.click_node(editors[0])
         ui.run_process(['xdotool','key','--clearmodifiers','at'],check=True,timeout=3)
-        ui.run_process(['xclip','-selection','clipboard'],input=alias.encode(),stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL,check=True,timeout=3)
-        ui.run_process(['xdotool','key','--clearmodifiers','ctrl+v'],check=True,timeout=3)
-        end=time.monotonic()+2
-        selected_target=None
-        observed=[]
-        while time.monotonic()<end:
-            current=ui.tree()
-            rows=native.picker_rows(current,editors[0])
-            observed=[len(n.get('name','')) for n in rows]
-            matches=[n for n in rows if ui.normal(n.get('name'))==ui.normal(alias)]
-            if len(matches)==1:
-                selected_target=matches[0];break
-            time.sleep(.06)
-        if selected_target is None:raise RuntimeError('Native member picker did not expose the unique roster target; observed_lengths='+','.join(map(str,observed)))
-        ui.click_node(selected_target)
         time.sleep(.2)
-        current=ui.tree()
-        still_listed=any(ui.normal(n.get('name'))==ui.normal(alias)
-                         for n in native.picker_rows(current,editors[0]))
-        print(json.dumps({'roster_members':len(roster),'unique_target_present':True,
-            'selected_from_native_picker':not still_listed,
-            'composer_unique':len([n for n in ui.walk(current) if n.get('role')=='text' and
-                'EDITABLE' in n.get('states',[]) and n.get('bounds')==editors[0]['bounds']])==1}))
+        nodes = [n for n in ui.walk(ui.tree()) if identity(n) not in previous]
+        print(json.dumps({'new_controls':[{'role':n.get('role'),'name_length':len(n.get('name','')),
+            'is_target':n.get('name')=='飘·渺','bounds':n.get('bounds'),'states':n.get('states'),
+            'child_roles':[c.get('role') for c in n.get('children',[])]} for n in nodes][:80]}))
     finally:
         ui.run_process(['xdotool','key','--clearmodifiers','Escape','BackSpace'],check=True,timeout=3)
 

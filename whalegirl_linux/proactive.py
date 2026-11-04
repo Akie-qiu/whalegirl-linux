@@ -19,6 +19,7 @@ from .resources import native_pressure
 from .context import build_context, vision_reply
 from .search import DeepSeekSearch, search_static_prompt
 from .proactive_tools import resolve_tools
+from .settings import reply_temperature
 
 BEIJING = timezone(timedelta(hours=8))
 
@@ -280,8 +281,9 @@ class ProactiveService:
             unused, image_context = r.images.tools.context(
                 first, [first], query=query, base_candidates=base_image_catalog)
             base_image_ids = {item['id'] for item in base_image_catalog}
-            used = set(self.store.used_stickers(s.account_id, chat, s.sticker_cooldown_seconds)) | r.sticker_library.excluded(s.account_id, chat)
-            choices = r.stickers.candidates(query, s.sticker_candidate_limit, used) if s.stickers_enabled else {}
+            used = r.sticker_library.excluded(s.account_id, chat)
+            history = self.store.sticker_selection_history(s.account_id, chat, s.sticker_cooldown_seconds) if s.stickers_enabled else {}
+            choices = r.stickers.candidates(query, s.sticker_candidate_limit, used, history) if s.stickers_enabled else {}
             mentions_enabled = s.proactive_mentions_enabled and s.group_mentions_enabled and chat.endswith('@chatroom')
             mentions = {}
             if mentions_enabled:
@@ -293,12 +295,22 @@ class ProactiveService:
                     pass
             source_ids = {m['key'] for m in recent} | {'memory:'+str(i) for i in recall.get('ids', [])+recall.get('joke_ids', [])}
             tieba_evidence = {}
-            from .natural_chat import base_prompt as natural_base_prompt, reply_protocol
-            system=(natural_base_prompt(s,r.styles.get_active().system_prompt)+memory_static+search_static_prompt(s)
-                +r.affection.static_prompt(first,s,include_venue=False)+r.sticker_library.static_prompt(s)
-                +r.images.tools.static_prompt(first,include_catalog=False)+sticker_static_prompt(s)+r.tieba.tools.static_prompt()
-                +'\n这是一次主动开聊机会，没有人刚向你提问；有具体想分享或接续的内容再开口。只联系当前会话，sources填写提供的真实消息key或memory:ID；忙碌人员不可点名或@。'
-                +reply_protocol())
+            system = ((s.system_prompt_override.strip() or r.styles.get_active().system_prompt)
+                + habit_static_prompt(s) + warmth_prompt(s) + memory_static + search_static_prompt(s)
+                + r.fishtalk.static_prompt()
+                + r.affection.static_prompt(first, s, include_venue=False) + r.sticker_library.static_prompt(s)
+                + r.images.tools.static_prompt(first, include_catalog=False)
+                + sticker_static_prompt(s)
+                + r.tieba.tools.static_prompt()
+                + '\n【主动聊天】你现在有一次自主发起聊天的机会，并没有人刚向你提问。'
+                  '结合人设、关系、当前北京时间和真实话题，顺着第一直觉决定是否值得开口；没具体想说的就沉默。'
+                  '可分享有依据的兴趣见闻、接续尚未解决的话题、关心近况或找一个具体群友搭话。'
+                  '先分清是正在接话还是隔了一段时间重新开聊：已结束的旧话题不再逐句点评；隔得久时只有确有新意或值得关心才开口，不固定打招呼或催促回复。'
+                  '像一个在场的年轻女孩自然抛出一句短话或表情，不当话题主持人或总结员；忙碌人员不可点名或@。'
+                  '可按需使用已授权工具（联网搜索、贴吧、记忆、表情库、图库与生图）；记忆和收藏的source_key只用真实群友消息，不因自己准备开口而改好感度。'
+                  '输出JSON：{"should_reply":false,"reason":"供管理员查看的简短依据，不含内部推理",'
+                  '"sources":["确切消息key或memory:ID"],"actions":[],"image_request":null,"tieba_request":null,"tieba_used_meme_ids":[],"search_query":"","fetch_url":"","memory_ops":[],"memory_used_ids":[],"sticker_ops":[],"image_descriptions":[]}。'
+                  'actions为有序发送计划，文字为{"type":"text","text":"自然短句","mentions":[]}，表情为{"type":"sticker","id":"目录ID"}；每轮最多'+str(s.reply_max_parts)+'个动作，沉默时actions=[]且image_request=null。')
             system += r.autonomy.static_prompt()
             # Chat-specific catalog and venue belong after all common rules;
             # changing the roster must not split the reusable system prefix.
@@ -314,6 +326,7 @@ class ProactiveService:
             growth_prompt=r.growth.prompt(first,humans,growth_context)
             loaded_memory_ids.update(growth_context.get('ids',[]))
             dynamic = (memory_dynamic + growth_prompt + r.images.tools.dynamic_prompt(image_context, base_image_ids)
+                       + r.fishtalk.dynamic_prompt(first)
                        + sticker_dynamic_prompt(choices, r.stickers.details(choices)))
             if choices:
                 dynamic+=sticker_usage_prompt(self.store,s,first)
@@ -325,6 +338,9 @@ class ProactiveService:
                 source_ids.add('memory:'+str(first['_reading_offered']))
             dynamic += r.affection.dynamic_prompt(first, humans[-6:], s)
             dynamic += mention_dynamic_prompt(mentions,mentions_enabled)
+            if s.anti_formula_guard_enabled and not s.fishtalk_enabled:
+                dynamic += anti_formula_check(self.store,s.account_id,chat,
+                    gentle=r.autonomy.experience.active())['prompt']
             # Offer real recent sticker sources without embedding the full
             # management catalog because an old message mentioned collection.
             dynamic += r.sticker_library.dynamic_prompt(first, [first], s)
@@ -332,7 +348,7 @@ class ProactiveService:
             engine = r.engine_factory(api_url=s.api_url, api_key=self.config.api_key(), model=s.model,
                                       api_style=s.api_style,
                                       reasoning_effort=s.reasoning_effort, stream_enabled=s.model_stream_enabled,
-                                      max_tokens=s.max_tokens+400, temperature=.65, timeout=12, max_retries=0)
+                                      max_tokens=s.max_tokens+400, temperature=reply_temperature(s, proactive=True), timeout=12, max_retries=0)
             engine.usage_callback = lambda event: r.token_ledger.record(s.account_id, event)
             tool_messages, image_keys, context_counts = await build_context(
                 self.store,r.gateway,s,first,[],r.chat_labels,initiative=True)

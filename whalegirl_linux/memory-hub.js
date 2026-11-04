@@ -26,15 +26,6 @@
       <label class="check-label"><input id="hub-auto-accept" type="checkbox">自动采纳有依据的普通成长经验</label>
     </div><p class="hint">关闭自动整理仍可使用已有记忆及明确的记住/忘记指令。核心不按时间降级；稳定事实不会只因很久没聊就失效。好感度开关仍在好感度页面。</p>
       <div class="panel-footer"><span class="hint">只影响记忆与成长，近期上下文条数沿用会话设置</span><button id="hub-save-settings" class="primary" type="button">保存记忆设置</button></div></details>
-    <details id="hub-style" class="settings-drawer"><summary>学到的说话方式</summary>
-      <p class="hint">新版自主聊天从本群真人表达学习语感。来源群友这轮没发言时仍能参考；角色身份保持原设定。下面两个开关是全局设置，会话选择仅用于查看。</p>
-      <div class="two-fields"><label>会话<select id="hub-style-chat"></select></label>
-        <label class="check-label"><input id="hub-style-use" type="checkbox">使用学到的表达与聊天习惯</label>
-        <label class="check-label"><input id="hub-style-learn" type="checkbox">继续从真实聊天学习</label></div>
-      <div class="row"><button id="hub-style-refresh" class="secondary" type="button">查看当前表达</button>
-        <button id="hub-style-save" class="secondary" type="button">保存学习与使用设置</button></div>
-      <p id="hub-style-status" class="hint"></p><div id="hub-style-notes"></div>
-    </details>
     <div id="hub-tabs" class="model-presets" role="group" aria-label="记忆视图" style="margin:14px 0"></div>
     <p id="hub-counts" class="timing-detail" role="status"></p>
     <div class="chat-toolbar"><input id="hub-query" type="search" placeholder="搜索内容、微信 ID 或关键词" aria-label="搜索记忆">
@@ -82,9 +73,6 @@
   function chatOptions(select,all) {const value=select.value;select.replaceChildren();if(all)options(select,{'':'所有会话'});options(select,Object.fromEntries((cfg?.allowed_chat_ids||[]).map(id=>[id,chatName(id)])));if([...select.options].some(o=>o.value===value))select.value=value;}
   function populate() {
     if(!cfg)return;
-    chatOptions($('hub-style-chat'),false);
-    $('hub-style-use').checked=cfg.chat_habits_enabled??true;
-    $('hub-style-learn').checked=cfg.learning_enabled??true;
     $('hub-enabled').checked=cfg.memory_enabled??true;$('hub-consolidation').checked=cfg.memory_consolidation_enabled??true;
     $('hub-budget').value=cfg.memory_token_budget??1400;$('hub-limit').value=cfg.memory_item_limit??8;$('hub-cold-days').value=cfg.memory_cold_after_days??30;
     $('hub-eagerness').value=cfg.learning_eagerness??70;$('hub-eagerness-value').textContent=$('hub-eagerness').value+'/100';
@@ -150,42 +138,18 @@
   $('hub-more').onclick=()=>action($('hub-more'),()=>refresh(next));$('hub-query').onkeydown=e=>{if(e.key==='Enter')refresh().catch(error=>notice(error.message,true));};
   for(const id of ['hub-chat','hub-person','hub-tier','hub-status','hub-kind'])$(id).onchange=()=>refresh().catch(e=>notice(e.message,true));
   $('hub-eagerness').oninput=()=>$('hub-eagerness-value').textContent=$('hub-eagerness').value+'/100';
-  async function savePreferences(){
+  $('hub-save-settings').onclick=()=>action($('hub-save-settings'),async()=>{
     for(const id of ['hub-budget','hub-limit','hub-cold-days'])if(!$(id).reportValidity())return;
     await saveSubset({memory_enabled:$('hub-enabled').checked,memory_consolidation_enabled:$('hub-consolidation').checked,
       memory_token_budget:Number($('hub-budget').value),memory_item_limit:Number($('hub-limit').value),memory_cold_after_days:Number($('hub-cold-days').value),
-      learning_eagerness:Number($('hub-eagerness').value),editable_memory_enabled:$('hub-ai-editing').checked,learning_auto_accept:$('hub-auto-accept').checked,
-      chat_habits_enabled:$('hub-style-use').checked,learning_enabled:$('hub-style-learn').checked});
-    await refresh();if($('hub-style').open)await refreshStyle();
-    window.dispatchEvent(new CustomEvent('whalegirl-panel-saved',{detail:'memory-panel'}));notice('记忆与成长设置已保存');
-  }
-  $('hub-save-settings').onclick=()=>action($('hub-save-settings'),savePreferences);
+      learning_eagerness:Number($('hub-eagerness').value),editable_memory_enabled:$('hub-ai-editing').checked,learning_auto_accept:$('hub-auto-accept').checked});notice('记忆与成长设置已保存');await refresh();});
   $('hub-edit-form').onsubmit=e=>{e.preventDefault();action($('hub-edit-save'),async()=>{
     const status=$('hub-edit-status').value;const values={op:editing?'update':'create',...(editing?{id:editing.id,version:editing.version}:{}),
       chat:$('hub-edit-chat').value,subject:$('hub-edit-person').value.trim(),kind:$('hub-edit-kind').value,scope:$('hub-edit-scope').value,
       tier:$('hub-edit-tier').value,status,venue:$('hub-edit-venue').value,locked:$('hub-edit-locked').checked,content:$('hub-edit-content').value.trim(),
       property_key:$('hub-edit-property').value.trim(),triggers:$('hub-edit-triggers').value.trim(),source_key:editing?.source_key||''};
     if(editing?.status==='forgotten'&&status==='active')throw new Error('请先在列表点“恢复”，再编辑，避免误恢复已忘记资料。');
-    await api('memory-hub','POST',values);$('hub-editor').close();await refresh();if($('hub-style').open)await refreshStyle();notice('记忆已保存');});};
-  async function refreshStyle(){
-    const chat=$('hub-style-chat').value,box=$('hub-style-notes');box.replaceChildren();
-    if(!chat){text('hub-style-status','请先授权一个会话');return;}
-    const result=await api('chat-style?'+new URLSearchParams({chat}));
-    text('hub-style-status',(result.enabled?'正在使用':'使用已暂停')+' · '+(result.learning_enabled?'后台继续学习':'后台学习已暂停')+
-      ' · 最近加载：'+when(result.last_loaded));
-    for(const item of result.notes){
-      const row=node('article','record');row.append(node('p','message',item.content));
-      if(item.sample)row.append(node('p','hint','真人原话：'+item.sample.quote));
-      row.append(button('编辑',async()=>{const d=await api('memory-hub/'+item.id);edit(d.memory);}),
-        button('停用',async()=>{await api('memory-hub','POST',{op:'archive',id:item.id,version:item.version});await refreshStyle();await refresh();}));
-      box.append(row);
-    }
-    if(!result.notes.length)box.textContent='当前没有已采纳的本会话表达；有来源的学习会逐渐积累，私聊也可参考不含群原话的通用节奏。';
-  }
-  $('hub-style-refresh').onclick=()=>action($('hub-style-refresh'),refreshStyle);
-  $('hub-style-chat').onchange=()=>refreshStyle().catch(e=>notice(e.message,true));
-  $('hub-style').ontoggle=()=>{if($('hub-style').open)refreshStyle().catch(e=>notice(e.message,true));};
-  $('hub-style-save').onclick=()=>action($('hub-style-save'),savePreferences);
+    await api('memory-hub','POST',values);$('hub-editor').close();await refresh();notice('记忆已保存');});};
   function navigate(){if(location.hash==='#learning-panel')location.hash='#memory-panel';if(location.hash==='#memory-panel')Promise.all([loadPeople(),refresh()]).catch(e=>notice(e.message,true));}
   window.addEventListener('hashchange',navigate);
   window.memoryHub={populate,stateUpdated(){if(location.hash==='#memory-panel'&&Date.now()-lastFetch>30000)refresh().catch(e=>notice(e.message,true));}};

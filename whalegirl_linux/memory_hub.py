@@ -114,7 +114,6 @@ class MemoryHub:
                     occurred REAL NOT NULL,excerpt TEXT NOT NULL DEFAULT '',receipt TEXT NOT NULL DEFAULT '{}',
                     UNIQUE(memory_id,source_key,source_type));
                 CREATE INDEX IF NOT EXISTS memory_evidence_source ON memory_evidence(account,source_key);
-                CREATE INDEX IF NOT EXISTS memory_evidence_style ON memory_evidence(account,memory_id,occurred);
                 CREATE TABLE IF NOT EXISTS memory_origins(
                     account TEXT NOT NULL,source TEXT NOT NULL,origin_id TEXT NOT NULL,
                     memory_id INTEGER NOT NULL,origin_version INTEGER NOT NULL DEFAULT 0,
@@ -138,8 +137,6 @@ class MemoryHub:
             self.db.commit()
         from .memory_layers import MemoryLayers
         self.layers=MemoryLayers(self)
-        from .chat_style import ChatStyle
-        self.chat_style=ChatStyle(self)
 
     @property
     def settings(self):
@@ -166,6 +163,8 @@ class MemoryHub:
             excerpt[:500], json.dumps(receipt or {}, ensure_ascii=False)))
 
     def prepare(self, value, old, data, actor):
+        if actor != 'admin' and self.forgotten_source(value['account'], data.get('source_key', '')):
+            raise ValueError('该来源位于管理员已清除的记忆范围，不能自动重新学习')
         tier = data.get('tier', (old or {}).get('tier') or default_tier(value['kind']))
         if tier not in TIERS:
             raise ValueError('记忆等级无效')
@@ -272,20 +271,40 @@ class MemoryHub:
                 self.suppress(after, visited)
                 self.project_learning(after)
 
-    def blocked(self, account, chat, subject, content, source_key='', kind='', *, except_memory_id=0):
+    def forget_cutoff(self, account, chat):
+        row = self.db.execute('SELECT value FROM memory_hub_meta WHERE key=?',
+                              ('forget_before:' + account + ':' + chat,)).fetchone()
+        return float(row[0]) if row else 0
+
+    def forgotten_source(self, account, source_key):
+        if not source_key:
+            return False
+        return bool(self.db.execute('''SELECT 1 FROM message_log l JOIN memory_hub_meta h
+            ON h.key='forget_before:'||l.account||':'||l.chat WHERE l.account=? AND l.key=?
+            AND l.timestamp<=CAST(h.value AS REAL)''', (account, source_key)).fetchone())
+
+    def blocked(self, account, chat, subject, content, source_key='', kind=''):
+        if self.forgotten_source(account, source_key):
+            return True
         signature = hashlib.sha256(json.dumps([account, chat, subject, normalized(content)], ensure_ascii=False).encode()).hexdigest()
         return bool(self.db.execute('''SELECT 1 FROM memory_suppressions s JOIN memories m ON m.id=s.memory_id
-            WHERE s.account=? AND s.active=1 AND s.memory_id!=? AND (s.signature=? OR
+            WHERE s.account=? AND s.active=1 AND (s.signature=? OR
             (s.source_key!='' AND s.source_key=? AND (?='' OR m.kind=?))) LIMIT 1''',
-            (account, except_memory_id, signature, source_key,kind,kind)).fetchone())
+            (account, signature, source_key,kind,kind)).fetchone())
 
     def suppressed_sources(self, account, allowed):
         if not allowed:
             return []
         marks = ','.join('?' for _ in allowed)
-        return [r[0] for r in self.db.execute(f'''SELECT DISTINCT s.source_key FROM memory_suppressions s
+        sources = [r[0] for r in self.db.execute(f'''SELECT DISTINCT s.source_key FROM memory_suppressions s
             JOIN memories m ON m.id=s.memory_id WHERE s.account=? AND s.active=1 AND s.source_key!=''
             AND m.chat IN ({marks})''', (account, *allowed))]
+        for chat in allowed:
+            cutoff = self.forget_cutoff(account, chat)
+            if cutoff:
+                sources.extend(r[0] for r in self.db.execute(
+                    'SELECT key FROM message_log WHERE account=? AND chat=? AND timestamp<=?', (account, chat, cutoff)))
+        return list(set(sources))
 
     def sync_learning(self, row, old=None, operation='import', actor='migration'):
         """Called inside the legacy writer's transaction, never a second brain."""

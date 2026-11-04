@@ -1,0 +1,7 @@
+{
+  "commit": "bb621c3da31052e7e52b6307db3e27c508e4d502",
+  "license": "MIT",
+  "version": "0.3.6",
+  "repository": "https://github.com/Nozzi2455/fishtalk",
+  "integration": "Pinned upstream CLI and libraries; Python local adapter, persona-preserving rules"
+}

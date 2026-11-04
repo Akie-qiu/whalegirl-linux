@@ -134,8 +134,10 @@ class Store:
         # A pending native row is seen again under its server ID after upload.
         # Count that message once, without merging real repeated messages.
         grouped = {}
+        hub = getattr(self, 'memory_hub', None)
+        cutoff = hub.forget_cutoff(account, chat) if hub else 0
         rows = self.db.execute("SELECT * FROM message_log WHERE account=? AND chat=? "
-                               "ORDER BY timestamp DESC,local_id DESC,key DESC", (account, chat))
+                               "AND timestamp>? ORDER BY timestamp DESC,local_id DESC,key DESC", (account, chat, cutoff))
         for raw in rows:
             row = dict(raw)
             identity = ('local', row['local_id']) if (row.get('local_id') or 0) > 0 else ('key', row['key'])
@@ -235,6 +237,15 @@ class Store:
     def used_stickers(self,account,chat,seconds):
         return {r[0] for r in self.db.execute('SELECT md5 FROM sticker_usage WHERE account=? AND chat=? AND sent>?',
                                             (account,chat,time.time()-seconds))} if seconds else set()
+
+    def sticker_selection_history(self,account,chat,cooldown=0):
+        """Local soft ranking signals; recent use does not make a sticker unavailable."""
+        now=time.time()
+        rows=self.db.execute('''SELECT md5,COUNT(*),MAX(sent) FROM sticker_usage
+            WHERE account=? AND chat=? AND sent>? GROUP BY md5''',
+            (account,chat,now-7*86400))
+        return {r[0]:{'count':r[1],'last':r[2],
+                     'recent':bool(cooldown and r[2]>now-cooldown)} for r in rows}
 
     def record_sticker(self,account,chat,md5):
         with self.lock:

@@ -107,6 +107,19 @@ details.settings-drawer>summary::after,details.record>summary::after{content:'�
 details.settings-drawer[open]>summary::after,details.record[open]>summary::after{content:'收起 ▴';background:#d8ebe5;color:#157d6e}
 
 /* Person Profile Card Header & Score Bar */
+.expression-toolbar{display:flex;align-items:center;gap:22px;flex-wrap:wrap;margin:22px 0 16px;padding:14px 18px;background:#f3f8f6;border-radius:12px}
+.expression-toolbar label{min-width:190px;margin:0}.expression-toolbar p{flex:1;min-width:220px;margin:0}
+.expression-presets{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin:18px 0}
+.expression-presets[hidden]{display:none}.expression-card{min-width:0;padding:18px 20px;border:1px solid #dce7e3;border-radius:12px;background:#fcfefd}
+.expression-card h3{margin:0 0 8px;font-size:15px}.expression-card>label{font-size:13px}.expression-card .hint{margin:8px 0 0;line-height:1.7}
+.expression-fine-grid{grid-template-columns:repeat(3,minmax(0,1fr));align-items:start;margin-top:18px}
+.expression-state-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin:20px 0}
+.expression-state-grid .two-fields{grid-template-columns:repeat(2,minmax(0,1fr));margin-top:16px}.expression-state-grid .check-label{align-items:flex-start;font-size:12px;line-height:1.7}
+.expression-link{display:inline-block;margin-top:16px;font-size:12px}.expression-panel #expression-short-controls{border:1px solid #dce7e3;border-radius:12px;padding:16px 20px;margin-top:16px}
+.expression-panel #expression-short-controls h3{font-size:14px;margin-top:0}.expression-panel #expression-short-controls .two-fields{margin-top:14px;grid-template-columns:repeat(2,minmax(0,1fr))}
+.expression-panel #expression-live-section{padding:0;border:0}.expression-panel #expression-live-section>h3{font-size:14px;margin-top:14px}
+@media(max-width:900px){.expression-presets,.expression-fine-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.expression-state-grid{grid-template-columns:1fr}}
+@media(max-width:680px){.expression-presets,.expression-fine-grid{grid-template-columns:1fr}.expression-toolbar{gap:6px}.expression-toolbar label{width:100%}.expression-card{padding:16px}.expression-panel .panel-footer{align-items:stretch}.expression-panel .panel-footer button{width:100%}}
 .person-card-head{display:flex;align-items:center;justify-content:space-between;gap:12px}
 .person-avatar-group{display:flex;align-items:center;gap:10px;min-width:0}
 .person-avatar{width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#157d6e,#2b5876);color:white;display:grid;place-items:center;font-weight:700;font-size:15px;flex-shrink:0}

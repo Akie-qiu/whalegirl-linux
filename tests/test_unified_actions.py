@@ -128,8 +128,7 @@ class InitiativeContextTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.stickers.entries={'a'*32:'开心'};self.runtime.stickers.available=['a'*32]
         calls=self.capture();self.assertTrue(await self.service.run_once())
         self.assertEqual(len(calls),1)
-        self.assertNotIn('期望约75%',str(calls[0][0]))
-        self.assertIn('很愿意',calls[0][1]['system_prompt'])
+        self.assertIn('期望约75%',str(calls[0][0]))
         self.assertNotIn('【表情节奏参考】',calls[0][1]['system_prompt'])
 
     async def test_unanswered_opener_is_not_repeated_after_midnight(self):

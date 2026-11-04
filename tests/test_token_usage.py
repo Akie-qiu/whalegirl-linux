@@ -38,17 +38,12 @@ class LedgerTests(unittest.TestCase):
         store=Store(path);book=TokenLedger(store)
         def record(raw,account='account',status='success'):
             book.record(account,{'model':'example','provider':'example.test','status':status,'elapsed_ms':100,**normalize_usage(raw)})
-        book.record('account',{'model':'example','provider':'example.test','operation':'chat','status':'success',
-            'elapsed_ms':100,**normalize_usage({'prompt_tokens':100,'completion_tokens':20,'prompt_cache_hit_tokens':80})})
-        book.record('account',{'model':'example','provider':'example.test','operation':'image','status':'success',
-            'elapsed_ms':100,**normalize_usage({'prompt_tokens':900,'completion_tokens':10,'prompt_cache_hit_tokens':90})})
+        record({'prompt_tokens':100,'completion_tokens':20,'prompt_cache_hit_tokens':80})
+        record({'prompt_tokens':900,'completion_tokens':10,'prompt_cache_hit_tokens':90})
         record({},status='error');record({'prompt_tokens':999,'completion_tokens':1},account='other')
         stats=book.snapshot('account','all')['summary'];self.assertEqual(stats['total_tokens'],1030)
         self.assertEqual(stats['cache_hit_rate'],17);self.assertEqual(stats['requests'],3);self.assertEqual(stats['failed'],1)
         self.assertEqual(stats['total_tokens_reports'],2);self.assertIsNone(stats['cache_write_tokens'])
-        operations={row['operation']:row for row in book.snapshot('account','all')['operations']}
-        self.assertEqual(operations['chat']['input_tokens'],100)
-        self.assertEqual(operations['image']['cache_hit_rate'],10.0)
         store.close();store=Store(path)
         try:self.assertEqual(TokenLedger(store).snapshot('account','all')['summary']['requests'],3)
         finally:store.close()
@@ -79,9 +74,9 @@ class EngineAccountingTests(unittest.IsolatedAsyncioTestCase):
         engine._get_client=AsyncMock(return_value=client);engine.usage_callback=events.append
         try:
             with patch('whalegirl_linux.upstream.ai_engine.asyncio.sleep',new=AsyncMock()):
-                self.assertEqual(await engine.chat([{'role':'user','content':'test'}],operation='reply'),'ok')
+                self.assertEqual(await engine.chat([{'role':'user','content':'test'}]),'ok')
             self.assertEqual(len(events),2);self.assertEqual(events[0]['status'],'error');self.assertIsNone(events[0]['total_tokens'])
-            self.assertEqual(events[1]['total_tokens'],120);self.assertEqual(events[1]['operation'],'reply');self.assertEqual(len(calls),2)
+            self.assertEqual(events[1]['total_tokens'],120);self.assertEqual(len(calls),2)
             def broken(_):raise RuntimeError('accounting only')
             engine.usage_callback=broken
             self.assertEqual(await engine.chat([{'role':'user','content':'test'}]),'ok');self.assertEqual(len(calls),3)
@@ -129,8 +124,6 @@ class EngineAccountingTests(unittest.IsolatedAsyncioTestCase):
                 event=Runtime.event('account','group@chatroom',{'serverId':mid,'localId':mid,'sender':sender,
                     'senderName':sender,'type':1,'content':text,'isSelf':False,'timestamp':time.time()+turn})
                 event['trigger']=trigger;store.observe([event]);store.insert(event)
-                store.db.execute('UPDATE autonomy_chats SET last_considered=0')
-                store.db.commit()
                 await runtime.process_next()
             self.assertEqual(len(payloads),2)
             sys_0=payloads[0]['messages'][0]['content']
@@ -142,61 +135,16 @@ class EngineAccountingTests(unittest.IsolatedAsyncioTestCase):
             user_1=payloads[1]['messages'][1]['content']
             self.assertIn('【本轮动态上下文】',user_0)
             self.assertLess(user_0.index('【当前会话近期完整消息（含未@内容）】'),user_0.index('【本轮动态上下文】'))
-            reply_marker='\n【本轮新发生的交流】\n'
+            from whalegirl_linux.time_context import REPLY_MARKERS
+            reply_marker=next(marker for marker in REPLY_MARKERS if marker in user_0)
             self.assertLess(user_0.index('【本轮动态上下文】'),user_0.index(reply_marker))
+            hist_0=user_0.split('【当前会话近期完整消息（含未@内容）】\n',1)[1].split('\n【较早话题摘要',1)[0].splitlines()
+            hist_1=user_1.split('【当前会话近期完整消息（含未@内容）】\n',1)[1].split('\n【较早话题摘要',1)[0].splitlines()
+            self.assertEqual(hist_0[0],hist_1[0])
+            # The complete recent window advances by one human message; only
+            # the static system prefix is invariant. Shared rows stay identical.
+            self.assertEqual(hist_0[2:],hist_1[1:len(hist_0)-1])
             self.assertIn('帮我想个晚饭',user_1)
-        finally:
-            await real_builder.close()
-            await runtime.close()
-
-    async def test_reply_mode_schema_is_a_suffix_after_shared_prompt_rules(self):
-        from whalegirl_linux.runtime import Runtime
-        from whalegirl_linux.settings import Config, Settings
-        from whalegirl_linux.upstream.ai_engine import AIEngine
-        from test_chat_habits import Engine, Gateway
-        runs=ROOT/'test-runs';runs.mkdir(exist_ok=True)
-        folder=Path(tempfile.mkdtemp(prefix='cache-mode-',dir=runs))
-        config=Config(folder)
-        config.save(Settings(enabled=True,account_id='account',allowed_chat_ids=['group@chatroom'],
-            context_messages=12,safety_enabled=False,stickers_enabled=False,images_chat_enabled=False,
-            learning_enabled=False,tieba_enabled=False,editable_memory_enabled=False,web_search_enabled=False,
-            affection_enabled=False,chat_habits_enabled=False,sticker_self_manage_enabled=False,
-            quote_replies_enabled=False,group_mentions_enabled=False,
-            debounce_single_seconds=0,debounce_burst_seconds=0,debounce_max_seconds=0),'test-key')
-        store=Store(folder/'state.sqlite3');gateway=Gateway()
-        runtime=Runtime(config,store,gateway,ROOT/'styles',engine_factory=Engine)
-        real_builder=AIEngine('https://api.deepseek.com/chat/completions','test',model='deepseek-flash')
-        prompts=[];formats=[]
-        try:
-            base_ts=time.time()-300
-            for idx in range(1,15):
-                row=Runtime.event('account','group@chatroom',{'serverId':idx,'localId':idx,'sender':f'u{idx%3}',
-                    'senderName':f'群友{idx%3}','type':1,'content':f'历史发言第{idx}句','isSelf':False,'timestamp':base_ts+idx})
-                store.observe([row])
-            engine=await runtime.model()
-            async def capture_chat(messages,**kwargs):
-                engine.calls+=1
-                prompts.append(kwargs['system_prompt'])
-                formats.append(kwargs.get('response_format'))
-                real_builder._build_payload(messages,kwargs.get('system_prompt',''),None,
-                                            response_format=kwargs.get('response_format'))
-                return json.dumps({'should_reply':True,'actions':[{'type':'text','text':'收到啦'}]},ensure_ascii=False)
-            engine.chat=capture_chat
-            for mid,trigger,text in [(15,'direct','鲸鱼娘 你好'),(16,'natural','大家好')]:
-                event=Runtime.event('account','group@chatroom',{'serverId':mid,'localId':mid,'sender':f'user{mid}',
-                    'senderName':f'群友{mid}','type':1,'content':text,'isSelf':False,'timestamp':time.time()})
-                event['trigger']=trigger;store.observe([event]);store.insert(event)
-                store.db.execute('UPDATE autonomy_chats SET last_considered=0')
-                store.db.commit()
-                await runtime.process_next()
-            self.assertEqual(len(prompts),2)
-            self.assertEqual(engine.calls,2)
-            self.assertEqual(formats,[{'type':'json_object'},{'type':'json_object'}])
-            static_0=prompts[0].split('\n【本轮动态上下文】',1)[0]
-            static_1=prompts[1].split('\n【本轮动态上下文】',1)[0]
-            self.assertTrue(static_1.startswith(static_0))
-            self.assertEqual(static_0,static_1)
-            self.assertIn('只输出JSON',static_0)
         finally:
             await real_builder.close()
             await runtime.close()

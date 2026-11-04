@@ -4,7 +4,7 @@ import time
 
 
 BEIJING = timezone(timedelta(hours=8))
-CLOCK_RULE = '\n时间以本轮服务器时间为准；各条消息标注的是原消息时间，不能当成现在。当前时间无需联网或猜测。时段只供理解语境，不因夜深自动催睡或结束交流。'
+CLOCK_RULE = '\n时间以本轮服务器时间为准；各条消息标注的是原消息时间，不能当成现在。当前时间无需联网或猜测。'
 CLOCK_MARKER = '\n【服务器当前时间】'
 REPLY_MARKER = '\n【本次需要回复的消息】\n'
 REPLY_MARKERS = (REPLY_MARKER, '\n【当前需要回复的消息｜本轮主题优先】\n', '\n【本轮新发生的交流】\n')

@@ -1,0 +1,584 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>鱼塘 · fishtalk</title>
+<style>
+  :root {
+    --bg: #f1ebe0; --panel: #f8f3ea; --card: #fffdf8; --ink: #23201b; --sub: #7d7365; --faint: #aaa091;
+    --rule: #e2d8c6; --hover: #efe7d8; --sel: #e8dcc6;
+    --good: #2f8a55; --funny: #e07a1f; --goodfish: #1f9a96; --fish: #3566b0; --bad: #8c8274; --auto: #7aa1d6;
+    --good-bg: #e3f2e8; --funny-bg: #fdecd9; --goodfish-bg: #dcf3f1; --fish-bg: #e2eaf7; --bad-bg: #ece8e2; --auto-bg: #edf2fa;
+    --shadow: 0 18px 44px -30px rgba(60, 40, 10, .45);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #13161b; --panel: #181c22; --card: #1f242c; --ink: #ebe5db; --sub: #9a9184; --faint: #6c655b;
+      --rule: #2c323b; --hover: #232932; --sel: #2b323d;
+      --good-bg: #1c3227; --funny-bg: #3a2817; --goodfish-bg: #15302f; --fish-bg: #1a2a40; --bad-bg: #2a2a2a; --auto-bg: #1c2633;
+      --shadow: 0 18px 44px -30px rgba(0,0,0,.8);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--ink); font: 15px/1.55 system-ui, "PingFang SC", "Microsoft YaHei", sans-serif; display: flex; flex-direction: column; }
+  button, input, textarea, select { font: inherit; color: inherit; }
+  kbd { font: 600 11px ui-monospace, Consolas, monospace; min-width: 20px; height: 20px; padding: 0 5px; display: inline-grid; place-items: center; border-radius: 6px; border: 1px solid currentColor; opacity: .7; }
+
+  /* 顶栏 */
+  .top { display: flex; align-items: center; gap: 14px; padding: 12px 20px; border-bottom: 1px solid var(--rule); background: var(--panel); flex-wrap: wrap; }
+  .logo { width: 34px; height: 34px; border-radius: 10px; background: var(--fish); display: grid; place-items: center; flex: none; }
+  .logo svg { width: 20px; height: 20px; }
+  .top h1 { margin: 0; font-size: 18px; letter-spacing: .05em; }
+  .top .sub { color: var(--sub); font-size: 12.5px; }
+  .ov { margin-left: auto; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12.5px; }
+  .pill { padding: 3px 10px; border-radius: 999px; background: var(--card); border: 1px solid var(--rule); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .pill b { font-weight: 700; }
+  .btn { cursor: pointer; border: 1px solid var(--rule); background: var(--card); border-radius: 10px; padding: 6px 12px; transition: background .15s, border-color .15s; }
+  .btn:hover { border-color: var(--sub); }
+  .btn.primary { background: var(--ink); color: var(--card); border-color: var(--ink); }
+
+  .shell { flex: 1; display: grid; grid-template-columns: 270px 1fr; min-height: 0; }
+
+  /* 左边：语料包 */
+  aside { border-right: 1px solid var(--rule); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
+  aside h2 { font-size: 12px; letter-spacing: .12em; color: var(--sub); margin: 16px 18px 8px; font-weight: 600; }
+  .packs { overflow: auto; padding: 0 10px 14px; flex: 1; }
+  .pack { display: block; width: 100%; text-align: left; cursor: pointer; border: 1px solid transparent; background: none; border-radius: 12px; padding: 10px 10px 9px; margin-bottom: 4px; position: relative; }
+  .pack.warn { border-color: #c4473a; background: var(--card); }
+  .phead { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .phead .name { flex: 1; min-width: 0; }
+  .ptools { display: flex; gap: 2px; opacity: 0; transition: opacity .12s; flex: none; }
+  .pack:hover .ptools, .pack.on .ptools { opacity: 1; }
+  .ico { cursor: pointer; border: 0; background: none; width: 24px; height: 24px; border-radius: 7px; color: var(--sub); font-size: 13px; line-height: 1; }
+  .ico:hover { background: var(--hover); color: var(--ink); }
+  .ico.danger:hover { background: #f6dcd8; color: #c4473a; }
+  .edit { display: flex; gap: 6px; width: 100%; } .edit input { flex: 1; min-width: 0; padding: 4px 8px; }
+  .edit .btn { padding: 4px 9px; font-size: 13px; }
+  .confirm { margin-top: 8px; font-size: 12.5px; color: #c4473a; display: flex; flex-direction: column; gap: 6px; }
+  .confirm span { display: flex; gap: 6px; } .confirm .btn { padding: 4px 10px; font-size: 13px; }
+  .dangerbtn { background: #c4473a; color: #fff; border-color: #c4473a; }
+  .sidefoot { padding: 12px 14px; border-top: 1px solid var(--rule); display: flex; flex-direction: column; gap: 6px; }
+  .wide { width: 100%; padding: 9px 12px; }
+  .small { font-size: 11.5px; line-height: 1.5; }
+  .pack:hover { background: var(--hover); }
+  .pack.on { background: var(--card); border-color: var(--rule); box-shadow: var(--shadow); }
+  .pack .name { font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pack .nums { color: var(--sub); font-size: 12px; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .stack { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: var(--rule); margin-top: 7px; }
+  .stack i { display: block; height: 100%; }
+  .legend { padding: 10px 18px 14px; border-top: 1px solid var(--rule); color: var(--sub); font-size: 11.5px; display: flex; flex-wrap: wrap; gap: 4px 12px; }
+  .legend span::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; background: var(--c); vertical-align: 0; }
+
+  /* 右边主区 */
+  main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .tabs { display: flex; gap: 4px; padding: 12px 20px 0; border-bottom: 1px solid var(--rule); }
+  .tab { cursor: pointer; border: 0; background: none; padding: 9px 14px; border-radius: 10px 10px 0 0; color: var(--sub); border-bottom: 2px solid transparent; }
+  .tab.on { color: var(--ink); border-bottom-color: var(--ink); font-weight: 600; }
+  .view { flex: 1; overflow: auto; padding: 18px 20px 28px; }
+  .view[hidden] { display: none; }
+  .crumb { color: var(--sub); font-size: 13px; margin-bottom: 12px; }
+  .crumb b { color: var(--ink); }
+
+  /* 批注 */
+  .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+  .search { flex: 1; min-width: 200px; display: flex; align-items: center; gap: 8px; background: var(--card); border: 1px solid var(--rule); border-radius: 12px; padding: 7px 12px; }
+  .search:focus-within { border-color: var(--sub); }
+  .search input { border: 0; outline: 0; background: none; flex: 1; min-width: 0; }
+  .search svg { width: 16px; height: 16px; color: var(--sub); flex: none; }
+  .seg { display: flex; background: var(--card); border: 1px solid var(--rule); border-radius: 12px; padding: 3px; }
+  .seg button { cursor: pointer; border: 0; background: none; padding: 5px 11px; border-radius: 9px; color: var(--sub); white-space: nowrap; }
+  .seg button.on { background: var(--sel); color: var(--ink); font-weight: 600; }
+  .found { color: var(--sub); font-size: 13px; font-variant-numeric: tabular-nums; }
+
+  .labelgrid { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 18px; align-items: start; }
+  @media (max-width: 1100px) { .labelgrid { grid-template-columns: 1fr; } }
+  .card { position: relative; background: var(--card); border: 1px solid var(--rule); border-radius: 20px; box-shadow: var(--shadow); padding: 18px 26px 22px; min-height: 230px; display: flex; flex-direction: column; transition: transform .14s, opacity .14s; }
+  .card.leave { transform: translateY(-8px); opacity: 0; }
+  .meta { display: flex; gap: 8px; align-items: center; color: var(--sub); font-size: 12.5px; flex-wrap: wrap; }
+  .src { padding: 1px 8px; border-radius: 6px; background: var(--hover); color: var(--ink); font-weight: 600; }
+  .meta .likes { margin-left: auto; }
+  .text { flex: 1; display: flex; align-items: center; padding: 18px 0 4px; font-size: clamp(20px, 2.6vw, 27px); line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+  .tag { font-size: 12px; padding: 2px 9px; border-radius: 999px; font-weight: 600; }
+  .tag.good { background: var(--good-bg); color: var(--good); } .tag.funny { background: var(--funny-bg); color: var(--funny); }
+  .tag.fish { background: var(--fish-bg); color: var(--fish); } .tag.goodfish { background: var(--goodfish-bg); color: var(--goodfish); } .tag.bad { background: var(--bad-bg); color: var(--bad); }
+  .tag.auto { background: var(--auto-bg); color: var(--auto); }
+  .stamp { position: absolute; right: 24px; bottom: 18px; font-weight: 800; font-size: 19px; letter-spacing: .1em; border: 3px solid currentColor; border-radius: 10px; padding: 1px 11px; transform: rotate(-8deg) scale(1.4); opacity: 0; transition: transform .13s, opacity .13s; pointer-events: none; }
+  .stamp.on { transform: rotate(-8deg) scale(1); opacity: .9; }
+  .why { margin-top: 10px; font-size: 12.5px; color: var(--auto); }
+
+  .choices { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 14px; }
+  .choice { cursor: pointer; text-align: left; border-radius: 14px; padding: 11px 12px 10px; border: 2px solid transparent; display: grid; grid-template-columns: 1fr auto; gap: 1px 6px; align-items: center; transition: transform .08s, box-shadow .15s; }
+  .choice b { font-size: 17px; } .choice small { grid-column: 1 / 3; font-size: 11.5px; opacity: .8; }
+  .choice:hover { transform: translateY(-2px); box-shadow: 0 10px 22px -14px currentColor; }
+  .choice.hit { transform: scale(.97); border-color: currentColor; }
+  .choice.good { background: var(--good-bg); color: var(--good); } .choice.funny { background: var(--funny-bg); color: var(--funny); }
+  .choice.fish { background: var(--fish-bg); color: var(--fish); } .choice.goodfish { background: var(--goodfish-bg); color: var(--goodfish); } .choice.bad { background: var(--bad-bg); color: var(--bad); }
+  .actions { display: flex; gap: 10px; margin-top: 10px; }
+  .act { flex: 1; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 9px; padding: 9px 12px; border-radius: 12px; background: var(--card); border: 1px solid var(--rule); transition: transform .08s, border-color .15s; }
+  .act:hover { border-color: var(--sub); } .act.hit { transform: scale(.98); }
+  .act:disabled { opacity: .4; cursor: default; }
+  .act svg { width: 17px; height: 17px; }
+
+  /* 右侧预览列表 */
+  .side { background: var(--card); border: 1px solid var(--rule); border-radius: 18px; overflow: hidden; position: sticky; top: 0; }
+  .side h3 { margin: 0; padding: 12px 14px; font-size: 13px; border-bottom: 1px solid var(--rule); display: flex; justify-content: space-between; color: var(--sub); font-weight: 600; }
+  .list { height: min(560px, calc(100vh - 250px)); min-height: 280px; overflow-y: auto; overscroll-behavior: contain; position: relative; }
+  .row { display: flex; gap: 8px; align-items: flex-start; width: 100%; text-align: left; cursor: pointer; border: 0; border-bottom: 1px solid var(--rule); background: none; padding: 9px 14px; }
+  .row:hover { background: var(--hover); }
+  .row.cur { background: var(--sel); box-shadow: inset 3px 0 0 var(--ink); }
+  .row .n { color: var(--faint); font-size: 11px; min-width: 26px; padding-top: 2px; font-variant-numeric: tabular-nums; }
+  .row .t { flex: 1; font-size: 13.5px; line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .row mark { background: #ffe49a; color: inherit; border-radius: 3px; padding: 0 1px; }
+  .empty { padding: 28px 16px; text-align: center; color: var(--sub); }
+
+  /* 文风包 */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .tile { background: var(--card); border: 1px solid var(--rule); border-radius: 16px; padding: 14px 16px; }
+  .tile .k { color: var(--sub); font-size: 12px; }
+  .tile .v { font-size: 22px; font-weight: 700; margin-top: 2px; }
+  .tile .d { color: var(--sub); font-size: 12.5px; margin-top: 4px; line-height: 1.6; }
+  .box { background: var(--card); border: 1px solid var(--rule); border-radius: 16px; padding: 14px 18px; margin-bottom: 14px; }
+  .box h4 { margin: 0 0 8px; font-size: 14px; }
+  .box ul { margin: 0; padding-left: 18px; } .box li { margin: 5px 0; }
+  .muted { color: var(--sub); font-size: 13px; }
+
+  /* 黑名单 */
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { color: var(--sub); font-weight: 600; font-size: 12px; }
+  code { font: 12px ui-monospace, Consolas, monospace; background: var(--hover); padding: 1px 5px; border-radius: 5px; word-break: break-all; }
+  .fishrow { display: flex; gap: 12px; align-items: center; padding: 11px 0; border-bottom: 1px solid var(--rule); }
+  .fishrow .t { flex: 1; } .fishrow .r { color: var(--auto); font-size: 12px; margin-top: 3px; }
+  .fishrow .ops { display: flex; gap: 6px; flex: none; }
+
+  textarea { width: 100%; min-height: 160px; resize: vertical; background: var(--card); border: 1px solid var(--rule); border-radius: 14px; padding: 12px 14px; outline: none; line-height: 1.6; }
+  textarea:focus, .field:focus { border-color: var(--sub); }
+  .field { background: var(--card); border: 1px solid var(--rule); border-radius: 10px; padding: 7px 11px; outline: none; }
+  .result { margin-top: 14px; }
+  
+  .toast { position: fixed; left: 50%; bottom: 22px; transform: translate(-50%, 16px); opacity: 0; background: var(--ink); color: var(--card); padding: 9px 15px; border-radius: 12px; font-size: 14px; display: flex; gap: 12px; align-items: center; transition: opacity .2s, transform .2s; pointer-events: none; }
+  .toast.on { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
+  .toast button { background: none; border: 0; color: var(--funny); cursor: pointer; font-weight: 600; padding: 0; }
+</style>
+</head>
+<body>
+<div class="top">
+  <div class="logo" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12c3-5 9-6 13-2l5-3v10l-5-3c-4 4-10 3-13-2z"/><circle cx="8" cy="11" r=".6" fill="#fff"/></svg></div>
+  <div><h1>鱼塘</h1><div class="sub">fishtalk 控制台 · 分包批注、看文风、查黑名单</div></div>
+  <div class="ov" id="ov"></div>
+</div>
+
+<div class="shell">
+  <aside>
+    <h2>语料包</h2>
+    <div class="packs" id="packs"></div>
+    <div class="sidefoot">
+      <button class="btn primary wide" id="distillBtn">立即蒸馏</button>
+      <div class="muted small">按现在的批注重新生成文风包。平时每批 20 条会自动蒸馏一次，一般不用手动点。</div>
+    </div>
+    <div class="legend">
+      <span style="--c:var(--good)">好</span><span style="--c:var(--funny)">好笑</span><span style="--c:var(--goodfish)">好鱼</span><span style="--c:var(--fish)">鱼(手动)</span><span style="--c:var(--bad)">烂</span><span style="--c:var(--auto)">自动判鱼</span><span style="--c:var(--rule)">自动当真人</span>
+    </div>
+  </aside>
+
+  <main>
+    <div class="tabs" id="tabs">
+      <button class="tab on" data-t="label">批注</button>
+      <button class="tab" data-t="pack">文风包</button>
+      <button class="tab" data-t="black">黑名单 &amp; 被判成鱼的</button>
+      <button class="tab" data-t="feed">喂料</button>
+    </div>
+
+    <!-- 批注 -->
+    <section class="view" data-v="label">
+      <div class="toolbar">
+        <label class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg><input id="q" placeholder="搜关键词，比如「董事长」　按 / 快速搜索"></label>
+        <div class="seg" id="filter">
+          <button data-f="unlabeled" class="on">未批</button><button data-f="all">全部</button><button data-f="labeled">已批</button><button data-f="autofish">自动判鱼</button>
+        </div>
+        <span class="found" id="found"></span>
+      </div>
+      <div class="labelgrid">
+        <div>
+          <div class="card" id="card"><div class="meta" id="meta"></div><div class="text" id="text"></div><div class="why" id="why"></div><div class="stamp" id="stamp"></div></div>
+          <div class="choices" id="choices">
+            <button class="choice good" data-l="good"><b>好</b><kbd>1</kbd><small>像真人说的，值得学</small></button>
+            <button class="choice funny" data-l="funny"><b>好笑</b><kbd>2</kbd><small>好，而且有梗</small></button>
+            <button class="choice goodfish" data-l="goodfish"><b>好鱼</b><kbd>3</kbd><small>AI 写的，但有意思</small></button>
+            <button class="choice fish" data-l="fish"><b>是鱼</b><kbd>4</kbd><small>AI 八股，惹人烦</small></button>
+            <button class="choice bad" data-l="bad"><b>烂</b><kbd>5</kbd><small>推广、引战、没内容</small></button>
+          </div>
+          <div class="actions">
+            <button class="act" id="undo" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-3"/></svg>撤销上一条 <kbd>Z</kbd></button>
+            <button class="act" id="clear">清掉这条的标记</button>
+            <button class="act" id="skip">跳过这条 <kbd>空格</kbd><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg></button>
+          </div>
+        </div>
+        <div class="side"><h3><span id="sideTitle">接下来</span><span id="sideCount"></span></h3><div class="list" id="list"></div></div>
+      </div>
+    </section>
+
+    <!-- 文风包 -->
+    <section class="view" data-v="pack" hidden><div id="packView"></div></section>
+
+    <!-- 黑名单 -->
+    <section class="view" data-v="black" hidden>
+      <div class="crumb" id="blackCrumb"></div>
+      <div class="box"><h4>被自动判成鱼的（可以放回）</h4><div class="muted" style="margin-bottom:6px">判错了就点「放回」，它会被标成「好」，下次蒸馏重新算进真人里。</div><div id="autoFishList"></div></div>
+      <div class="box"><h4>手动标成鱼的</h4><div id="manualFishList"></div></div>
+      <div class="box"><h4>黑名单规则一览</h4><div class="muted" style="margin-bottom:8px">内置规则命中一条就拦；软信号要叠两条以上，或者再加上重复，才判成鱼。</div><div id="rules"></div></div>
+    </section>
+
+    <!-- 喂料 -->
+    <section class="view" data-v="feed" hidden>
+      <div class="box"><h4>粘贴进来学</h4>
+        <div class="muted" style="margin-bottom:8px">一行一条：聊天记录（复制粘贴的）、帖子、你觉得说得好的话都行。手机号、链接、表情会自动去掉。</div>
+        <textarea id="feedText" placeholder="一行一条……"></textarea>
+        <div style="display:flex;gap:10px;margin-top:10px;align-items:center;flex-wrap:wrap">
+          <span class="muted">放进</span>
+          <select class="field" id="feedPack" style="max-width:340px"></select>
+          <input class="field" id="feedNew" placeholder="新语料包的名字，比如「技术群」" hidden>
+          <button class="btn primary" id="feedBtn">喂进去</button>
+          <span class="muted" id="feedResult"></span>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="toast" id="toast"><span id="toastText"></span><button id="toastUndo">撤销</button></div>
+
+<script>
+  const $ = (id) => document.getElementById(id)
+  const esc = (s) => String(s == null ? '' : s).replace(/[<&>"]/g, (c) => ({ '<': '&lt;', '&': '&amp;', '>': '&gt;', '"': '&quot;' }[c]))
+  const NAMES = { bili: 'B 站', qq: 'QQ', wechat: '微信', text: '文本', tieba: '贴吧' }
+  const KINDS = { comment: '评论', reply: '楼中楼', danmaku: '弹幕', chat: '聊天', line: '一句话' }
+  const LABELS = { good: '好', funny: '好笑', goodfish: '好鱼', fish: '是鱼', bad: '烂' }
+  const api = (u, body) => fetch(u, body ? { method: 'POST', body: JSON.stringify(body) } : undefined).then((r) => r.json())
+
+  const S = { editing: null, deleting: null, pack: '', tab: 'label', filter: 'unlabeled', q: '', items: [], idx: 0, history: [], busy: false, state: null }
+  let toastTimer = 0, qTimer = 0
+
+  function toast(text, undo) {
+    $('toastText').textContent = text
+    $('toastUndo').style.display = undo ? '' : 'none'
+    $('toast').classList.add('on')
+    clearTimeout(toastTimer)
+    toastTimer = setTimeout(() => $('toast').classList.remove('on'), 2200)
+  }
+
+  /* ---------- 状态 / 左栏 ---------- */
+  async function loadState() {
+    S.state = await api('/api/state')
+    const o = S.state.overview
+    $('ov').innerHTML =
+      `<span class="pill">语料 <b>${o.total}</b></span>` +
+      `<span class="pill">手动批 <b>${o.labeled}</b>　好 ${o.count.good} · 好笑 ${o.count.funny} · 好鱼 ${o.count.goodfish || 0} · 鱼 ${o.count.fish} · 烂 ${o.count.bad}</span>` +
+      `<span class="pill">自动批 <b>${o.auto}</b>　其中判成鱼 ${o.autoFish}</span>`
+    renderPacks()
+  }
+
+  function packRow(key, p) {
+    const pct = (n) => (p.total ? n / p.total * 100 : 0) + '%'
+    const human = p.unlabeled - p.autoFish
+    const tools = key && S.editing !== key && S.deleting !== key
+      ? `<span class="ptools"><button class="ico" data-op="rename" title="改名">✎</button><button class="ico danger" data-op="delete" title="删除这个语料包">✕</button></span>` : ''
+    const head = S.editing === key
+      ? `<div class="edit"><input class="field" value="${esc(p.label)}" data-k="${esc(key)}"><button class="btn primary" data-op="save">改名</button><button class="btn" data-op="cancel">取消</button></div>`
+      : `<div class="name" title="${esc(p.label)}">${esc(p.label)}</div>${tools}`
+    const del = S.deleting === key
+      ? `<div class="confirm">删掉这个包的 ${p.total} 条语料（连同批注）？<span><button class="btn dangerbtn" data-op="confirmdel">删除</button><button class="btn" data-op="cancel">算了</button></span></div>` : ''
+    return `<div class="pack ${S.pack === key ? 'on' : ''} ${S.deleting === key ? 'warn' : ''}" data-k="${esc(key)}" role="button" tabindex="0">
+      <div class="phead">${head}</div>
+      <div class="nums">${p.total} 条 · 手动 ${p.total - p.unlabeled} · 自动 ${p.unlabeled}${p.autoFish ? `（判鱼 ${p.autoFish}）` : ''}</div>
+      <div class="stack">
+        <i style="width:${pct(p.good)};background:var(--good)"></i><i style="width:${pct(p.funny)};background:var(--funny)"></i><i style="width:${pct(p.goodfish || 0)};background:var(--goodfish)"></i>
+        <i style="width:${pct(p.fish)};background:var(--fish)"></i><i style="width:${pct(p.bad)};background:var(--bad)"></i>
+        <i style="width:${pct(p.autoFish)};background:var(--auto)"></i><i style="width:${pct(human)};background:transparent"></i>
+      </div>${del}</div>`
+  }
+
+  function renderPacks() {
+    const o = S.state.overview
+    const all = { label: '全部', total: o.total, good: o.count.good, funny: o.count.funny, goodfish: o.count.goodfish, fish: o.count.fish, bad: o.count.bad, autoFish: o.autoFish, unlabeled: o.auto }
+    $('packs').innerHTML = packRow('', all) + S.state.packs.map((p) => packRow(p.key, { ...p, label: p.key })).join('')
+  }
+
+  $('packs').addEventListener('click', async (e) => {
+    const row = e.target.closest('.pack'); if (!row) return
+    const key = row.dataset.k
+    const op = e.target.closest('[data-op]') && e.target.closest('[data-op]').dataset.op
+    if (op === 'rename') { S.editing = key; S.deleting = null; renderPacks(); const i = row.ownerDocument.querySelector(`.pack[data-k="${CSS.escape(key)}"] input`); if (i) { i.focus(); i.select() } return }
+    if (op === 'delete') { S.deleting = key; S.editing = null; renderPacks(); return }
+    if (op === 'cancel') { S.editing = null; S.deleting = null; renderPacks(); return }
+    if (op === 'save') return saveRename(key, row.querySelector('input').value)
+    if (op === 'confirmdel') {
+      toast('正在删除，顺便重新蒸馏，稍等几秒…')
+      const r = await api('/api/pack/delete', { key })
+      S.deleting = null
+      if (S.pack === key) S.pack = ''
+      toast(`删掉了 ${r.deleted} 条（误删的话，它们存在 .fishtalk/trash.jsonl 里）`)
+      await loadState(); refreshView(); return
+    }
+    if (e.target.closest('input')) return
+    if (S.editing || S.deleting) return
+    S.pack = key
+    renderPacks()
+    refreshView()
+  })
+  $('packs').addEventListener('keydown', (e) => {
+    if (e.target.tagName !== 'INPUT') return
+    if (e.key === 'Enter') saveRename(e.target.dataset.k, e.target.value)
+    if (e.key === 'Escape') { S.editing = null; renderPacks() }
+  })
+  async function saveRename(from, to) {
+    to = String(to || '').trim()
+    if (!to || to === from) { S.editing = null; renderPacks(); return }
+    toast('正在改名，顺便重新蒸馏，稍等几秒…')
+    const r = await api('/api/pack/rename', { from, to })
+    S.editing = null
+    if (S.pack === from) S.pack = to
+    toast(`改好了：${to}（${r.renamed} 条）`)
+    await loadState(); refreshView()
+  }
+
+  /* ---------- 批注 ---------- */
+  async function loadItems(keepId) {
+    const u = new URLSearchParams({ pack: S.pack, filter: S.filter, q: S.q })
+    const r = await api('/api/items?' + u)
+    S.items = r.items
+    S.idx = keepId ? Math.max(0, S.items.findIndex((x) => x.id === keepId)) : 0
+    S.history = []
+    $('found').textContent = `${r.total} 条${r.total > r.items.length ? `（先显示前 ${r.items.length} 条）` : ''}`
+    renderCard(); renderList()
+  }
+
+  function renderCard() {
+    $('undo').disabled = S.history.length === 0
+    const it = S.items[S.idx]
+    const has = Boolean(it)
+    for (const b of document.querySelectorAll('.choice, #skip, #clear')) b.disabled = !has
+    if (!has) {
+      $('meta').innerHTML = ''
+      $('text').textContent = S.q ? '没搜到。换个关键词试试。' : S.filter === 'unlabeled' ? '这个包里没有未批的了 🎉' : '这里是空的。'
+      $('why').textContent = ''
+      return
+    }
+    const where = it.title || it.where || ''
+    $('meta').innerHTML =
+      `<span class="src">${esc(NAMES[it.source] || it.source)}</span><span>${esc(KINDS[it.kind] || it.kind || '')}</span>` +
+      (S.pack ? '' : `<span title="${esc(it.pack)}">${esc(it.pack)}</span>`) +
+      (it.label ? `<span class="tag ${it.label}">已标：${LABELS[it.label]}</span>` : it.autoFish ? '<span class="tag auto">自动判成鱼</span>' : '<span class="tag" style="background:var(--hover);color:var(--sub)">自动当真人</span>') +
+      (it.likes ? `<span class="likes">${it.likes} 赞</span>` : '')
+    $('text').textContent = it.text
+    $('why').textContent = it.autoFish && it.reasons.length ? '自动判鱼的理由：' + it.reasons.join('；') : ''
+  }
+
+  function hl(text) {
+    const t = esc(text)
+    if (!S.q) return t
+    const q = esc(S.q).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    return t.replace(new RegExp(q, 'gi'), (m) => `<mark>${m}</mark>`)
+  }
+
+  // 右边列表：整批都列出来，可以上下滑着看；当前这条高亮，并且自动滚到能看见的位置
+  function renderList() {
+    $('sideTitle').textContent = S.q ? '搜索结果（点哪条跳哪条）' : '这一批（点哪条跳哪条）'
+    $('sideCount').textContent = S.items.length ? `第 ${Math.min(S.idx + 1, S.items.length)} / ${S.items.length} 条` : ''
+    if (!S.items.length) { $('list').innerHTML = '<div class="empty">没有了</div>'; return }
+    $('list').innerHTML = S.items.map((x, n) => {
+      const tag = x.label ? `<span class="tag ${x.label}">${LABELS[x.label]}</span>` : x.autoFish ? '<span class="tag auto">鱼?</span>' : ''
+      return `<button class="row ${n === S.idx ? 'cur' : ''}" data-n="${n}"><span class="n">${n + 1}</span><span class="t">${hl(x.text)}</span>${tag}</button>`
+    }).join('')
+    const cur = $('list').querySelector('.row.cur')
+    if (cur) {
+      // 只在当前这条跑出可视范围时才滚，免得用户自己往上翻着看的时候被拽回去
+      const L = $('list'), top = cur.offsetTop - L.offsetTop
+      if (top < L.scrollTop || top + cur.offsetHeight > L.scrollTop + L.clientHeight) L.scrollTop = Math.max(0, top - L.clientHeight / 3)
+    }
+  }
+
+  $('list').addEventListener('click', (e) => {
+    const r = e.target.closest('.row'); if (!r) return
+    S.history.push({ idx: S.idx, id: null })
+    S.idx = Number(r.dataset.n)
+    renderCard(); renderList()
+  })
+
+  function press(el) { el.classList.add('hit'); setTimeout(() => el.classList.remove('hit'), 130) }
+
+  async function mark(label) {
+    const it = S.items[S.idx]
+    if (S.busy || !it) return
+    S.busy = true
+    press(document.querySelector(`[data-l="${label}"]`))
+    const stamp = $('stamp')
+    stamp.textContent = LABELS[label]
+    stamp.style.color = getComputedStyle(document.documentElement).getPropertyValue(`--${label}`)
+    stamp.classList.add('on')
+    const prev = it.label
+    const r = await api('/api/label', { id: it.id, label })
+    it.label = label; it.autoFish = false
+    S.history.push({ idx: S.idx, id: it.id, prev })
+    setTimeout(() => {
+      stamp.classList.remove('on')
+      $('card').classList.add('leave')
+      setTimeout(() => {
+        S.idx = Math.min(S.idx + 1, S.items.length)
+        renderCard(); renderList(); $('card').classList.remove('leave'); S.busy = false
+      }, 140)
+      toast(`标成了「${LABELS[label]}」`, true)
+      if (r.distilled) setTimeout(() => toast('文风包已经按你点的更新了 ✓'), 1000)
+      loadState()
+    }, 160)
+  }
+
+  async function undo() {
+    if (S.busy || !S.history.length) return
+    const h = S.history.pop()
+    press($('undo'))
+    if (h.id) {
+      await api('/api/label', { id: h.id, label: h.prev || null })
+      const it = S.items.find((x) => x.id === h.id); if (it) it.label = h.prev || null
+      toast('撤销了')
+      loadState()
+    }
+    S.idx = h.idx
+    renderCard(); renderList()
+  }
+
+  async function clearMark() {
+    const it = S.items[S.idx]; if (!it || !it.label) return
+    S.history.push({ idx: S.idx, id: it.id, prev: it.label })
+    await api('/api/label', { id: it.id, label: null })
+    it.label = null
+    toast('清掉了，这条回到自动判断', true)
+    renderCard(); renderList(); loadState()
+  }
+
+  function skip() {
+    if (S.busy || S.idx >= S.items.length) return
+    press($('skip'))
+    S.history.push({ idx: S.idx, id: null })
+    S.idx++
+    renderCard(); renderList()
+  }
+
+  $('choices').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b && !b.disabled) mark(b.dataset.l) })
+  $('undo').onclick = undo; $('toastUndo').onclick = undo; $('skip').onclick = skip; $('clear').onclick = clearMark
+  $('filter').addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return
+    S.filter = b.dataset.f
+    for (const x of $('filter').children) x.classList.toggle('on', x === b)
+    loadItems()
+  })
+  $('q').addEventListener('input', () => { clearTimeout(qTimer); qTimer = setTimeout(() => { S.q = $('q').value.trim(); loadItems() }, 200) })
+
+  /* ---------- 文风包 ---------- */
+  async function loadPackView() {
+    const { pack } = await api('/api/pack?pack=' + encodeURIComponent(S.pack))
+    if (!pack) { $('packView').innerHTML = '<div class="empty">还没有文风包。先喂点语料。</div>'; return }
+    const pairs = (a) => (a && a.length ? a.map(([k, c]) => `「${esc(k)}」${c}`).join('　') : '（样本太少）')
+    $('packView').innerHTML =
+      `<div class="crumb">文风包 · <b>${esc(pack.name)}</b>　蒸馏于 ${esc(pack.made)}${pack.small ? '　<span class="tag auto">这个包不到 30 条，下面显示的是全部的</span>' : ''}</div>
+      <div class="tiles">
+        <div class="tile"><div class="k">句子长度（中位）</div><div class="v">${pack.length.median} 字</div><div class="d">常见 ${pack.length.p25}～${pack.length.p75} 字（只作参考，不判鱼）</div></div>
+        <div class="tile"><div class="k">结尾不加标点</div><div class="v">${Math.round(pack.noEndPunctRatio * 100)}%</div><div class="d">${pairs(pack.endings)}</div></div>
+        <div class="tile"><div class="k">句尾语气词</div><div class="d" style="font-size:14px;color:var(--ink)">${pairs(pack.particles)}</div></div>
+        <div class="tile"><div class="k">常见开头</div><div class="d" style="font-size:14px;color:var(--ink)">${pairs(pack.openings)}</div></div>
+      </div>
+      <div class="box"><h4>范例（学味道，不照抄）</h4><ul>${pack.examples.map((e) => `<li>${esc(e.text)}${e.label === 'funny' ? ' <span class="tag funny">好笑</span>' : e.label === 'good' ? ' <span class="tag good">好</span>' : ''}${e.likes ? ` <span class="muted">${e.likes} 赞</span>` : ''}</li>`).join('')}</ul></div>`
+  }
+
+  /* ---------- 黑名单 ---------- */
+  async function loadBlack() {
+    $('blackCrumb').innerHTML = `范围：<b>${esc(S.pack || '全部')}</b>（左边点别的包可以切换）`
+    const [auto, manual, bl] = await Promise.all([
+      api('/api/items?' + new URLSearchParams({ pack: S.pack, filter: 'autofish', limit: 500 })),
+      api('/api/items?' + new URLSearchParams({ pack: S.pack, filter: 'fish', limit: 500 })),
+      api('/api/blacklist'),
+    ])
+    const fishRow = (x, ops) => `<div class="fishrow" data-id="${x.id}"><div class="t">${esc(x.text)}${x.reasons && x.reasons.length ? `<div class="r">理由：${esc(x.reasons.join('；'))}</div>` : ''}</div><div class="ops">${ops}</div></div>`
+    $('autoFishList').innerHTML = auto.items.length
+      ? auto.items.map((x) => fishRow(x, '<button class="btn" data-op="good">放回（标「好」）</button><button class="btn" data-op="fish">确认是鱼</button>')).join('')
+      : '<div class="muted">没有被自动判成鱼的。</div>'
+    $('manualFishList').innerHTML = manual.items.length
+      ? manual.items.map((x) => fishRow(x, '<button class="btn" data-op="clear">取消标记</button>')).join('')
+      : '<div class="muted">还没有手动标成鱼的。</div>'
+    $('rules').innerHTML = `<div style="overflow:auto"><table><tr><th>类型</th><th>说明</th><th>规则</th></tr>${bl.rules.map((r) => `<tr><td>${esc(r.kind)}</td><td>${esc(r.why)}</td><td><code>${esc(r.pattern)}</code></td></tr>`).join('')}</table></div>`
+  }
+  for (const id of ['autoFishList', 'manualFishList']) {
+    $(id).addEventListener('click', async (e) => {
+      const b = e.target.closest('button[data-op]'); if (!b) return
+      const row = b.closest('.fishrow')
+      const op = b.dataset.op
+      await api('/api/label', { id: row.dataset.id, label: op === 'clear' ? null : op })
+      row.style.opacity = .35
+      toast(op === 'good' ? '放回了，下次蒸馏算进真人' : op === 'fish' ? '确认是鱼' : '取消了标记')
+      loadState()
+    })
+  }
+
+  /* ---------- 喂料 ---------- */
+  // 下拉框：现有的语料包 + 「新建一个」。默认选左边当前选中的包，没选就默认新建
+  function renderFeedPacks(prefer) {
+    const sel = $('feedPack')
+    const keep = prefer || sel.value
+    sel.innerHTML = S.state.packs.map((p) => `<option value="${esc(p.key)}">${esc(p.key)}（${p.total} 条）</option>`).join('') +
+      '<option value="__new__">＋ 新建一个语料包…</option>'
+    sel.value = keep && [...sel.options].some((o) => o.value === keep) ? keep : (S.pack || '__new__')
+    $('feedNew').hidden = sel.value !== '__new__'
+  }
+  $('feedPack').onchange = () => { $('feedNew').hidden = $('feedPack').value !== '__new__'; if (!$('feedNew').hidden) $('feedNew').focus() }
+
+  $('feedBtn').onclick = async () => {
+    const text = $('feedText').value.trim(); if (!text) return
+    const isNew = $('feedPack').value === '__new__'
+    const scene = isNew ? $('feedNew').value.trim() : $('feedPack').value
+    if (isNew && !scene) { $('feedNew').focus(); $('feedResult').textContent = '给新语料包起个名字'; return }
+    $('feedResult').textContent = '喂着呢…'
+    const r = await api('/api/feed', { text, scene })
+    $('feedResult').textContent = `读到 ${r.read} 条，新增 ${r.added} 条${r.distilled ? '，文风包已更新' : ''}。`
+    if (r.added) {
+      $('feedText').value = ''
+      await loadState()
+      $('feedNew').value = ''
+      renderFeedPacks(scene)   // 新建的包喂完以后，下拉框自动选中它，接着喂就不用再填名字
+    }
+  }
+
+  $('distillBtn').onclick = async () => { toast('蒸馏中，稍等几秒…'); const r = await api('/api/distill', {}); toast(r.ok ? '文风包已重新蒸馏 ✓' : '蒸馏失败'); loadState(); refreshView() }
+
+  /* ---------- 切换 ---------- */
+  function refreshView() {
+    if (S.tab === 'label') loadItems()
+    else if (S.tab === 'pack') loadPackView()
+    else if (S.tab === 'black') loadBlack()
+    else if (S.tab === 'feed') { $('feedPack').value = ''; renderFeedPacks() }
+  }
+  $('tabs').addEventListener('click', (e) => {
+    const b = e.target.closest('.tab'); if (!b) return
+    S.tab = b.dataset.t
+    for (const t of $('tabs').children) t.classList.toggle('on', t === b)
+    for (const v of document.querySelectorAll('.view')) v.hidden = v.dataset.v !== S.tab
+    refreshView()
+  })
+
+  document.addEventListener('keydown', (e) => {
+    const typing = /INPUT|TEXTAREA/.test(document.activeElement.tagName)
+    if (e.key === 'Escape' && typing) { document.activeElement.blur(); return }
+    if (typing || e.ctrlKey || e.metaKey || e.altKey || S.tab !== 'label') return
+    const k = e.key.toLowerCase()
+    const KEYS = { 1: 'good', 2: 'funny', 3: 'goodfish', 4: 'fish', 5: 'bad' }
+    if (k === '/') { e.preventDefault(); $('q').focus() }
+    else if (KEYS[k]) mark(KEYS[k])
+    else if (k === 'z' || k === 'backspace') { e.preventDefault(); undo() }
+    else if (k === ' ' || k === 'arrowright') { e.preventDefault(); skip() }
+  })
+
+  loadState().then(() => loadItems())
+</script>
+</body>
+</html>

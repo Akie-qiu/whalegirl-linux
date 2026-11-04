@@ -36,7 +36,8 @@
   function populate() {
     for (const name of numeric) field(name).value = cfg[name];
     $('chat-habits-enabled').checked = cfg.chat_habits_enabled;
-    text('autonomy-mode','统一自主聊天：人格卡与本群表达决定语气');
+    $('autonomy-enabled').checked = cfg.autonomy_enabled ?? false;
+    text('autonomy-mode', cfg.autonomy_enabled ? '当前使用新版自主聊天' : '当前使用旧版回复逻辑');
     $('followup-wait-enabled').checked = cfg.followup_wait_enabled ?? true;
     $('editable-memory-enabled').checked = cfg.editable_memory_enabled;
     $('web-search-enabled').checked = cfg.web_search_enabled;
@@ -47,7 +48,12 @@
     $('interest-keywords').value = (cfg.interest_keywords || []).join('\n');
     $('repeat-probability').value = Math.round(cfg.repeat_probability * 100);
     chatLabels();
-    document.querySelector('label[for="send-interval"]').textContent = '所有会话两轮回复最短间隔 / 秒';
+    const intervalLabel = document.querySelector('label[for="send-interval"]');
+    const intervalTitle = intervalLabel?.querySelector('[data-control-label]');
+    if (intervalTitle) intervalTitle.textContent = '所有会话两轮回复最短间隔 / 秒';
+    else if (intervalLabel && !intervalLabel.contains($('send-interval'))) {
+      intervalLabel.textContent = '所有会话两轮回复最短间隔 / 秒';
+    }
   }
   function chatLabels() {
     const select = $('memory-chat'); const value = select.value; select.replaceChildren();
@@ -79,7 +85,7 @@
       })); intents.append(row);
     }
     const labels = {speak:'选择参与',silent:'选择旁观',observe:'合并观察',growth:'整理经验',wait:'等待补充',mood_changed:'情绪变化',reading_considered:'考虑过的新见闻'};
-    if (!result.events.length) events.textContent = '这里显示参与依据和成长记录';
+    if (!result.events.length) events.textContent = '开启新版后显示参与依据和成长记录';
     for (const item of result.events) {
       const row = document.createElement('article'); row.className = 'record';
       const title = document.createElement('strong'); title.textContent = (labels[item.kind] || item.kind) + ' · ' + chatName(item.chat);
@@ -112,6 +118,17 @@
     }
     if (!(result.experiences || []).length) diary.textContent = '值得留下的真实互动才会入档；与现有记忆共用来源、编辑、停用和恢复功能';
   }
+  $('autonomy-enabled').onchange = async () => {
+    const control = $('autonomy-enabled'); const value = control.checked; control.disabled = true;
+    try {
+      if (window.proactiveChat?.save) await window.proactiveChat.save(false);
+      else await saveSubset({autonomy_enabled:value});
+      notice(value ? '已切换到新版自主聊天。' : '已切回旧版回复逻辑，接续意图与新版旁听学习已暂停。');
+      if ($('autonomy-details').open) await refreshAutonomy();
+    } catch (error) {
+      control.checked = cfg.autonomy_enabled ?? false; notice(error.message, true);
+    } finally { control.disabled = false; }
+  };
   $('refresh-autonomy').onclick = () => action($('refresh-autonomy'), refreshAutonomy);
   $('autonomy-details').ontoggle = () => {
     if ($('autonomy-details').open) refreshAutonomy().catch(error => notice(error.message, true));

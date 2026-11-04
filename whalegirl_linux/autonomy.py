@@ -1,7 +1,7 @@
 """Opt-in conversational agency, grounded follow-ups and incremental learning.
 
-No timer calls a model without new evidence or a due intention, and every
-outbound action still uses the existing ledger. There is one chat engine.
+The switch gates every new behavior. No timer calls a model without new evidence
+or a due intention, and every outbound action still uses the existing ledger.
 """
 from __future__ import annotations
 
@@ -18,20 +18,19 @@ from .topic_relevance import current_query, related_topic
 
 
 def enabled(settings):
-    return True
+    return bool(getattr(settings, 'autonomy_enabled', False))
 
 
 STATIC_PROMPT = '''
-【自主参与接口】普通指令按实际需求执行，非任务交流由你决定是否参与。
-除原有字段，可返回participation_reason（供管理员看的简短行动依据，不写内部思考）、intent_ops和mood_update；没有变化就留空。
-intent_ops用于有真实来由的后续聊天，最多2项：
-{"op":"plan","topic":"以后想接续的具体事情","source_key":"本会话真实消息key","after_minutes":60,"expires_minutes":1440}，到期分钟须大于等待分钟，最长10080分钟；
-已有意图可用{"op":"complete|cancel","id":"本轮提供的确切意图ID"}结束。不要为普通寒暄创建任务，不承诺一定到点联系。
-时间按真实消息和北京时间理解；没有明确的未来事情就不建意图。已有相关意图不重复建，对方已说明结果或不想聊就完成或取消。
-mood_update可为{"mood":"normal|proud|flustered|grumpy|jealous|hyped|sleepy","energy_delta":2,"source_key":"真实消息key","reason":"具体互动依据"}。
-情绪随真实互动自然轻微起伏（如开心得意、害羞不好意思、小吃味或被哄好），不借情绪改变好感度或核心人设，不把角色背景写成三次元线下经历。
-讨论接口故障、模型能力等技术问题时正常处理任务，不因单独提到角色名字就提交害羞或吃醋；没有新的情绪事件时让mood_update留空，由已有状态自然平复。
-learning_proposals中的相处经验写清适用场景和例外，引用真实发言；学习新的理解，不背固定台词，不因对方没回复就认定被讨厌。
+【自主参与】保持真实少女活人感。看清语境自由选择旁观、文字、原生表情或穿插发送，不凑格式或字数；普通任务及时做。
+可选JSON扩展字段（无变动留空）：
+1. participation_reason：简短行动依据（供管理员查看）。
+2. intent_ops：最多2项后续跟进，基于真实来由：
+   - 规划：{"op":"plan","topic":"以后想接续的具体事情","source_key":"本会话真实消息key","after_minutes":60,"expires_minutes":1440}（到期须大于等待，最长10080分）
+   - 结束：{"op":"complete|cancel","id":"确切意图ID"}。普通寒暄不建，不承诺一定到点联系。
+3. mood_update：真实互动引起的情绪微澜：
+   {"mood":"normal|proud|flustered|grumpy|jealous|hyped|sleepy","energy_delta":2,"source_key":"真实消息key","reason":"具体互动依据"}。无新情绪事件留空自然平复。
+4. learning_proposals：相处经验写清适用场景与例外，引用真实发言。
 '''
 
 
@@ -360,13 +359,12 @@ class AutonomyService:
                 '\nexchange是前后交流，confirmed_actions是本角色已确认发送的消息，二者可能描述同一条发言，不能重复计数。'
                 'account_history仅表示此微信账号的历史，未核实为当前角色，不据此学习自身文风。'
                 '只用learnable_keys里新增真人本人发言作证据；上下文、自身历史和回执只解释处境，不充当认可。'
-                '优先发现真人怎样衔接、用句、玩笑和收尾，适用条件明确时用chat_style或expression记录，并逐字引用真人表达；不把表达学习都变成黑话释义、人物事实或劝人照顾自己的准则。'
                 '观察自己怎样接话、对方怎样接及后续纠正；明确反馈和多次一致互动才支持经验。'
                 '没有回复、单个笑声或一次起哄不能直接证明喜欢或讨厌；不优化为讨好，不照搬台词。'
                 '提议写在什么场合适用及例外，区分个人偏好、本群习惯和临时玩笑。'
                 if self.experience.active() else '')
             raw = await asyncio.wait_for(engine.chat([{'role':'user','content':json.dumps(data, ensure_ascii=False)}],
-                system_prompt=('你在后台观察真实群友交流，不扮演角色、不发消息。\n' + LEARNING_PROMPT)
+                system_prompt=(s.system_prompt_override.strip() or r.styles.get_active().system_prompt) + LEARNING_PROMPT
                 + self.experience.static_prompt()
                 + exchange_rules
                 + '\n这是后台旁听学习，不发微信消息。只输出JSON：{"learning_proposals":[],"experience_update":null}，提议最多2条，体验最多1条。'
@@ -442,4 +440,4 @@ class AutonomyService:
             row['details'] = json.loads(row.pop('details_json'))
         return {'enabled': self.active(), 'busy': self.busy, 'last_error': self.last_error,
                 'experience_enabled': self.experience.active(), 'experiences': self.experience.diary(),
-                'intents': intents, 'events': events, 'mode': '自主聊天'}
+                'intents': intents, 'events': events, 'mode': '新版自主聊天' if self.active() else '旧版回复逻辑'}

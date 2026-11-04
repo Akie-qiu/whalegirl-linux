@@ -114,18 +114,30 @@ class StickerCatalog:
     def chat_signal(self, md5):
         return sticker_emotional_signal(self.profiles.get(md5), self.entries.get(md5, ''))
 
-    def candidates(self,text,limit=8,used=()):
+    def candidates(self,text,limit=8,used=(),history=None):
         available=self.choices()
+        history=history or {}
+        if limit<=0:return {}
         words=set(re.findall(r'[A-Za-z0-9_]{2,}|[\u3400-\u9fff]{2}',text.casefold()))
         for phrase in re.findall(r'[\u3400-\u9fff]{2,}',text):words.update(phrase[i:i+2] for i in range(len(phrase)-1))
         def score(md5):
             profile=self.profiles.get(md5,{})
             haystack=(available[md5]+' '+json.dumps(profile,ensure_ascii=False)).casefold()
             return sum(w in haystack for w in words)
-        # Cycle the unranked tail so equally relevant choices do not always mean the first favorite.
-        ids=list(available);shift=int(time.time()//60)%max(1,len(ids));ids=ids[shift:]+ids[:shift]
-        ranked=sorted((m for m in ids if m not in used),key=score,reverse=True)
-        return {m:available[m] for m in ranked[:limit]}
+        def usage(md5):
+            item=history.get(md5) or {}
+            return (bool(item.get('recent')),int(item.get('count') or 0),float(item.get('last') or 0))
+        ids=[m for m in available if m not in used]
+        scores={m:score(m) for m in ids}
+        # Keep most slots relevant and reserve a small tail for less-used options.
+        # The order stays stable until the actual catalog or usage changes.
+        ranked=sorted(ids,key=lambda m:(-scores[m],*usage(m),m))
+        primary=max(1,limit-max(1,limit//4)) if limit>1 else 1
+        chosen=ranked[:primary]
+        remaining=[m for m in ids if m not in chosen]
+        remaining.sort(key=lambda m:(*usage(m),-scores[m],m))
+        chosen.extend(remaining[:max(0,limit-len(chosen))])
+        return {m:available[m] for m in chosen}
 
     def details(self,choices):
         fields=PROFILE_FIELDS

@@ -1,0 +1,35 @@
+{
+  "name": "fishtalk",
+  "version": "0.3.6",
+  "description": "教你的 AI 说人话：只读的语料小工具，学真人怎么说话，发之前拦一下八股。DSH 插件 + 命令行，Claude Code / Codex 也能用。",
+  "bin": {
+    "fishtalk": "fishtalk.js"
+  },
+  "exports": {
+    ".": "./lib/dsh/index.mjs",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "fishtalk.js",
+    "lib/",
+    "skills/",
+    "cordis.patch.yml",
+    "AGENT.md",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {},
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Nozzi2455/fishtalk.git"
+  },
+  "homepage": "https://github.com/Nozzi2455/fishtalk"
+}

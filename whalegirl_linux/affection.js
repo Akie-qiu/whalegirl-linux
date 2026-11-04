@@ -5,16 +5,22 @@
   const panel=el('section','panel span-all');panel.id='affection-panel';
   panel.append(el('h2','','人物好感度'),el('p','muted','同一微信 ID 在所有已授权群和私聊共用好感度。群聊只表达朋友式关心；私聊可更亲近，个人事实与偏好继续按原规则共享。分数仅后台可见。'));
   const enabled=el('input');enabled.id='affection-enabled';enabled.type='checkbox';enabled.className='toggle';enabled.setAttribute('aria-label','好感度系统总开关');
-  const enabledLabel=el('div','setting-row'),enabledCopy=el('div');enabledCopy.append(el('strong','','好感度系统总开关'),el('p','','切换后自动保存。关闭后停止自动计分，也不按好感度调整语气和记忆优先级；已有分数与记录保留。'));
+  const enabledLabel=el('div','setting-row'),enabledCopy=el('div');enabledCopy.append(el('strong','','好感度系统'),el('p','','关闭后停止自动计分及好感度个性化，已有分数和记录保留。修改后保存聊天表达。'));
   enabledLabel.append(enabledCopy,enabled);
   const enabledStatus=el('p','hint');enabledStatus.id='affection-enabled-status';enabledStatus.setAttribute('aria-live','polite');
-  const privateStyle=el('select');for(const [v,t] of [['close','熟悉后可更亲近，跟随对方语气'],['warm','始终保持温暖朋友语气']]){const o=el('option','',t);o.value=v;privateStyle.append(o);}
+  const privateStyle=el('select');privateStyle.id='expression-affection-private-style';for(const [v,t] of [['close','熟悉后可更亲近，跟随对方语气'],['warm','始终保持温暖朋友语气'],['unreserved','毫无保留 · 只娇不傲（对其他人私聊也保持甜软坦率）']]){const o=el('option','',t);o.value=v;privateStyle.append(o);}
   const privateLabel=el('label','','私聊表达');privateLabel.append(privateStyle);
+  const privateUnreserved=el('input');privateUnreserved.id='expression-private-unreserved-enabled';privateUnreserved.type='checkbox';
+  const privateUnreservedLabel=el('label','check-label');privateUnreservedLabel.id='expression-private-unreserved-label';
+  privateUnreservedLabel.append(privateUnreserved,document.createTextNode('与其他人的私聊也保持“毫无保留 · 只娇不傲”（不嘴硬推拉，坦率软糯回应）'));
+  const rulePrivateUnreserved=el('input');rulePrivateUnreserved.id='affection-private-unreserved-enabled';rulePrivateUnreserved.type='checkbox';
+  const rulePrivateUnreservedLabel=el('label','check-label');
+  rulePrivateUnreservedLabel.append(rulePrivateUnreserved,document.createTextNode('与其他人的私聊也保持“毫无保留 · 只娇不傲”（不嘴硬推拉，坦率软糯回应）'));
   const ownerIdsInput=el('input');ownerIdsInput.type='text';ownerIdsInput.id='affection-owner-ids';ownerIdsInput.maxLength=400;ownerIdsInput.placeholder='例如：wxid_xxx（多个用逗号分隔）';
   const ownerIdsLabel=el('label','','主人专属微信 ID（仅私聊放开亲昵与敏感边界）');ownerIdsLabel.append(ownerIdsInput);
-  const settingsBox=el('details','settings-drawer');settingsBox.append(el('summary','','⚙️ 好感度计分规则与私聊语气设置'));
+  const settingsBox=el('details','settings-drawer');settingsBox.append(el('summary','','好感度计分规则与主人设置'));
   const settingsGrid=el('div','two-fields');settingsGrid.style.marginTop='10px';
-  settingsGrid.append(privateLabel,ownerIdsLabel);
+  settingsGrid.append(privateLabel,privateUnreservedLabel,ownerIdsLabel,rulePrivateUnreservedLabel);
   const inputs={};for(const [name,title,min,max] of [
     ['affection_initial_score','未建立记录的新人物初始好感度',0,100],
     ['affection_daily_gain','每人每天最多增加',0,20],['affection_daily_loss','每人每天最多降低',0,20],
@@ -23,7 +29,7 @@
   }
   const saveRuleBtn=button('保存好感度规则',async()=>{
     const ownerIds=ownerIdsInput.value.split(/[,，\s]+/).map(s=>s.trim()).filter(Boolean).slice(0,20);
-    const values={affection_private_style:privateStyle.value,owner_ids:ownerIds};
+    const values={owner_ids:ownerIds,private_unreserved_enabled:rulePrivateUnreserved.checked};
     for(const [n,input] of Object.entries(inputs))values[n]=Number(input.value);
     await saveSubset(values);await load();notice('好感度规则已保存');
   });
@@ -32,6 +38,7 @@
   ruleFooter.append(el('span','hint','只累计有效交流，不按消息条数刷分；离线不扣分。'),saveRuleBtn);
   settingsBox.append(settingsGrid,ruleFooter);
   panel.append(enabledLabel,enabledStatus,settingsBox);
+  const expressionLink=el('p','hint');const expressionAnchor=el('a','','前往聊天表达调整好感度开关与私聊语气 →');expressionAnchor.href='#expression-panel';expressionLink.append(expressionAnchor);panel.prepend(expressionLink);
   const toolbar=el('div','chat-toolbar'),query=el('input');query.type='search';query.placeholder='搜索昵称或真实微信 ID';query.setAttribute('aria-label','搜索好感度人物');
   toolbar.append(query,button('查询 / 刷新',load));const count=el('p','hint'),list=el('div','bento-grid');list.id='affection-list';panel.append(toolbar,count,list);$('memory-panel').after(panel);
   const nav=el('a','','人物好感度');nav.href='#affection-panel';document.querySelector('nav').append(nav);
@@ -50,7 +57,15 @@
     finally{toggling=false;for(const input of controls)input.disabled=false;}
   }
   enabled.onchange=()=>toggle(enabled);
-  function populate(){if(!cfg)return;syncEnabled();privateStyle.value=cfg.affection_private_style;ownerIdsInput.value=Array.isArray(cfg.owner_ids)?cfg.owner_ids.join(', '):'';for(const [n,input] of Object.entries(inputs))input.value=cfg[n];}
+  async function toggleUnreserved(control){
+    const value=!!control.checked;
+    privateUnreserved.checked=value;rulePrivateUnreserved.checked=value;
+    try{await saveSubset({private_unreserved_enabled:value});notice(value?'已开启：与其他人私聊也保持“毫无保留 · 只娇不傲”':'已关闭：仅对主人私聊保持“毫无保留 · 只娇不傲”');}
+    catch(error){if(cfg){privateUnreserved.checked=!!cfg.private_unreserved_enabled;rulePrivateUnreserved.checked=!!cfg.private_unreserved_enabled;}notice(error.message,true);}
+  }
+  privateUnreserved.onchange=()=>toggleUnreserved(privateUnreserved);
+  rulePrivateUnreserved.onchange=()=>toggleUnreserved(rulePrivateUnreserved);
+  function populate(){if(!cfg)return;syncEnabled();privateStyle.value=cfg.affection_private_style;privateUnreserved.checked=!!cfg.private_unreserved_enabled;rulePrivateUnreserved.checked=!!cfg.private_unreserved_enabled;ownerIdsInput.value=Array.isArray(cfg.owner_ids)?cfg.owner_ids.join(', '):'';for(const [n,input] of Object.entries(inputs))input.value=cfg[n];}
   async function history(person,box){
     const r=await api('affection/revisions?subject='+encodeURIComponent(person.subject));box.replaceChildren();
     if(!r.revisions.length)box.append(el('p','hint','还没有变化记录'));
@@ -126,6 +141,7 @@
   }
   nav.addEventListener('click',()=>load().catch(e=>notice(e.message,true)));
   window.addEventListener('hashchange',()=>{if(location.hash==='#affection-panel')load().catch(e=>notice(e.message,true));});
-  window.affection={populate,toggle,load,stateUpdated(){if(!loaded&&cfg&&location.hash==='#affection-panel')load().catch(e=>notice(e.message,true));}};
+  window.affection={populate,toggle,load,expressionValues(){return {affection_enabled:enabled.checked,affection_private_style:privateStyle.value,private_unreserved_enabled:privateUnreserved.checked};},stateUpdated(){if(!loaded&&cfg&&location.hash==='#affection-panel')load().catch(e=>notice(e.message,true));}};
   if(cfg)populate();
+  window.improvements?.buildExpressionPanel();
 })();

@@ -4,22 +4,23 @@
   section.id = 'proactive-panel'; section.className = 'panel span-all';
   section.innerHTML = `
     <div class="section-top"><div><span class="section-index">CHAT / AUTONOMY</span><h2>自主与主动聊天</h2>
-    <p class="muted">日常接话、主动开聊和后续话题，在这里一起管理。</p></div>
+    <p class="muted">新旧模式、日常接话、主动开聊和后续话题，在这里一起管理。</p></div>
     <span class="pill" id="proactive-status">读取中</span></div>
     <h3>聊天方式</h3><div id="proactive-mode-slot"></div>
     <div id="proactive-participation-slot" class="settings-grid"></div>
     <label class="check-label"><input id="experience-growth-enabled" type="checkbox">体验成长：从真实相处积累经历与习惯</label>
-    <p class="hint">结合群聊节奏自主选择参与，留下值得记住的互动和未说出口的想法；核心人设保留。关闭后经历仍保存，可在上方展开记录管理。公开阅读与贴吧继续使用“自主成长”里的原有开关和预算。</p>
+    <p class="hint">新版自主决策中生效。结合群聊节奏自主选择参与，留下值得记住的互动和未说出口的想法；核心人设保留。关闭后经历仍保存，可在上方展开记录管理。公开阅读与贴吧继续使用“自主成长”里的原有开关和预算。</p>
     <h3>文字与表情</h3>
     <div id="proactive-expression-slot" class="settings-grid"></div>
     <p class="hint">AI 统一决定说话、只发表情或穿插发送，积极性影响偏好，不保证固定比例；条数是上限，不是每次必须发满。</p>
     <div class="settings-grid">
+      <label>期望带表情的回复 / %<input id="sticker-usage-target" type="number" min="0" max="100" step="5"><span class="hint">建议 70～85；0 关闭频率参考。AI 会参考本会话最近20轮的使用情况，仍自主决定，不强制配图或补发。</span></label>
       <label>文字搭配表情意愿 / 100<input id="sticker-text-pair-eagerness" type="number" min="0" max="100"><span class="hint">高：说完具体内容后，更愿意用表情补充语气。</span></label>
       <label>只发表情意愿 / 100<input id="sticker-only-eagerness" type="number" min="0" max="100"><span class="hint">高：一个表情能接住时，少凑一句文字解释。</span></label>
       <label>接表情、拍一拍的表情意愿 / 100<input id="sticker-reaction-eagerness" type="number" min="0" max="100"><span class="hint">高：更愿意用表情回应轻松的表情互动。</span></label>
       <label>每轮最多原生表情 / 张<input id="sticker-max-per-reply" type="number" min="1" max="3"><span class="hint">仍受本轮总条数和账号额度限制，不要求每轮发满。</span></label>
     </div>
-    <div class="chat-toolbar"><button id="sticker-preset-rich" class="secondary" type="button">更丰富</button><button id="sticker-preset-first" class="secondary" type="button">表情优先</button></div>
+    <div class="chat-toolbar"><button id="sticker-preset-rich" class="secondary" type="button">更丰富 · 75%</button><button id="sticker-preset-first" class="secondary" type="button">表情优先 · 90%</button></div>
     <p class="hint">快捷档位填入上方设置，点击“保存全部聊天设置”生效。0～100 调整 AI 的表达偏好，不是程序随机发送的概率；意愿为0时不主动采用该方式，明确要求时仍可正常响应。</p>
     <details><summary>群聊记录整理的表情风格参考 · 可编辑</summary>
       <label>给 AI 的表达参考<textarea id="sticker-style-note" rows="5" maxlength="1200" placeholder="由管理员根据聊天记录整理的表达习惯，不放私人原话"></textarea></label>
@@ -75,6 +76,7 @@
   function stickerPreset(first){
     $('stickers-enabled').checked=true;$('sticker-aggressiveness').disabled=false;
     $('sticker-aggressiveness').value=first?'sticker_first':'very_high';
+    $('sticker-usage-target').value=first?90:75;
     $('sticker-text-pair-eagerness').value=100;$('sticker-only-eagerness').value=first?100:90;
     $('sticker-reaction-eagerness').value=100;
     text('proactive-save-note','已选择'+(first?'表情优先':'更丰富')+'，保存后生效');
@@ -83,11 +85,11 @@
   $('sticker-preset-first').onclick=()=>stickerPreset(true);
   const link = document.createElement('a'); link.href = '#proactive-panel'; link.textContent = '自主与主动聊天';
   document.querySelector('nav').append(link);
-  const names = ['experience_growth_enabled','participation','proactive_enabled','proactive_private_enabled','proactive_mentions_enabled','proactive_level',
+  const names = ['autonomy_enabled','experience_growth_enabled','participation','proactive_enabled','proactive_private_enabled','proactive_mentions_enabled','proactive_level',
     'proactive_per_day','proactive_chat_per_day','proactive_cooldown_minutes','proactive_decision_minutes',
     'proactive_idle_minutes','proactive_continuation_minutes','proactive_start_hour','proactive_end_hour','proactive_pause_hours',
     'stickers_enabled','sticker_aggressiveness','sticker_cooldown_seconds','reply_max_parts','reply_part_interval','quiet_default_minutes',
-    'sticker_text_pair_eagerness','sticker_only_eagerness','sticker_reaction_eagerness','sticker_max_per_reply','sticker_style_note'];
+    'sticker_text_pair_eagerness','sticker_only_eagerness','sticker_reaction_eagerness','sticker_max_per_reply','sticker_style_note','sticker_usage_target'];
   let chosen = new Set(), strict = new Set(), latest = null, lastFetch = 0;
   function field(name) { return name==='sticker_cooldown_seconds' ? $('style-sticker-cooldown') : $(name.replaceAll('_','-')); }
   function populate() {
@@ -98,8 +100,8 @@
     }
     chosen = new Set(cfg.proactive_chat_ids || []); strict = new Set(cfg.proactive_strict_chat_ids || []);
     chatLabels();
-    text('autonomy-mode','统一自主聊天 · 人格卡与本群表达决定语气');
-    text('proactive-save-note', '已保存 · 自主聊天 · ' +
+    text('autonomy-mode', cfg.autonomy_enabled ? '当前使用新版自主决策 · 切换立即保存本页设置' : '当前使用旧版回复逻辑 · 切换立即保存本页设置');
+    text('proactive-save-note', '已保存 · ' + (cfg.autonomy_enabled ? '新版自主决策' : '旧版回复逻辑') + ' · ' +
       (cfg.proactive_enabled ? '允许主动开聊' : '主动开聊已关闭'));
     text('proactive-pacing-note', '文字、表情及发送顺序统一由 AI 决定。' +
       (Number(cfg.proactive_idle_minutes) > 0 ? '当前主动开聊要等会话安静 ' + cfg.proactive_idle_minutes + ' 分钟，可能较晚才重提话题；希望及时接话可把下方安静时长设为 0，普通自动回复不受此等待影响。' : '主动开聊没有额外安静时长要求；判断机会不代表每次都要说话。'));

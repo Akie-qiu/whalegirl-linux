@@ -56,6 +56,19 @@ class GenerationUncertain(ValueError):
     pass
 
 
+def image_response_shape(value):
+    """Bounded protocol metadata only; never retain prompts, links or images."""
+    if not isinstance(value, dict):
+        return {'body_type': type(value).__name__}
+    fields = ('created', 'data', 'usage', 'error', 'result', 'id', 'task_id', 'object', 'status', 'refusal')
+    data = value.get('data')
+    first = data[0] if isinstance(data, list) and data else None
+    return {'body_type': 'dict', 'fields': [k for k in fields if k in value],
+        'data_type': type(data).__name__, 'data_items': len(data) if isinstance(data, list) else 0,
+        'first_item_fields': [k for k in ('b64_json', 'url', 'revised_prompt', 'refusal')
+                              if isinstance(first, dict) and k in first]}
+
+
 class ImageService:
     def __init__(self, runtime):
         self.runtime = runtime
@@ -118,7 +131,8 @@ class ImageService:
 
     def diagnose(self, identity, **values):
         """Stage/status only: never store provider bodies, signed URLs or keys."""
-        allowed = {'phase', 'http_status', 'download_attempts', 'error_type', 'original_error', 'admin_review'}
+        allowed = {'phase', 'http_status', 'download_attempts', 'error_type', 'original_error', 'admin_review',
+                   'response_shape', 'provider_error_code', 'provider_task_id', 'provider_status', 'poll_attempts'}
         if set(values) - allowed:
             raise ValueError('Invalid image diagnostic')
         with self.store.lock:
@@ -614,6 +628,80 @@ class ImageService:
                     continue
                 raise GenerationUncertain('图片已生成，但结果下载失败；未重复生成，请核对供应商结果') from exc
 
+    async def generation_result(self, client, response, job, endpoint, key, deadline):
+        """Consume an image or a documented task result, without another POST.
+
+        Sub2API task results use image.generation.task / imgtask_* and expose
+        result.data on completion. Only poll the original API origin; a response
+        cannot redirect bearer credentials to an arbitrary task URL.
+        """
+        task_id, attempts = '', 0
+        rejected = {'invalid_api_key', 'authentication_error', 'permission_error', 'insufficient_quota',
+                    'billing_hard_limit_reached', 'rate_limit_exceeded', 'invalid_request_error',
+                    'model_not_found', 'content_policy_violation', 'moderation_blocked'}
+        known_errors = rejected | {'upstream_error', 'api_error', 'server_error', 'image_generation_error'}
+        while True:
+            value = response.json()
+            self.diagnose(job['id'], response_shape=image_response_shape(value))
+            if not isinstance(value, dict):
+                raise GenerationUncertain('生图接口返回格式未确认，未重复生成，请核对供应商结果')
+            status = value.get('status')
+            if status in ('queued', 'pending', 'processing', 'in_progress', 'completed', 'succeeded', 'failed', 'cancelled'):
+                self.diagnose(job['id'], provider_status=status)
+            supplied_id = value.get('task_id') or (value.get('id') if value.get('object') == 'image.generation.task' else '')
+            if isinstance(supplied_id, str) and re.fullmatch(r'imgtask_[A-Za-z0-9_-]{4,128}', supplied_id):
+                if task_id and supplied_id != task_id:
+                    raise GenerationUncertain('供应商返回的任务编号发生变化，未重复生成')
+                task_id = supplied_id
+                self.diagnose(job['id'], provider_task_id=task_id)
+            is_task = bool(task_id or value.get('object') == 'image.generation.task')
+            result = value.get('result') if is_task and isinstance(value.get('result'), dict) else value
+            usage = result.get('usage') if isinstance(result.get('usage'), dict) else value.get('usage')
+            if isinstance(usage, dict):
+                self.change(job['id'], usage_json=json.dumps({k: v for k, v in usage.items() if isinstance(v, (int, float))}))
+            items = result.get('data') or []
+            if isinstance(items, list):
+                item = next((i for i in items if isinstance(i, dict) and
+                    (isinstance(i.get('b64_json'), str) and i['b64_json'] or
+                     isinstance(i.get('url'), str) and i['url'])), None)
+                if item:
+                    # A real image wins over an optional warning. Do not issue
+                    # a false failure after a completed, usable generation.
+                    return result, item
+            error = value.get('error') or result.get('error')
+            if error:
+                codes = [str(error.get(k) or '') for k in ('code', 'type')] if isinstance(error, dict) else []
+                code = next((v for v in codes if v in known_errors), 'other')
+                self.diagnose(job['id'], provider_error_code=code)
+                if is_task and status in ('failed', 'cancelled'):
+                    raise ValueError('供应商生图任务失败或取消（'+code+'），未自动重新生成')
+                if code in rejected:
+                    raise ValueError('生图接口拒绝本次请求（'+code+'），未自动重新生成')
+                raise GenerationUncertain('供应商返回生图错误（'+code+'），结果及扣费待核实，未重复生成')
+            refused = any(isinstance(i, dict) and i.get('refusal') for i in items) if isinstance(items, list) else False
+            if value.get('refusal') or refused:
+                self.diagnose(job['id'], provider_error_code='content_policy_violation')
+                raise ValueError('生图接口拒绝本次内容，未自动重新生成')
+            if is_task and status in ('failed', 'cancelled'):
+                raise ValueError('供应商生图任务已失败或取消，未自动重新生成')
+            if not task_id or status not in ('queued', 'pending', 'processing', 'in_progress'):
+                raise GenerationUncertain('生图接口已响应，但没有可用图片或可查询的任务结果；待核实，未重复生成')
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                raise GenerationUncertain('供应商图片任务仍未完成，已保留任务编号，未重复生成')
+            await asyncio.sleep(min(3.0, remaining))
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                raise GenerationUncertain('供应商图片任务仍未完成，已保留任务编号，未重复生成')
+            attempts += 1
+            self.diagnose(job['id'], phase='poll', poll_attempts=attempts)
+            task_url = endpoint.rsplit('/images/', 1)[0]+'/images/tasks/'+task_id
+            response = await client.get(task_url, headers={'Authorization': 'Bearer '+key},
+                                        timeout=min(15.0, remaining), follow_redirects=False)
+            self.diagnose(job['id'], http_status=response.status_code)
+            if response.status_code >= 300:
+                raise GenerationUncertain('供应商图片任务查询未确认（HTTP '+str(response.status_code)+'），已保留任务编号，未重复生成')
+
     async def generate(self, job):
         s = self.config.settings
         key = self.config.image_api_key()
@@ -656,6 +744,7 @@ class ImageService:
         self.diagnose(job['id'], phase='submit')
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(s.image_timeout,connect=15),trust_env=False) as client:
+                deadline = time.monotonic()+s.image_timeout
                 params = {'model':s.image_model,'prompt':prompt,'n':1,'size':(plan.get('canvas') or {}).get('size', s.image_size)}
                 options = {'data':{k:str(v) for k,v in params.items()},'files':files} if files else {'json':params}
                 response = await client.post(endpoint,headers={'Authorization':'Bearer '+key},**options)
@@ -664,15 +753,7 @@ class ImageService:
                     raise GenerationUncertain('生图服务异常，可能已接单，不自动再次扣费生成')
                 if response.status_code >= 400:
                     raise ValueError('生图接口返回 HTTP '+str(response.status_code)+'，请检查模型、密钥或额度')
-                value = response.json()
-                if not isinstance(value,dict):
-                    raise GenerationUncertain('生图接口返回格式尚未确认，请核对供应商任务，不自动重试')
-                usage={k:v for k,v in (value.get('usage') or {}).items() if isinstance(v,(int,float))} if isinstance(value.get('usage'),dict) else {}
-                self.change(job['id'],usage_json=json.dumps(usage))
-                items = value.get('data') or []
-                if not isinstance(items,list) or not items or not isinstance(items[0],dict):
-                    raise GenerationUncertain('接口没有直接返回图片；若返回任务ID，需要供应商的查询文档，暂不重复生成')
-                item = items[0]
+                value, item = await self.generation_result(client, response, job, endpoint, key, deadline)
                 if item.get('b64_json'):
                     self.diagnose(job['id'], phase='decode')
                     encoded = item['b64_json']

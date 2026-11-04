@@ -741,7 +741,6 @@ class AIEngine:
         temperature: float | None = None,
         max_tokens: int | None = None,
         response_format: dict | None = None,
-        operation: str = "chat",
     ) -> AsyncIterator[str]:
         """流式聊天请求，逐块返回"""
         if not self._available:
@@ -769,7 +768,7 @@ class AIEngine:
             logger.error(self.last_error)
         finally:
             self.last_response_meta={'request_fingerprint':request_fingerprint,'attempts':1}
-            self.record_usage(raw_usage,started=started,created=created,status=outcome,operation=operation)
+            self.record_usage(raw_usage,started=started,created=created,status=outcome)
 
     async def test_connection(self) -> tuple[bool, str]:
         """测试 API 连接"""

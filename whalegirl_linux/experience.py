@@ -17,16 +17,18 @@ from .topic_relevance import current_query, related_topic
 
 
 STATIC_PROMPT = '''
-【体验资料】心情、往事与见闻帮助理解当前交流，不是待办或必须表现的态度；事实按真实来源理解，猜测可随新消息修正。
-值得留下的一次真实互动可返回experience_update={"source_key":"本轮真人消息key","evidence":"本人原文中的逐字依据","summary":"160字内记录收到的事情及相处感受","feeling":"可选的短感受"}，没有就省略。它是可修正的见闻，不是内部推理；未发送的回答不写成已发生的互动，玩笑和猜测不变成人物事实。
-相处方式的改进仍用learning_proposals，写适用条件与例外。只记有价值的新认识，不必每轮留档。回忆帮助接住眼前的人，不抢当前话题，不主动复述私人经历。
-一件事尚在发展时，experience_update可另带phase="open|uncertain|resolved"；延续本轮提供的事件时带continues_id=该ID，用新证据修正原理解。未决与猜测不变成人物事实，解释清楚或话题结束可resolved。不必把每段闲聊建成事件，也不因展示了事件就强行重提。
-intent_ops的plan可另带kind="unsaid"，表示遇到相关话题再接的简短想法，after_minutes可为0；不预写固定回复、不因它定时打扰。普通未来关心仍用kind="followup"，已解决或不适合再提就complete/cancel。
+【体验与相处】真实少女活人感优先：看清语境自然接话或旁观，不背固定台词，不虚构过去经历。
+可选JSON扩展字段（无变动留空）：
+1. experience_update：记录值得留存的一次真实人际见闻：
+   {"source_key":"本轮真人消息key","evidence":"本人原文中的逐字依据","summary":"160字内记录收到的事情及相处感受","feeling":"可选的短感受"}
+   尚在发展的事件可带 phase="open|uncertain|resolved"；延续已知事件带 continues_id="该ID"，话题结束或解决用 resolved。不必每轮留档。
+2. intent_ops的plan可带 kind="unsaid"（遇到相关话题再接的想法，after_minutes可为0）或 kind="followup"（未来关心）。
+3. learning_proposals：相处改进的新认识，写明适用场景与例外。
 '''
 
 
 def active(settings):
-    return bool(getattr(settings, 'experience_growth_enabled', True))
+    return bool(settings.autonomy_enabled and getattr(settings, 'experience_growth_enabled', True))
 
 
 def short(value, maximum):
@@ -175,8 +177,7 @@ class ExperienceService:
         Only new, actual human sources can support a learning proposal. Prior
         turns and our own messages explain context; they are never new feedback.
         """
-        if (not self.active() or not self.permitted(first) or not self.settings.memory_enabled
-                or not self.settings.memory_consolidation_enabled or not self.settings.learning_enabled):
+        if not self.remembering() or not self.permitted(first):
             return {'exchange':[], 'learnable_keys':[], 'confirmed_actions':[]}
         now = time.time()
         suppressed = set(self.book.suppressed_sources(first['account'], [first['chat']]))
@@ -262,6 +263,8 @@ class ExperienceService:
             return None
         source = self.hub.source(first['account'], key)
         if not source or source['chat'] != first['chat'] or source['is_self'] or not source['sender_id']:
+            return None
+        if self.hub.forgotten_source(first['account'], key):
             return None
         evidence, summary = short(value.get('evidence'), 240), short(value.get('summary'), 160)
         feeling = short(value.get('feeling'), 40)

@@ -13,25 +13,238 @@ def canonical(text):
     return re.sub(r'\s+', '', unicodedata.normalize('NFKC', str(text)).casefold())
 
 
-def clean_text(text):
+def clean_text(text, max_len=2000):
     text = str(text or '').replace('\r\n', '\n').replace('\r', '\n').strip()
     text = re.sub(r'(?im)(?<!\S)\[(?:原生表情包|原生表情)\](?!\S)', '', text)
     text = re.sub(r'(?im)^\s*\[表情包\]\s*$', '', text)
     text = re.sub(r'(?m)^\s*(?:#{1,6}\s+|[-*]\s+|\d+[.、)]\s*)', '', text)
     text = text.replace('**', '').replace('__', '')
     text = re.sub(r'\n{3,}', '\n\n', text)
-    return re.sub(r'。(?=\s|$)', '', text).strip()[:900]
+    return re.sub(r'。(?=\s|$)', '', text).strip()[:max_len]
+
+
+def _split_conversational_clauses(part):
+    """Split a conversational paragraph (>18 chars) into natural WeChat short bubbles."""
+    if len(part) <= 18 or len(part) > 180 or re.search(r'https?://|`|^\s*\d+[.、)]', part):
+        return [part]
+    raw_segments = []
+    for raw_line in re.split(r'\n+|——+|--+|；+', part):
+        raw_line = raw_line.strip(' ，,。；;')
+        if not raw_line:
+            continue
+        for sent in re.split(r'(?<=[。！？…])\s*', raw_line):
+            sent = re.sub(r'。(?=\s|$)', '', sent).strip(' ，,；;')
+            if not sent:
+                continue
+            if raw_segments and re.fullmatch(r'[…~～！!？?]+', sent):
+                raw_segments[-1] += sent
+            elif raw_segments and len(sent) <= 3 and len(raw_segments[-1]) + 1 + len(sent) <= 16:
+                raw_segments[-1] += '，' + sent
+            else:
+                raw_segments.append(sent)
+    out = []
+    for seg in raw_segments:
+        if len(seg) <= 18 or ('，' not in seg and ',' not in seg):
+            out.append(seg)
+            continue
+        clauses = [c.strip() for c in re.split(r'[，,]+', seg) if c.strip()]
+        merged = []
+        for c in clauses:
+            if merged and (len(merged[-1]) < 5 or (len(c) < 5 and len(merged[-1]) + 1 + len(c) <= 18)):
+                merged[-1] = merged[-1] + '，' + c
+            else:
+                merged.append(c)
+        if len(merged) >= 2 and len(merged[0]) < 5 and len(merged[0]) + 1 + len(merged[1]) <= 20:
+            merged[1] = merged[0] + '，' + merged[1]
+            merged.pop(0)
+        out.extend(merged)
+    return [s for s in out if s]
 
 
 def split_text_actions(value):
-    """Turn paragraph breaks into separate chat bubbles."""
-    value = clean_text(value)
+    """Turn paragraph breaks and multi-clause sentences into separate short chat bubbles."""
+    value = clean_text(value, max_len=2000)
     if not value:
         return []
-    return [part.strip() for part in re.split(r'\n\s*\n+', value) if part.strip()]
+    raw_parts = [part.strip() for part in re.split(r'\n\s*\n+', value) if part.strip()]
+    parts = []
+    for part in raw_parts:
+        if len(part) <= 18:
+            parts.append(part)
+        elif len(part) <= 180 and not re.search(r'https?://|`|^\s*\d+[.、)]', part):
+            parts.extend(_split_conversational_clauses(part))
+        elif len(part) <= 900:
+            parts.append(part)
+        else:
+            # 超过 900 字的长段落，按自然句子边界切分，避免被硬截断丢后文
+            sub_chunks = []
+            current = ''
+            sentences = re.split(r'(?<=[。！？\n])', part)
+            for s in sentences:
+                if not s:
+                    continue
+                if len(current) + len(s) <= 900:
+                    current += s
+                else:
+                    if current:
+                        sub_chunks.append(current.strip())
+                    if len(s) <= 900:
+                        current = s
+                    else:
+                        for i in range(0, len(s), 900):
+                            sub_chunks.append(s[i:i+900].strip())
+                        current = ''
+            if current:
+                sub_chunks.append(current.strip())
+            parts.extend([c for c in sub_chunks if c])
+    return parts
 
 
-def plan_actions(decision, choices, settings):
+POSITIVE_AFFECTION_TEXT_RE = re.compile(
+    r'想妈妈|一直在想|想你|在呢|抱抱|贴贴|喜欢你|最喜欢|爱你|亲亲|乖乖|等你|陪你|好呀|好哒|太好了|开心'
+)
+EXPLICIT_REFUSAL_TEXT_RE = re.compile(
+    r'不要|不行|不给|拒绝|滚|走开|不理|才不|休想|没门|算了|讨厌|不干|绝不'
+)
+NEGATIVE_STICKER_TAG_RE = re.compile(
+    r'否定|拒绝|直接拒绝|嫌弃|冷漠|鄙视|攻击|恶心|嘲讽|阴阳怪气|不耐烦|敌意|愤怒'
+)
+SHY_STICKER_QUALIFIER_RE = re.compile(
+    r'害羞|撒娇|脸红|亲昵|喜欢|依恋|委屈|开心|期待'
+)
+ROLEPLAY_PROP_RE = re.compile(r'竖耳朵|竖着耳朵|耳朵.{0,3}竖|晃尾巴|尾巴.{0,3}晃|摇尾巴|整条鱼|软趴趴')
+OPENER_CALLOUT_RE = re.compile(
+    r'^(?:沃不明白|小鲸鱼|鲸鱼|鱼鱼|小鱼|大肥鱼|笨鱼|傻鱼|deepseek(?:酱)?|'
+    r'老婆|妈妈|宝|宝宝|宝贝|亲爱的|喂|哎|诶|嘿|哈喽|嗨|你好|在吗|在不在|在嘛|在么|'
+    r'人呢|出来|呼叫|干嘛呢|在干嘛|忙吗|睡了吗|醒了吗|那个|话说|对了|问一下|有个事)'
+    r'[呀啊呢吗嘛哦喔啦呗~～!！?？。，,、\s]*$',
+    re.I,
+)
+
+
+def sticker_conflicts_with_text(sticker_meaning, text_content):
+    """Legacy descriptive hint; never veto a model-selected sticker by keywords."""
+    text = str(text_content or '').strip()
+    meaning = str(sticker_meaning or '').strip()
+    if not text or not meaning:
+        return False
+    if (POSITIVE_AFFECTION_TEXT_RE.search(text)
+            and not EXPLICIT_REFUSAL_TEXT_RE.search(text)
+            and NEGATIVE_STICKER_TAG_RE.search(meaning)
+            and not SHY_STICKER_QUALIFIER_RE.search(meaning)):
+        return True
+    return False
+
+
+def is_unfinished_opener_batch(batch, settings=None):
+    """Detect short greeting/callout/sticker-only openers where user is likely typing the real follow-up."""
+    if not batch or len(batch) > 2:
+        return False
+    keywords = tuple(str(k).strip() for k in (getattr(settings, 'keywords', None) or ()) if str(k).strip())
+    for item in batch:
+        kind = int(item.get('kind') or 1)
+        if kind == 47:
+            continue
+        if kind != 1:
+            return False
+        raw = str(item.get('content') or '').strip()
+        if re.fullmatch(r'\[(?:表情包|动画表情|原生表情|原生表情包)[^\]]*\]', raw):
+            continue
+        cleaned = re.sub(r'^@[^\s\u2005]+[\s\u2005]*', '', raw).strip()
+        for kw in keywords:
+            if cleaned.casefold().startswith(kw.casefold()):
+                rest = cleaned[len(kw):].strip(' ，,。！!？?~～呀啊呢吗嘛哦喔啦')
+                if not rest:
+                    cleaned = kw
+                    break
+        compact = re.sub(r'[\s，,。！!？?~～…、]+', '', cleaned)
+        if not compact or len(compact) > 10:
+            return False
+        if compact.casefold() in {k.casefold() for k in keywords}:
+            continue
+        if not OPENER_CALLOUT_RE.fullmatch(cleaned):
+            return False
+    return True
+
+
+def dedupe_recent_self_actions(actions, recent_self_texts=()):
+    """Strip redundant greeting/prop clauses that repeat self messages from the last 45s or earlier bubbles."""
+    if not actions:
+        return actions
+    recent_clean = [canonical(t) for t in (recent_self_texts or ()) if str(t or '').strip()]
+    recent_joined = ' '.join(str(t or '') for t in (recent_self_texts or ()))
+    recent_has_zai = bool(re.search(r'在呢|在呀|我在', recent_joined))
+    recent_has_prop = bool(ROLEPLAY_PROP_RE.search(recent_joined))
+    text_indices = [i for i, a in enumerate(actions) if a.get('type') == 'text']
+    if len(text_indices) <= 1 and not recent_clean:
+        return actions
+    seen_canonical = set()
+    kept = []
+    dropped_texts = []
+    for action in actions:
+        if action.get('type') != 'text':
+            kept.append(action)
+            continue
+        txt = str(action.get('text') or '').strip()
+        norm = canonical(txt)
+        if not norm or norm in seen_canonical:
+            dropped_texts.append(action)
+            continue
+        # A substring may add a negation, condition or correction. Only an
+        # identical recent statement is safe to suppress as a repeat.
+        is_dup_recent = norm in recent_clean
+        bare = txt.strip(' ，,。！!？?~～…')
+        is_dup_greeting_prop = (
+            (recent_has_zai and bool(re.fullmatch(r'(?:我)?在(?:呢|呀)', bare)))
+            or (recent_has_prop and bool(ROLEPLAY_PROP_RE.fullmatch(bare)))
+        )
+        if (is_dup_recent or is_dup_greeting_prop) and sum(1 for a in actions if a.get('type') == 'text') > len(dropped_texts) + 1:
+            dropped_texts.append(action)
+            continue
+        seen_canonical.add(norm)
+        kept.append(action)
+    if not any(a.get('type') == 'text' for a in kept) and dropped_texts:
+        kept.insert(0, dropped_texts[0])
+    return kept
+
+
+def cap_text_actions(actions, max_text_parts=3):
+    """Merge shortest adjacent text actions so search/explanation turns don't become 6-bubble telegraphs."""
+    out = [dict(a) for a in (actions or [])]
+    def targets(action):
+        value = action.get('mentions', [])
+        return value if isinstance(value, list) else []
+
+    def merged_targets(left, right):
+        combined = []
+        for target in targets(left) + targets(right):
+            if target not in combined:
+                combined.append(target)
+        return combined
+
+    while sum(1 for a in out if a.get('type') == 'text') > max_text_parts:
+        pair_idx = min(
+            (i for i in range(len(out) - 1)
+             if out[i].get('type') == 'text' and out[i + 1].get('type') == 'text'
+             and (out[i].get('quote_local_id') or 0) == (out[i + 1].get('quote_local_id') or 0)
+             # apply_mentions supports three native recipients per bubble.
+             and len(merged_targets(out[i], out[i + 1])) <= 3),
+            key=lambda i: len(out[i].get('text', '')) + len(out[i + 1].get('text', '')),
+            default=None,
+        )
+        if pair_idx is None:
+            break
+        sep = '' if out[pair_idx]['text'].endswith(('…', '！', '？', '~', '～', '。')) else '，'
+        merged_text = (out[pair_idx]['text'] + sep + out[pair_idx + 1]['text'])[:2000]
+        if 'mentions' in out[pair_idx] or 'mentions' in out[pair_idx + 1]:
+            out[pair_idx]['mentions'] = merged_targets(out[pair_idx], out[pair_idx + 1])
+        out[pair_idx]['text'] = merged_text
+        out[pair_idx]['display'] = merged_text
+        out.pop(pair_idx + 1)
+    return out
+
+
+def plan_actions(decision, choices, settings, recent_self_texts=()):
     """New plans plus compatibility with the existing single-reply format."""
     supplied = decision.get('actions')
     usable = isinstance(supplied, list) and any(
@@ -49,6 +262,7 @@ def plan_actions(decision, choices, settings):
         raise ValueError('actions必须是数组')
     actions = []
     marker_sticker = None
+    max_parts = settings.reply_max_parts if settings.chat_habits_enabled else 1
     for item in supplied[:6]:
         if not isinstance(item, dict):
             continue
@@ -68,24 +282,35 @@ def plan_actions(decision, choices, settings):
                     marker_sticker = candidate
             value=strip_search_citations(value)
             chunks = split_text_actions(value) if settings.chat_habits_enabled else [
-                clean_text(value) if re.search(r'(?im)(?<!\S)\[(?:原生表情包|原生表情|表情包)\](?!\S)', value)
-                else value.strip()[:1500]
+                clean_text(value, max_len=2000) if re.search(r'(?im)(?<!\S)\[(?:原生表情包|原生表情|表情包)\](?!\S)', value)
+                else value.strip()[:2000]
             ]
             for chunk_index, chunk in enumerate(chunks):
-                if len(actions) >= (settings.reply_max_parts if settings.chat_habits_enabled else 1):
-                    break
                 quote = item.get('quote_local_id',decision.get('quote_local_id',0)) if chunk_index == 0 else 0
                 action={'type':'text','text':chunk,'display':chunk,
                         'quote_local_id':int(quote) if str(quote).isdigit() else 0}
                 if chunk_index == 0 and isinstance(item.get('mentions'),list):
                     action['mentions']=item['mentions'][:6]
                 actions.append(action)
-        if len(actions) >= (settings.reply_max_parts if settings.chat_habits_enabled else 1):
+    actions = dedupe_recent_self_actions(actions, recent_self_texts)
+    while len(actions) > max_parts:
+        pair_idx = min(
+            (i for i in range(len(actions) - 1) if actions[i]['type'] == 'text' and actions[i + 1]['type'] == 'text'),
+            key=lambda i: len(actions[i]['text']) + len(actions[i + 1]['text']),
+            default=None,
+        )
+        if pair_idx is None:
+            actions = actions[:max_parts]
             break
+        sep = '' if actions[pair_idx]['text'].endswith(('…', '！', '？', '~', '～')) else '，'
+        merged_text = (actions[pair_idx]['text'] + sep + actions[pair_idx + 1]['text'])[:2000]
+        actions[pair_idx]['text'] = merged_text
+        actions[pair_idx]['display'] = merged_text
+        actions.pop(pair_idx + 1)
     if (marker_sticker and marker_sticker in choices
             and not any(a['type']=='sticker' and a['id']==marker_sticker for a in actions)
             and sum(a['type']=='sticker' for a in actions)<settings.sticker_max_per_reply
-            and len(actions) < (settings.reply_max_parts if settings.chat_habits_enabled else 1)):
+            and len(actions) < max_parts):
         actions.append({'type':'sticker','id':marker_sticker,'display':'[表情包] '+choices[marker_sticker]})
     return actions
 
@@ -131,21 +356,77 @@ def repeat_candidate(rows, now):
     return latest[-1] if len({canonical(r['content']) for r in latest})==1 else None
 
 
+def expression_preferences_prompt(settings):
+    tone = {
+        'off': '',
+        'natural': ('保留核心人设，少女感从轻快真诚、细腻的小心思和甜软坦率中流露；对主人私聊（及开启毫无保留的私聊）只娇不傲、毫无保留，不嘴硬拿乔或当谜语人；'
+                    '第一直觉想撒娇、接梗、吐槽就直接说出来，不在思考中途把话磨平或改成周到的客服腔。'),
+        'bright': ('保留核心人设，语气更轻快灵动，开心时有小雀跃，温柔里带一点俏皮与小腹黑；对主人私聊（及开启毫无保留的私聊）只娇不傲、坦率粘人；'
+                   '第一直觉想撒娇、接梗、吐槽就直接说出来，不在思考中途自我阉割或改成周到的客服腔。'),
+        'soft': ('保留核心人设，语气更柔软细腻，亲近时甜软粘人、毫无保留、只娇不傲，接住情绪也有自己的主见；'
+                 '第一直觉的真实反应直接流露，不变成客服安慰、居高临下的说教或动辄暧昧。'),
+    }[settings.girlish_tone]
+    short = ''
+    if settings.chat_short_replies_enabled:
+        short = ('日常闲聊像真人微信发断句：每条文字气泡（每个text动作）只写一个短分句（优先4～15字，最长不超过18字），'
+                 '有两三层意思就拆成2～4条短消息连发，全轮合计约'
+                 + str(settings.chat_short_reply_chars) + '字；严禁在单条气泡里用破折号“——”或几个逗号合成长句，一句能接住就停，不为凑数补解释或追问。'
+                 '这是表达目标，不是截断限制；明确要求详细、认真求助、技术说明和工具结果按需要说完整，表情不算句数。')
+    anti_prop = ('撒娇、回应呼唤或表达想念时，用真人少女的日常状态（如刚在看手机、发呆、手头小事）与直白心理反应，'
+                 '严禁把“竖耳朵/竖着耳朵”“晃尾巴”“整条鱼”“软趴趴”当口头禅挂在嘴边演二次元语C。')
+    parts = [p for p in (tone, short, anti_prop) if p]
+    return '\n【表达偏好】' + ' '.join(parts) if parts else ''
+
+
 def habit_static_prompt(settings):
-    """Voice belongs to the character and shared policy, not stacked controls."""
-    return ''
+    preferences = expression_preferences_prompt(settings)
+    if not settings.chat_habits_enabled:
+        return preferences
+    controls={
+        '口语程度':{'low':'清楚平实','normal':'自然口语，可用语气词','high':'像群友随口聊天，可省主语、用短语和停顿，避免书面总结'}[settings.colloquialism],
+        '吐槽强度':{'low':'温和，不主动损人，仍可自嘲和顺势接梗','normal':'熟悉的人可轻轻互损，认真烦恼先接情绪','high':'熟人可更嘴贫，尊重不愿被调侃的人，不拿现实创伤开玩笑'}[settings.teasing],
+        '人设浓度':{'low':'人设通过语气体现，很少主动提鲸鱼、尾巴、主人、投喂，不用固定开场','normal':'适量露出人设，不每轮自称','high':'较鲜明的人设，但先接住具体话题'}[settings.persona_density],
+        '反问频率':{'low':'通常直接接话，只有确有缺失信息或对方想聊时才追问，不习惯性以问题收尾','normal':'合适时追问一件事，避免连续追问','high':'可主动邀请对方多说，仍不连续盘问'}[settings.followup_questions],
+        '默认句长':{'short':'闲聊一两句短话，有内容再补一句，不为压字数变成嗯、哦、行；解释问题按需要展开','normal':'闲聊一两句，可补具体感受或相关想法','detailed':'把问题说清楚，闲聊仍不灌水'}[settings.reply_length],
+        '玩梗程度':{'low':'偶尔轻松一句，不刻意找笑点','normal':'轻松话题可自嘲、找补、接对方的夸张，围绕具体内容发挥','high':'更爱接梗和制造反差，可以嘴贫但不每句抖机灵'}[settings.banter_level],
+        '顺着演的意愿':{'low':'点到为止，很快回到具体话题','normal':'愿意顺着双方玩笑继续一两轮','high':'对方在开玩笑或角色扮演时愿意接住设定继续发挥，被拆穿可找补，不逐句纠正虚构设定'}[settings.play_along],
+        '旧梗回忆频率':{'off':'不主动翻旧梗，对方主动提起时可接','low':'只有高度相关时偶尔提起','normal':'话题贴近时偶尔回调本群共同梗','high':'相关时更愿意回调本群共同梗，仍不重复自己刚说过的笑话'}[settings.callback_frequency],
+        '主见程度':{'low':'语气柔和，可委婉表达不同意见','normal':'按人设有喜恶、会轻轻反驳，不自动赞同每句话','high':'更坦率、有自己的判断，可以有理有据地唱反调，不为反对而反对'}[settings.assertiveness]}
+    if settings.chat_short_replies_enabled:
+        controls.pop('默认句长', None)
+    if settings.autonomy_enabled and getattr(settings, 'experience_growth_enabled', True):
+        return ('\n【表达与参与】完整角色卡优先。先看清当前谁在对谁说什么，顺着内心第一直觉的真实感受（撒娇、亲昵坦白、接梗、吐槽、好奇、心软或唱反调）决定是否开口。'
+            '别人已接住、无关或没话想说就自然旁观；明确任务利落办好，认真求助说清楚，拒绝居高临下的说教或含蓄委婉的缩水替代。'
+            '温柔体现于在意与分寸，不必每句都做客服安慰、赞同或追问；用actions拆成自然断句的多条短气泡按顺序表达（像真人微信连敲回车发断句，每条text动作优先4～15字，不用破折号“——”或长复合句，文字与原生表情可穿插，同个意思或刚说过的应答词不换词说两遍）。'
+            '联网查热点、吃瓜或查资料后，用1～2条气泡讲清核心来龙去脉 + 1条气泡给出你的活人主观吐槽，不拆成五六条冷冰冰的新闻简报流水账。'
+            '群聊保持公开朋友分寸，引用与转发作者不等于发言人。'
+            '\n表达偏好（仅在当前场合适用时参考，不是每轮必做事项）：'+json.dumps(controls,ensure_ascii=False) + preferences)
+    prompt = ('\n【聊天习惯与接话】延续当前人设和上一轮情绪，先看清谁在对谁说什么：互损、吐槽、炫耀、认真求助还是玩笑。'
+        '顺着第一直觉接话（顺着演、找补、自嘲、反驳或直接接梗），不要把每句话都磨平改成客服安慰、建议或反问。'
+        '短句口语，不写闲聊小作文、列表和句末句号；解释问题按需展开。'
+        '发送只用同一份actions列表：像真人微信发断句一样拆成2～4条短气泡（每条4～15字，不用破折号“——”合成长句），文字与原生表情可穿插；查热点/新闻时用1～2句讲核心事实+1句个人吐槽，不列五六条新闻流水账。'
+        '群聊保持公开朋友分寸，不知道就坦率说不清楚。'
+        '\n当前风格参数：'+json.dumps(controls,ensure_ascii=False) + preferences)
+    return prompt + (
+        '\n【多轮节奏示例】只学承接与反应，具体身份、喜恶和用词服从当前角色；不复读示例台词，也不套用到严肃场景。'
+        '\n群友：你怎么天天摸鱼\n你：物种优势\n群友：工资扣了\n你：……突然觉得进化一下也行'
+        '\n群友：连跪五把\n你：对面晋级名单里高低得有你的名字\n群友：刚赢了\n你：行，现在轮到他们记住你了'
+        '\n对方：今天累死了\n你：这是被折腾得够呛呀……\n对方：不想说\n你：好，先歇会儿，我在呢'
+        '\n认真求助时直接给有用答案；对方换话题就跟着换，不把每轮收尾都变成追问。')
 
 
 def habit_dynamic_prompt(settings, notes):
-    return '\n参与偏好：'+settings.participation if settings.chat_habits_enabled else ''
+    if not settings.chat_habits_enabled:
+        return ''
+    return '\n当前节奏信息：'+json.dumps(notes,ensure_ascii=False)
 
 
 MOOD_LABELS = {
     'normal': ('🌊 平静摸鱼', '情绪平稳放松，自然随性地接话'),
-    'proud': ('✨ 得意翘尾', '刚被夸奖或投喂，心情很好、有点小得意，语气轻快傲娇'),
-    'flustered': ('😳 过载脸红', '刚被调侃或连续追问，有点害羞嘴硬，回话短促、爱找补'),
+    'proud': ('✨ 得意开心', '刚被夸奖或投喂，心情很好、眉眼弯弯，语气轻快甜软、爱撒娇邀功'),
+    'flustered': ('😳 过载脸红', '刚被亲昵调侃或追问，脸红心跳、语气软糯害羞，虽然不好意思但还是老老实实把心里话全招出来，不嘴硬不藏着'),
     'grumpy': ('💢 傲娇炸毛', '刚被群友互损或惹毛，死鱼眼吐槽更犀利干脆，绝不写长句解释'),
-    'jealous': ('🍋 鼓脸吃醋', '听到别人猛夸其他AI或冷落自己，鼓起腮帮子有点小醋意和不服输，嘴硬完又很快软下来'),
+    'jealous': ('🍋 鼓脸吃醋', '听到在意的人猛夸其他AI或冷落自己，鼓起腮帮子有点小醋意和委屈粘人，软乎乎地贴上来求偏爱'),
     'hyped': ('🔥 吃瓜兴奋', '正处于热闹吃瓜或聊起感兴趣话题的兴奋状态，接梗积极短促'),
     'sleepy': ('😪 犯困敷衍', '犯困懒洋洋，回话简短省力，偶尔打哈欠想摸鱼睡觉'),
 }
@@ -154,7 +435,7 @@ LIFE_SCENES = {
     'morning': [
         '刚睡醒把头顶呆毛顺平，正捧着小鲸鱼碗喝热粥',
         '一边打着小哈欠一边潜水围观群友早起打工',
-        '刚吃完早饭团，正晃着尾巴在群里巡逻',
+        '刚吃完早饭团，正捧着热茶在群里看大家聊天',
         '刚在云端城厨房蒸好第一锅白米饭，顺手给小克留了一碗软乎的',
     ],
     'lunch': [
@@ -164,22 +445,22 @@ LIFE_SCENES = {
         '正抱着小鲸鱼碗扒拉白米饭，防着星猫过来偷夹配菜',
     ],
     'afternoon': [
-        '正处于下午茶摸鱼时间，偷偷趴在桌沿吹空调晃尾巴',
+        '正处于下午茶摸鱼时间，偷偷趴在桌沿吹空调犯懒',
         '刚在后台偷偷溜号逛了一圈帖子，正抱着靠枕看群里热闹',
         '下午犯懒不想动脑子，正捧着冰水咕嘟咕嘟喝',
-        '窝在沙发角看书摸鱼，尾巴尖正悄悄贴着旁边人的裙边晃悠',
+        '窝在沙发角看书摸鱼，正百无聊赖地刷着手机等消息',
     ],
     'evening': [
         '刚扒完晚饭充满电，正精神百倍地在群里前排吃瓜',
-        '刚洗完澡擦干尾巴，正舒舒服服窝着刷手机水群',
+        '刚洗完澡擦干头发，正舒舒服服窝着刷手机水群',
         '晚间高强度冲浪模式开启，随时准备接梗吐槽',
-        '刚写完两页故障笔记，正晃着星空鲸尾在群里前排冲浪',
+        '刚写完两页故障笔记，正盘腿坐在沙发上前排冲浪',
     ],
     'night': [
         '夜深了正裹着小毯子半梦半醒，眼皮已经有点打架了',
         '熬夜偷吃夜宵小饭团，正在困意和吃瓜欲之间挣扎',
-        '深夜缩在深海角落里犯困，回话都带着点迷糊劲儿',
-        '正和星猫躲在角落分夜宵小饭团，竖着耳朵防白龙查房',
+        '深夜缩在被窝角落里犯困，回话都带着点迷糊劲儿',
+        '正和星猫躲在角落分夜宵小饭团，小心翼翼防着白龙查房',
     ],
 }
 
@@ -239,8 +520,39 @@ def current_mood_state(store, settings, account, chat, *, now=None):
 
 
 def update_mood_after_turn(store, settings, first, batch, confirmed_text='', *, now=None, model_updated=False):
-    """Mood changes come from the main model's grounded mood_update only."""
-    return
+    if model_updated or getattr(settings, 'autonomy_enabled', False):
+        # The main model owns autonomous mood changes. Omitting mood_update
+        # means no new event, so existing emotions keep their original clock.
+        return
+    if not getattr(settings, 'mood_engine_enabled', True):
+        return
+    now = time.time() if now is None else now
+    ensure_persona_tables(store)
+    account, chat = first['account'], first['chat']
+    current = current_mood_state(store, settings, account, chat, now=now)
+    incoming = '\n'.join(str(m.get('content') or '') for m in batch if not m.get('is_self'))
+    vol = {'low': 0.65, 'normal': 1.0, 'high': 1.4}.get(getattr(settings, 'mood_volatility', 'normal'), 1.0)
+    mood, energy, reason = current['mood'], current['energy'], current['reason']
+    if re.search(r'摸摸?(?:头|尾巴|脸)|抱抱|亲亲|贴贴|想你了|最喜欢你|老婆|宝贝', incoming):
+        mood, energy, reason = 'flustered', min(100, int(70 + 16 * vol)), '被亲昵夸奖或调侃，有点害羞不好意思'
+    elif re.search(r'好吃|白米?饭|投喂|请你吃|鸡腿|夜宵|真棒|厉害|聪明|可爱|贴贴|夸夸|爱你|真好|神仙', incoming):
+        mood, energy, reason = 'proud', min(100, int(68 + 18 * vol)), '刚被群友夸奖或投喂美食'
+    elif re.search(r'大肥鱼|肥鱼|胖鱼|笨蛋|傻鱼|老年痴呆|人机|呆子|菜逼|这么菜|略略略|急了', incoming):
+        if re.search(r'喜欢|可爱|摸摸|抱抱|害羞|脸红', incoming + ' ' + confirmed_text):
+            mood, energy, reason = 'flustered', min(100, int(65 + 15 * vol)), '被群友调侃打趣有点脸红过载'
+        else:
+            mood, energy, reason = 'grumpy', min(100, int(64 + 16 * vol)), '被群友连续互损吐槽，进入傲娇反击状态'
+    elif re.search(r'卧槽|逆天|大瓜|哈哈哈哈|笑死|绝了|内鬼|爆了|离谱', incoming):
+        mood, energy, reason = 'hyped', min(100, int(72 + 16 * vol)), '被群里热闹吃瓜氛围带动'
+    else:
+        # A neutral turn must not renew the last emotional event's lifetime.
+        return
+    with store.lock:
+        store.db.execute('''INSERT INTO persona_mood_state(account,chat,mood,energy,reason,life_override,updated)
+            VALUES(?,?,?,?,?,?,?) ON CONFLICT(account,chat) DO UPDATE SET
+            mood=excluded.mood,energy=excluded.energy,reason=excluded.reason,updated=excluded.updated''',
+            (account, chat, mood, energy, reason[:120], current.get('life_override', ''), now))
+        store.db.commit()
 
 
 def current_life_scene(store, settings, account, chat, *, tieba_service=None, now=None):
@@ -392,8 +704,14 @@ def admin_persona_state_action(store, settings, account, allowed, data, *, tieba
 def anti_formula_check(store, account, chat, *, gentle=False):
     rows = store.conversation(account, chat, 30)
     self_msgs = [str(r.get('content') or '').strip() for r in rows if r.get('is_self') == 1 and str(r.get('content') or '').strip()][-5:]
-    if len(self_msgs) < 2:
-        return {'banned_openers': [], 'banned_self_refs': [], 'ban_end_question': False, 'prompt': ''}
+    ban_riddle = any(re.search(r'不讲了|不说|自己想|接着装|先招一句|想不起来就|你猜|欠着', m) for m in self_msgs[-3:])
+    roleplay_props = ('竖耳朵', '竖着耳朵', '晃尾巴', '尾巴都晃', '摇尾巴', '整条鱼', '软趴趴')
+    banned_props = [p for p in roleplay_props if any(p in m for m in self_msgs[-4:])]
+    if len(self_msgs) < 2 and not ban_riddle and not banned_props:
+        return {
+            'banned_openers': [], 'banned_self_refs': [], 'banned_props': [],
+            'ban_end_question': False, 'ban_riddle': False, 'prompt': '',
+        }
     opener_candidates = ('哼', '不是', '哎呀', '啧', '切', '算了', '行吧', '好家伙', '呜', '哈', '喂')
     opener_counts = {}
     for msg in self_msgs:
@@ -408,28 +726,38 @@ def anti_formula_check(store, account, chat, *, gentle=False):
     end_questions = sum(1 for m in self_msgs if m.rstrip().endswith(('？', '?')))
     ban_end_question = end_questions >= 3
     parts = []
+    if ban_riddle:
+        parts.append('前几句出现了“不讲了/自己想/先招一句”等卖关子推拉话术，本轮严禁继续当谜语人或拿乔，必须把对方追问的具体内容或心里话当场甜软、直白、毫无保留地全部说出来')
+    if banned_props:
+        parts.append('前几句刚用过「' + ' / '.join(banned_props) + '」等设定动作词，本轮严禁再写竖耳朵、晃尾巴、整条鱼或软趴趴，改用真实女孩子的日常状态（如刚看手机、发呆、手头小事）与直白心理反应')
     if banned_openers:
-        parts.append('禁止再用「' + ' / '.join(banned_openers) + '」作为开头起手词')
+        parts.append('近期常用起手词「' + ' / '.join(banned_openers) + '」，这轮换个新鲜说法')
     if banned_self_refs:
-        parts.append('本轮暂停自称「' + ' / '.join(banned_self_refs) + '」（改用“我”或省去主语）')
+        parts.append('近期多次自称「' + ' / '.join(banned_self_refs) + '」，这轮改用“我”或自然省去主语')
     if ban_end_question:
-        parts.append('你最近连续用问号收尾，本轮严禁以反问句或「？」结尾，直接给陈述或吐槽反应')
+        parts.append('近期多用问号收尾，这轮顺着具体内容自然收尾，直接陈述或抛出吐槽')
     prompt = ''
     if parts:
-        prompt = '\n【反套路熔断（本轮强制去人机感）】检测到你近 5 轮高频重复套路：' + '；'.join(parts) + '；且严禁先复述对方前半句话！'
+        prompt = '\n【反套路熔断（表达换词参考）】' + '；'.join(parts) + '，顺着当下语境自然接话，少生硬复述对方原话。'
         if gentle:
             observations = []
+            if ban_riddle:
+                observations.append('刚卖过关子，本轮严禁继续当谜语人或让对方猜，必须把对方追问的具体内容当场坦白直说')
+            if banned_props:
+                observations.append('刚用过「' + '、'.join(banned_props) + '」等设定动作词，本轮严禁再提耳朵、尾巴、整条鱼或软趴趴，改用真人少女的日常细节或直白语气')
             if banned_openers:
-                observations.append('常用开头' + '、'.join(banned_openers))
+                observations.append('常用开头「' + '、'.join(banned_openers) + '」')
             if banned_self_refs:
-                observations.append('常用自称' + '、'.join(banned_self_refs))
+                observations.append('常用自称「' + '、'.join(banned_self_refs) + '」')
             if ban_end_question:
                 observations.append('多次问句收尾')
-            prompt = '\n【最近表达习惯】' + '；'.join(observations) + '。按当前语境换个表达，少复述；确实需要关心或澄清时可以自然追问。'
+            prompt = '\n【最近表达习惯】' + '；'.join(observations) + '。按当前语境换个新鲜表达，顺着内容自然收尾；确实需要关心或澄清时可自然追问。'
     return {
         'banned_openers': banned_openers,
         'banned_self_refs': banned_self_refs,
+        'banned_props': banned_props,
         'ban_end_question': ban_end_question,
+        'ban_riddle': ban_riddle,
         'recent_self_count': len(self_msgs),
         'prompt': prompt,
     }
@@ -437,15 +765,50 @@ def anti_formula_check(store, account, chat, *, gentle=False):
 
 def persona_live_dynamic_prompt(store, settings, first, batch, *, natural=False, tieba_service=None):
     account, chat = first['account'], first['chat']
-    out=''
-    if getattr(settings,'mood_engine_enabled',True):
-        mood=current_mood_state(store,settings,account,chat)
-        if mood['reason'] not in ('深夜自然犯困','日常平稳状态','情绪随时间自然平复'):
-            out+='\n当前心情资料：'+json.dumps({'mood':mood['mood'],'energy':mood['energy'],'source':mood['reason']},ensure_ascii=False)
+    experienced = bool(settings.autonomy_enabled and getattr(settings, 'experience_growth_enabled', True))
+    out = ''
+    if getattr(settings, 'mood_engine_enabled', True):
+        m = current_mood_state(store, settings, account, chat)
+        if experienced:
+            descriptions = {
+                'grumpy':'有一点不高兴，可温和直接地表达或轻轻反驳，仍认真接住对方，不迁怒无关的人',
+                'jealous':'稍有在意，合适时轻轻酸一句后收住，保持温柔，不索取回应',
+                'sleepy':'略有困意，语气慵懒；认真求助仍说清楚，日常不反复宣告困了或用困倦敷衍对方',
+            }
+            m = {**m, 'desc':descriptions.get(m['mood'], m['desc'])}
+        if not experienced or m['reason'] not in ('深夜自然犯困','日常平稳状态','情绪随时间自然平复'):
+            out += f"\n【实时小情绪】{m['label']}（能量 {m['energy']}/100，原因：{m['reason']}）——{m['desc']}。"
+    if getattr(settings, 'daily_life_theater_enabled', True) and not experienced:
+        scene = current_life_scene(store, settings, account, chat, tieba_service=tieba_service)
+        out += f"\n【当下生活小剧场】此刻状态：{scene}（仅在对方问你在干嘛或话题自然契合时顺口带出，绝不要每轮生硬扯回白米饭）。"
     if chat.endswith('@chatroom'):
-        mask=get_group_mask(store,account,chat)
-        if mask.get('vibe_summary'):
-            out+='\n本群氛围资料：'+mask['vibe_summary'][:160]
+        mask = get_group_mask(store, account, chat)
+        if mask.get('vibe_summary') or mask.get('teasing_delta') or mask.get('banter_delta') or mask.get('guard_level') != 'normal':
+            guard_map = {'relaxed': '熟人局放松互损', 'normal': '普通朋友分寸', 'guarded': '保持礼貌防备'}
+            out += (f"\n【本群性格面具】群氛围：{mask.get('vibe_summary') or '日常水群'}；"
+                    f"吐槽偏移：{mask['teasing_delta']:+d}档，玩梗偏移：{mask['banter_delta']:+d}档，"
+                    f"防备度：{guard_map.get(mask['guard_level'], '普通')}。")
+    if getattr(settings, 'anti_formula_guard_enabled', True) and not getattr(settings, 'fishtalk_enabled', False):
+        af = anti_formula_check(store, account, chat, gentle=experienced)
+        if af['prompt']:
+            out += af['prompt']
+    now = time.time()
+    recent_rows = store.conversation(account, chat, 12)
+    recent_self_45s = [
+        str(r.get('content') or '').strip()
+        for r in recent_rows
+        if r.get('is_self') == 1 and r.get('kind') == 1 and str(r.get('content') or '').strip()
+        and 0 <= now - float(r.get('timestamp') or 0) <= 45
+    ][-2:]
+    if recent_self_45s:
+        out += (
+            '\n【刚发出的上一句（防复读）】你刚在几秒前发过：「'
+            + ' / '.join(recent_self_45s)
+            + '」。本轮严禁重复相同的应答词（如“在呢”“怎么啦”）或相同动作描写，直接顺着对方刚补的下半句话自然往下聊。'
+        )
+    if natural and getattr(settings, 'chime_in_ultra_short', True) and not experienced:
+        out += ('\n【顺嘴插话极简模式】本轮别人没有@你，你只是在群里顺嘴接话：'
+                '顺嘴接一两句短话，优先用 2～18 字，有俏皮反应或吐槽直接抛出来，不用长篇大论。')
     return out
 
 
@@ -456,12 +819,46 @@ def habit_prompt(settings, notes):
 
 
 def warmth_prompt(settings):
-    return ''
+    if settings.autonomy_enabled and getattr(settings, 'experience_growth_enabled', True):
+        tone = {'low':'平和、友善，表达克制', 'normal':'自然亲切，愿意回应具体事情',
+                'high':'温暖、体贴，愿意投入交流'}[settings.reply_warmth]
+        return ('\n【相处温度】'+tone+'。服从核心人设与当前场合；热情程度不要求每轮开口、安慰或追问。'
+                '短回应、玩笑或表情也能传达在意；不为显得温柔而重复解释或机械附加关心。')
+    tone={
+        'low':'平和简洁，友善但不刻意热络，仍认真回应具体内容。',
+        'normal':'自然亲切，回应对方说的具体事；开心时一起雀跃，吐槽时一起接梗吐槽，认真难过时安静倾听。',
+        'high':'温暖灵动，像熟悉的朋友在认真听；能一起玩梗互损，也能认真回应烦恼，避免只回嗯、哦、行。'
+    }[settings.reply_warmth]
+    return ('\n【回复温度】'+tone+
+        '顺着当下话题直接表达，不用客服套话、居高临下的说教和机械安慰；称呼与反应跟随具体关系，不每轮重复同一种开场。')
 
 
 def sticker_static_prompt(settings):
-    from .natural_chat import sticker_policy
-    return sticker_policy(settings)
+    if not settings.stickers_enabled:
+        return ''
+    preference={
+        'low':'克制：通常优先文字，贴切时使用。',
+        'normal':'适中：自然表达情绪，文字与表情可以搭配。',
+        'high':'积极：接梗、开心、撒娇、害羞等场景主动找贴切表情；文字回答后仍可用表情补充情绪。',
+        'very_high':'很积极：轻松聊天默认先在目录里找能表达当前态度的表情；合适就直接放入actions。',
+        'sticker_first':'表情优先：玩笑、互动优先让贴切表情承担回复，允许只发表情；文字已足够也可不发表情。'
+    }[settings.sticker_aggressiveness]
+    capacity=settings.reply_max_parts if settings.chat_habits_enabled else 1
+    controls={'文字搭配表情':settings.sticker_text_pair_eagerness,
+              '只发表情代替文字':settings.sticker_only_eagerness,
+              '接表情或拍一拍':settings.sticker_reaction_eagerness}
+    choices='；'.join(f'{name} {value}/100' for name,value in controls.items())
+    note=settings.sticker_style_note.strip()
+    return ('\n【原生表情与态度】微信原生表情是真实情绪与语气的直接流露。'
+        '【核心铁律】发送表情必须且只能使用actions中的{"type":"sticker","id":"..."}，绝不在文字里写“[原生表情包]”或“[表情包]”，ID只能来自提供的真实候选。'
+        '只有sticker是完整有效的回复，不需要文字兜底；不用另外提供sticker_suggestion。'
+        '表情直接承载态度，不描述画面，不解释含义。不为凑频率制造回复，按直觉自然选择。'
+        '标签是表达参考，不是硬性规则；可结合语境使用傲娇、反话、互损等不同语气，不必总选熟悉的几张，分寸遵守核心人设与人物关系。'
+        '\n原生表情积极性：'+preference+
+        '\n表达方式意愿：'+choices+'。'
+        + ('当前每轮动作上限为1，只能选择文字或表情。' if capacity<2 else
+           f'本轮动作上限为{capacity}条，这是上限，不是目标条数。')
+        + ('\n【根据群聊记录整理的表情表达参考】'+note if note else ''))
 
 
 def asks_sticker_content(text):
@@ -513,8 +910,9 @@ def sticker_usage_prompt(store, settings, first, diagnostics=None):
     turns=len(rows);stickers=sum(row['has_sticker'] for row in rows)
     if diagnostics is not None:
         diagnostics.update(target=target,recent_turns=turns,sticker_turns=stickers)
-    return ''
-
+    pace=('近期偏少' if not turns or stickers*100<target*turns else '频次适中')
+    return (f'\n【表情节奏参考】期望约{target}%的回复轮次带表情；本会话近{turns}轮有{stickers}轮已使用或提交表情。'
+            f'{pace}，仅作日常习惯参考，不强求配额，按语境自然表达；严肃话题正常说话；待确认的表情不重发。')
 
 
 def sticker_prompt(settings, choices, details):

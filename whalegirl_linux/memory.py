@@ -436,7 +436,6 @@ def consolidation_data(previous_summary, messages, memories):
 
 def memory_parts(book,settings,first,batch,affection=None,diagnostics=None):
     from .memory_hub import token_estimate
-    from .natural_chat import active as natural_active
     if not settings.memory_enabled:
         if diagnostics is not None:diagnostics.update(enabled=False,count=0,ids=[],estimated_tokens=0)
         return '', '', []
@@ -450,10 +449,6 @@ def memory_parts(book,settings,first,batch,affection=None,diagnostics=None):
         personal_priority=affection.personal_priority(first['account'],first.get('sender_id',''),settings) if affection else 0,
         half_life_days=settings.memory_half_life_days)
     rows=book.hub.layers.shallow(rows)
-    style_info={}
-    style_text=book.hub.chat_style.prompt(settings,first,style_info)
-    if natural_active(settings) and settings.chat_habits_enabled:
-        rows=[r for r in rows if r['kind'] not in ('chat_style','expression')]
     sources=[{'key':m['key'],'sender_id':m.get('sender_id',''),'sender':m.get('sender','')} for m in batch[-8:]]
     eagerness='\n学习积极性：'+str(settings.learning_eagerness if settings.learning_enabled and settings.memory_consolidation_enabled else 0)+'/100'
     def source_text():return '\n本次可引用的来源：'+json.dumps(sources,ensure_ascii=False)+eagerness
@@ -475,10 +470,10 @@ def memory_parts(book,settings,first,batch,affection=None,diagnostics=None):
         return ('\n【本轮分级记忆】'+json.dumps(loaded,ensure_ascii=False)+base+
             '\n实际检索状态：'+json.dumps({'available_in_scope':retrieval.get('available_in_scope',0),'loaded':len(loaded)},ensure_ascii=False))
     while loaded and token_estimate(packed())>settings.memory_token_budget:loaded.pop()
-    dynamic=style_text+packed();ids=list(dict.fromkeys([r['id'] for r in loaded]+style_info.get('chat_style_ids',[])))
+    dynamic=packed();ids=[r['id'] for r in loaded]
     book.hub.mark_loaded(first['account'],ids)
     if diagnostics is not None:
-        diagnostics.update(retrieval,**style_info,enabled=True,count=len(ids),ids=ids,
+        diagnostics.update(retrieval,enabled=True,count=len(loaded),ids=ids,
             profiles=sum(r['scope']=='profile' for r in loaded),chat_memories=sum(r['scope']=='chat' for r in loaded),
             tiers={tier:sum(r['tier']==tier for r in loaded) for tier in ('core','stable','ordinary','cold')},
             joke_ids=[r['id'] for r in loaded if r['kind']=='joke'],skipped_for_budget=max(0,len(rows)-len(loaded)),

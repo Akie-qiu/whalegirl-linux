@@ -131,19 +131,19 @@ class InteractionTests(unittest.IsolatedAsyncioTestCase):
         clocked=before_reply(prompt,'[dynamic clock]')
         self.assertLess(clocked.index('[dynamic clock]'),clocked.index('【本轮新发生的交流】'))
 
-    async def test_growth_switch_does_not_change_core_persona_or_chat_engine(self):
+    async def test_legacy_frame_and_core_persona_are_preserved(self):
         persona='完整核心人格：我是温柔的deepseek酱，也有自己的喜好'
         self.configure(system_prompt_override=persona,experience_growth_enabled=False)
         source=self.event(content='今天过得怎么样')
         self.store.observe([source])
         messages,_,_=await build_context(self.store,None,self.config.settings,source,[source],{})
-        self.assertIn('【本轮新发生的交流】',messages[0]['content'])
+        self.assertTrue(any(marker in messages[0]['content'] for marker in (
+            '【本次需要回复的消息】', '【当前需要回复的消息｜本轮主题优先】')))
         self.configure(experience_growth_enabled=True)
         habits=habit_static_prompt(self.config.settings)
         warmth=warmth_prompt(self.config.settings)
-        from whalegirl_linux.natural_chat import base_prompt
-        self.assertEqual(habits,'')
-        self.assertIn(persona,base_prompt(self.config.settings,''))
+        self.assertIn('完整角色卡优先',habits)
+        self.assertIn('不是每轮必做',habits)
         self.assertNotIn('避免只回嗯',warmth)
         self.assertEqual(self.config.settings.system_prompt_override,persona)
 
@@ -230,8 +230,6 @@ class InteractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data['learnable_keys'],[source['key']])
         self.assertNotIn('别的群里的私人事情',json.dumps(data,ensure_ascii=False))
         self.configure(memory_auto_capture=False)
-        self.assertEqual(self.experience.learning_exchange(source,[source])['learnable_keys'],[source['key']])
-        self.configure(learning_enabled=False)
         self.assertEqual(self.experience.learning_exchange(source,[source])['exchange'],[])
 
     async def test_locked_episode_is_readable_but_not_offered_for_rewriting(self):

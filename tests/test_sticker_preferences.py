@@ -9,18 +9,18 @@ import test_chat_habits as habits
 
 class StickerPreferenceTests(unittest.TestCase):
     def test_stronger_presets_keep_expression_model_owned(self):
-        for level,phrase in [('very_high','很愿意'),('sticker_first','更偏爱表情')]:
+        for level,phrase in [('very_high','默认先在目录里找'),('sticker_first','表情优先')]:
             prompt=sticker_static_prompt(Settings(sticker_aggressiveness=level))
             self.assertIn(phrase,prompt)
-            self.assertIn('独立承担回应',prompt)
-            self.assertNotIn('默认先',prompt)
+            self.assertIn('不为凑频率制造回复',prompt)
+            self.assertIn('不用另外提供sticker_suggestion',prompt)
 
     def test_prompt_contains_independent_preferences_and_the_curated_note(self):
         s=Settings(sticker_text_pair_eagerness=95,sticker_only_eagerness=90,
                    sticker_reaction_eagerness=0,sticker_style_note='用表情接梗，不凑一句解释')
         prompt=sticker_static_prompt(s)
-        for word in ['文字搭配95','表情代替文字90','接表情或拍一拍0',
-                     '使用sticker动作','独立承担回应','用表情接梗，不凑一句解释']:
+        for word in ['文字搭配表情 95/100','只发表情代替文字 90/100','接表情或拍一拍 0/100',
+                     '不用另外提供sticker_suggestion','只有sticker是完整有效的回复','用表情接梗，不凑一句解释']:
             self.assertIn(word,prompt)
         self.assertEqual(sticker_static_prompt(s.model_copy(update={'stickers_enabled':False})),'')
 
@@ -53,7 +53,7 @@ class StickerPreferenceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         action('other-chat',0,'sticker','sent','another@chatroom')
         stats={};prompt=sticker_usage_prompt(self.store,settings,first,stats)
         self.assertEqual(stats,{'target':75,'recent_turns':2,'sticker_turns':1})
-        self.assertEqual(prompt,'')
+        self.assertIn('近期偏少',prompt);self.assertIn('待确认的表情不重发',prompt)
         self.assertEqual(sticker_usage_prompt(self.store,settings.model_copy(update={'sticker_usage_target':0}),first),'')
         self.assertEqual(sticker_usage_prompt(self.store,settings.model_copy(update={'stickers_enabled':False}),first),'')
 
@@ -65,8 +65,8 @@ class StickerPreferenceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             return json.dumps({'should_reply':True,'actions':[{'type':'text','text':'我听着呢'}]})
         engine.chat=chat;await self.runtime.process_next()
         self.assertEqual(engine.calls,1);self.assertEqual(self.gateway.sent,[('text','我听着呢')])
-        self.assertNotIn('期望约75%',seen[0])
-        self.assertIn('很愿意',seen[0])
+        self.assertIn('期望约75%',seen[0])
+        self.assertGreater(seen[0].index('【表情节奏参考】'),seen[0].index('【本轮动态上下文】'))
 
     async def test_manual_note_is_in_the_single_main_request_and_plan_is_not_augmented(self):
         self.config.save(self.config.settings.model_copy(update={'sticker_style_note':'只发表情也是完整回应',

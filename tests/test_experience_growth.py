@@ -162,7 +162,7 @@ class ExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('当下生活小剧场', prompt)
         self.assertIn('群聊实况', self.service.dynamic_prompt(event,[event]))
         self.configure(experience_growth_enabled=False)
-        self.assertNotIn('2～18', persona_live_dynamic_prompt(self.store,self.config.settings,event,[event],natural=True))
+        self.assertIn('2～18', persona_live_dynamic_prompt(self.store,self.config.settings,event,[event],natural=True))
 
     async def test_group_style_and_echo_are_measured_from_distinct_real_people(self):
         now = time.time()
@@ -264,7 +264,7 @@ class ExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.experience.emotional_context(event),'')
         self.configure(active_persona_id='')
         self.assertTrue(self.experience.emotional_context(event))
-        for field in ('experience_growth_enabled','mood_engine_enabled'):
+        for field in ('experience_growth_enabled','autonomy_enabled','mood_engine_enabled'):
             self.configure(**{field:False})
             self.assertEqual(self.experience.emotional_context(event),'')
             self.configure(**{field:True})

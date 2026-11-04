@@ -27,6 +27,29 @@ from .personas import PersonaLibrary, PersonaSpec, PersonaSaveRequest, PersonaAc
 from .conversation import admin_persona_state_action
 
 
+class FishtalkImportRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    chat: str = Field(min_length=1, max_length=200)
+    content: str = Field(min_length=1, max_length=150000, repr=False)
+    format: Literal['text', 'json', 'csv'] = 'text'
+
+
+class FishtalkLabelRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    chat: str = Field(min_length=1, max_length=200)
+    key: str = Field(min_length=1, max_length=800)
+    label: Literal['auto', 'good', 'funny', 'fish', 'bad', 'blocked']
+
+
+class FishtalkChatRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    chat: str = Field(min_length=1, max_length=200)
+
+
+class FishtalkCheckRequest(FishtalkChatRequest):
+    text: str = Field(min_length=1, max_length=2000, repr=False)
+
+
 class ConfigRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     settings: Settings
@@ -429,6 +452,57 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     @app.get('/learning.js')
     async def learning_script():
         return FileResponse(root/'whalegirl_linux'/'learning.js', media_type='text/javascript')
+
+    @app.get('/fishtalk.js')
+    async def fishtalk_script():
+        return FileResponse(root/'whalegirl_linux'/'fishtalk.js', media_type='text/javascript')
+
+    @app.get('/api/fishtalk')
+    def fishtalk_state(chat: str=''):
+        try:
+            return runtime.fishtalk.snapshot(chat)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post('/api/fishtalk/rebuild')
+    def fishtalk_rebuild(body: FishtalkChatRequest):
+        try:
+            runtime.fishtalk.rebuild(body.chat)
+            return runtime.fishtalk.snapshot(body.chat)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post('/api/fishtalk/history')
+    def fishtalk_history(body: FishtalkChatRequest):
+        try:
+            runtime.fishtalk.rebuild(body.chat, full_history=True)
+            return runtime.fishtalk.snapshot(body.chat)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post('/api/fishtalk/import')
+    def fishtalk_import(body: FishtalkImportRequest):
+        try:
+            return runtime.fishtalk.import_text(body.chat, body.content, format=body.format)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(400, '语料导入失败，请检查会话授权和文件格式：'+type(exc).__name__) from exc
+
+    @app.post('/api/fishtalk/label')
+    def fishtalk_label(body: FishtalkLabelRequest):
+        try:
+            return runtime.fishtalk.label(body.chat, body.key, body.label)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post('/api/fishtalk/check')
+    def fishtalk_check(body: FishtalkCheckRequest):
+        try:
+            from .fishtalk_rules import check
+            runtime.fishtalk.scope(body.chat)
+            pack = runtime.fishtalk.pack(body.chat) or {}
+            return check(body.text, examples=[i['text'] for i in pack.get('examples', [])])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.get('/memory-hub.js')
     async def memory_hub_script():
@@ -1256,13 +1330,6 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
             return runtime.learning.snapshot(state=state, query=q[:200], chat=chat, kind=kind)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-
-    @app.get('/api/chat-style')
-    def chat_style_state(chat: str):
-        try:
-            return runtime.memory_hub.chat_style.snapshot(config.settings,chat)
-        except ValueError as exc:
-            raise HTTPException(403,str(exc)) from exc
 
     @app.get('/api/persona-state')
     def get_persona_state(chat: str=''):

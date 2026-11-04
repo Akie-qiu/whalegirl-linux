@@ -40,3 +40,7 @@ deploy/*.json
 /settings.json
 /console-password.json
 /runtime-exports/
+
+# Local upstream checkout and old source copies; the licensed integration is vendored.
+/references/fishtalk/
+/whalegirl_linux/*.before-*.py

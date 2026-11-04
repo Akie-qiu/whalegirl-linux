@@ -84,17 +84,17 @@ class SafetyGuard:
         since = min(now-3600,day_start)
         rows = self.store.db.execute('''SELECT i.chat,i.reply,
             CASE WHEN json_extract(m.metrics,'$.reply_type')='sticker' THEN 'sticker' ELSE 'text' END AS kind,
-            COALESCE(json_extract(m.metrics,'$.send_started_at'),i.updated) AS sent_at
+            COALESCE(json_extract(m.metrics,'$.send_started_at'),i.updated) AS sent_at,i.state
             FROM inbox i LEFT JOIN reply_metrics m ON m.key=i.key
             WHERE i.account=? AND i.state IN ('sent','sending','uncertain')
             AND NOT EXISTS(SELECT 1 FROM outbound_actions a WHERE a.inbox_key=i.key)
             AND COALESCE(json_extract(m.metrics,'$.send_started_at'),i.updated)>=?
-            UNION ALL SELECT chat,reply,kind,sent_at FROM outbound_actions
+            UNION ALL SELECT chat,reply,kind,sent_at,state FROM outbound_actions
             WHERE account=? AND state IN ('sent','sending','uncertain') AND sent_at>=?''', (account,since,account,since)).fetchall()
         if self.store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='moments_actions'").fetchone():
             rows += self.store.db.execute('''SELECT 'moments:' || kind || ':' ||
                 COALESCE(json_extract(payload,'$.post.id'),'timeline') AS chat,text AS reply,
-                'text' AS kind,updated AS sent_at FROM moments_actions WHERE account=?
+                'text' AS kind,updated AS sent_at,state FROM moments_actions WHERE account=?
                 AND state IN ('sent','sending','uncertain') AND updated>=?''',(account,since)).fetchall()
         counts = {'minute':0,'hour':0,'day':0,'chat_hour':0,'text_hour':0,'text_day':0,'sticker_hour':0,'sticker_day':0,'image_hour':0,'image_day':0}
         for row in rows:
@@ -143,6 +143,10 @@ class SafetyGuard:
                             'retry_at':day_start+86400 if window=='day' else min(times)+seconds}
         if reply:
             for row in rows:
+                # A fresh model choice may intentionally reuse a confirmed sticker.
+                # In-flight / uncertain submissions keep their duplicate protection.
+                if kind=='sticker' and row['kind']=='sticker' and row['state']=='sent':
+                    continue
                 if (row['chat']==chat and row['sent_at']>now-settings.safety_duplicate_seconds
                         and canonical(row['reply'])==canonical(reply)):
                     return {'allowed':False,'code':'duplicate_reply','reason':'本地保护：近期已在该会话发送相同内容，本次不重复发送',

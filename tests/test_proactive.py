@@ -192,7 +192,6 @@ class ProactiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('HTTP 404', self.service.snapshot()['runs'][0]['error'])
         self.runtime.engine_factory = factory
         self.reply = {'should_reply':False, 'actions':[]}
-        self.store.observe([{**self.event,'key':'new-after-error','local_id':2,'timestamp':time.time()-1800}])
         self.service.touch(CHAT, last_decision=0)
         await self.service.run_once()
         self.assertEqual(self.service.last_error, '')

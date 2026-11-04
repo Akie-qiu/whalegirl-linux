@@ -267,7 +267,10 @@ def locate_post(post, snapshot, *, allow_partial=False, allow_bottom=False):
     command('xdotool', 'mousemove', str(round(a['x']+a['width']/2)), str(round(a['y']+a['height']/2)),
             'click', '--repeat', '30', '--delay', '3', '4')
     time.sleep(.12)
-    for _ in range(7):
+    deadline = time.monotonic() + 10
+    for _ in range(24):
+        if time.monotonic() > deadline:
+            break
         f = frame()
         lists = [n for n in walk(f) if n.get('role') == 'list']
         if len(lists) != 1:
@@ -334,6 +337,34 @@ def comment_detail(post,expected_height=None):
     raise ValueError('Source post is not confirmed in comment detail')
 
 
+def bind_timeline_comments(post):
+    """Keep the verified post in view until its following comment block loads."""
+    for _ in range(10):
+        try:
+            return comment_detail(post)
+        except ValueError:
+            lists = [n for n in walk(frame()) if n.get('role') == 'list']
+            if len(lists) != 1:
+                raise
+            rows = lists[0].get('children', [])
+            owners = [i for i, row in enumerate(rows) if row.get('role') == 'list-item'
+                      and norm(post['text']) in norm(row.get('name'))]
+            if len(owners) != 1 or owners[0] != len(rows)-1:
+                raise
+            bounds, area = rows[owners[0]]['bounds'], lists[0]['bounds']
+            # Qt virtualizes the next row. A post at the bottom can be verified
+            # before its comments have any accessible object. Scroll only while
+            # that exact post is still present, rather than guessing a block.
+            if bounds['y'] >= area['y']+area['height'] or bounds['y']+bounds['height'] <= area['y']:
+                raise
+            repeat = '2' if bounds['y']+bounds['height'] > area['y']+area['height']+140 else '1'
+            activate_moments()
+            command('xdotool', 'mousemove', str(area['x']+area['width']//2),
+                    str(area['y']+area['height']//2), 'click', '--repeat', repeat, '--delay', '20', '5')
+            time.sleep(.12)
+    raise ValueError('Verified source post did not expose its comment block within bounded scrolling')
+
+
 def select_scrolling_comment(post,target):
     """Search visible row bands; native Copy confirms the exact unique source."""
     from moments_layout import visible_comment_points
@@ -394,11 +425,11 @@ def select_timeline_comment(post, target):
     duplicate = sum(norm(c['text']) == norm(target['text']) for c in post['comments']) != 1
     seen = set()
     deadline = time.monotonic()+18
-    expected_height = None
-    for _ in range(8):
-        bounds, area = comment_detail(post, expected_height)
-        if expected_height is None:
-            expected_height = bounds['height']
+    bounds, area = bind_timeline_comments(post)
+    expected_height = bounds['height']
+    for attempt in range(8):
+        if attempt:
+            bounds, area = comment_detail(post, expected_height)
         if duplicate and bounds['height'] > area['height']:
             raise ValueError('Duplicate comment text needs an unambiguous native row; no reply sent')
         top, bottom = max(bounds['y'], area['y']), min(bounds['y']+bounds['height'], area['y']+area['height'])

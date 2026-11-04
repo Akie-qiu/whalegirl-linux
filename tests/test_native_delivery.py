@@ -104,19 +104,45 @@ class ChatListNavigationTests(unittest.TestCase):
                         for i,name in enumerate(names)]}]}
 
     def test_offscreen_target_is_found_by_scrolling_only_chat_list(self):
-        with patch.object(ui,'tree',side_effect=[self.root('first','second'),self.root('third','临时测试')]),\
+        top=self.root('first','second')
+        with patch.object(ui,'tree',side_effect=[top,top,top,self.root('third','临时测试')]),\
              patch.object(ui,'run_process') as command,patch.object(ui.time,'sleep'):
             target=ui.locate_chat(self.root('other'),'临时测试')
         self.assertEqual(target['name'],'临时测试')
-        self.assertEqual(command.call_count,2)
-        self.assertEqual(command.call_args_list[0].args[0][-1],'4')
-        self.assertEqual(command.call_args_list[1].args[0][-1],'5')
+        self.assertEqual([c.args[0][-1] for c in command.call_args_list],['4','4','4','5'])
         self.assertTrue(all('Return' not in c.args[0] for c in command.call_args_list))
 
     def test_visible_target_needs_no_extra_snapshot(self):
         with patch.object(ui,'tree') as snapshot,patch.object(ui,'run_process') as command:
             self.assertEqual(ui.locate_chat(self.root('临时测试'),'临时测试')['name'],'临时测试')
         snapshot.assert_not_called();command.assert_not_called()
+
+    def test_coalesced_up_scroll_and_one_unchanged_frame_do_not_skip_newer_chats(self):
+        middle=self.root('middle')
+        pages=[middle,middle,self.root('near top'),self.root('临时测试')]
+        with patch.object(ui,'tree',side_effect=pages),patch.object(ui,'run_process') as command,patch.object(ui.time,'sleep'):
+            target=ui.locate_chat(self.root('old bottom'),'临时测试')
+        self.assertEqual(target['name'],'临时测试')
+        self.assertTrue(all(c.args[0][-1]=='4' for c in command.call_args_list))
+        self.assertFalse(any('--delay' in c.args[0] and c.args[0][c.args[0].index('--delay')+1]=='1'
+                             for c in command.call_args_list))
+
+    def test_recycled_row_cannot_click_search_box_and_partial_row_is_clipped(self):
+        root=self.root('临时测试');row=root['children'][0]['children'][0]
+        row['bounds'].update(y=40,height=68)
+        self.assertIsNone(ui.visible_chat(root,'临时测试')[1])
+        row['bounds'].update(y=80,height=45)
+        listing,target=ui.visible_chat(root,'临时测试')
+        self.assertEqual(target['bounds']['y'],100)
+        self.assertEqual(target['bounds']['height'],25)
+        self.assertEqual(row['bounds']['y'],80)
+
+    def test_absent_target_stops_at_observed_boundaries_without_typing_or_clicking_a_row(self):
+        root=self.root('another chat')
+        with patch.object(ui,'tree',return_value=root),patch.object(ui,'run_process') as command,patch.object(ui.time,'sleep'):
+            with self.assertRaisesRegex(ValueError,'尚未发送'):ui.locate_chat(root,'临时测试')
+        self.assertEqual([c.args[0][-1] for c in command.call_args_list],['4','4','5','5'])
+        self.assertTrue(all(c.args[0][0]=='xdotool' for c in command.call_args_list))
 
     def test_pre_send_failure_is_saved_and_submitted_boundary_preserved(self):
         root=Path(__file__).resolve().parents[1]/'test-runs';root.mkdir(exist_ok=True)

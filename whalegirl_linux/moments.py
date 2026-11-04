@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 import json
@@ -9,6 +10,8 @@ import random
 import re
 import time
 import uuid
+
+import httpx
 
 from .stickers import parse_json
 from .moments_creativity import MOMENTS_STORY_RULES, publication_references, story_brief, story_metadata
@@ -883,8 +886,30 @@ class MomentsService:
                 raise ValueError(check.get('reason') or '账号发送上限阻止本次发布')
             self.book.change(identity, 'sending')
             try:
-                result = await r.gateway.moments('moments_send', s.account_id,
-                    kind=row['kind'], text=row['text'], source=payload, request_id=identity)
+                from .gateway import UIJobError
+                for attempt in range(3):
+                    try:
+                        result = await r.gateway.moments('moments_send', s.account_id,
+                            kind=row['kind'], text=row['text'], source=payload, request_id=identity)
+                        break
+                    except UIJobError as exc:
+                        # A definite pre-submit EAGAIN is safe to retry. A click
+                        # or unknown result is never repeated, even with EAGAIN.
+                        resource_busy = (exc.state == 'failed_before_send' and
+                            re.search(r'\[Errno\s+'+str(errno.EAGAIN)+r'\]', str(exc)) is not None)
+                        if not resource_busy or attempt == 2:
+                            raise
+                        self.book.change(identity, 'draft', error='微信暂忙，尚未提交，准备重试')
+                        await asyncio.sleep((.6, 1.2)[attempt])
+                        try:
+                            self.gate(row['kind'])
+                        except ValueError as blocked:
+                            self.book.change(identity, 'draft', error=str(blocked))
+                            return self.book.get(s.account_id, identity)
+                        if self.busy():
+                            self.book.change(identity, 'draft', error='聊天正在处理，尚未提交，稍后重试')
+                            return self.book.get(s.account_id, identity)
+                        self.book.change(identity, 'sending')
                 state = 'sent' if result.get('confirmed') is True else 'uncertain'
                 self.book.change(identity, state, receipt=str(result.get('receipt') or ''),
                                  error='' if state == 'sent' else '微信结果未确认，请核对，系统不会自动重发')
@@ -942,10 +967,19 @@ class MomentsService:
         result = {}
         if refresh_due:
             # Only the slower timeline refresh opens the native UI.
-            saved['last_poll'] = now
-            if r.config.generation == generation:
-                self.book.save_state(s.account_id, saved)
-            result = await self.scan()
+            try:
+                result = await self.scan()
+            except (ValueError, OSError, httpx.HTTPError) as exc:
+                self.error = '朋友圈刷新失败，稍后重试：' + str(exc)[:140]
+                # Existing synchronized comments remain usable. A failed UI
+                # refresh must not postpone them or consume a publication slot.
+                result = await self.scan_comments() if s.moments_reply_own_enabled else {}
+                self.error = '朋友圈刷新失败，稍后重试：' + str(exc)[:140]
+                refresh_due = False
+            else:
+                saved['last_poll'] = now
+                if r.config.generation == generation:
+                    self.book.save_state(s.account_id, saved)
         elif s.moments_reply_own_enabled:
             result = await self.scan_comments()
         elif due_slot is None:

@@ -2,36 +2,136 @@
 (() => {
   const element=(tag,cls,content) => {const e=document.createElement(tag);if(cls)e.className=cls;if(content)e.textContent=content;return e;};
   const button=(title,fn) => {const b=element('button','secondary',title);b.type='button';b.onclick=()=>action(b,fn);return b;};
-  const styleFields={};
-  const styleBox=element('div','settings-grid');
-  const stickerCooldownLabel=element('label','','同一表情候选冷却 / 秒'),stickerCooldown=element('input');
-  stickerCooldown.type='number';stickerCooldown.id='style-sticker-cooldown';stickerCooldown.min=0;stickerCooldown.max=3600;stickerCooldown.step=1;
-  stickerCooldownLabel.append(stickerCooldown);styleBox.append(stickerCooldownLabel);
-  const humanLikeSection=element('section','record span-all');
-  humanLikeSection.append(element('h3','','相处状态'),element('p','hint','人设由角色卡定义，群表达在“记忆与成长”查看。这里仅展示有来源的心情和群氛围，不再用随机剧场或语气档位指挥回复。'));
-  const liveToolbar=element('div','chat-toolbar'),liveChatSelect=element('select');
-  liveChatSelect.id='persona-live-chat';liveChatSelect.setAttribute('aria-label','查看相处状态的会话');
-  const liveSummary=element('div','live-monitor-grid');liveSummary.id='persona-live-summary';
-  function renderPersonaLive(data){
-    if(!data)return;liveSummary.replaceChildren();
-    const mood=data.mood||{},mask=data.group_mask||{};
-    liveSummary.append(element('p','',`当前心情：${mood.label||'平静'} · ${mood.reason||'日常平稳'}`),
-      element('p','',`群氛围：${mask.vibe_summary||'尚无特别记录'}`));
+  const conversationFields={banter_level:'玩梗程度',play_along:'顺着演的意愿',callback_frequency:'旧梗回忆频率',assertiveness:'主见程度'};
+  const styleFields={reply_warmth:'亲切程度',girlish_tone:'少女语气',colloquialism:'口语程度',teasing:'吐槽强度',persona_density:'人设浓度',followup_questions:'反问频率',reply_length:'一般回复详略',...conversationFields};
+  const styleOptions={reply_warmth:[['low','平和简洁'],['normal','自然亲切'],['high','温暖热络']],sticker_after_text:[['off','关闭主动搭配'],['normal','适中 · 合适时搭配'],['high','积极 · 优先文字后配表情']],reply_length:[['short','简短'],['normal','适中'],['detailed','充分解释']]};
+  Object.assign(styleOptions,{
+    girlish_tone:[['off','跟随角色卡'],['natural','自然少女感'],['bright','轻快俏皮'],['soft','柔软细腻']],
+    banter_level:[['low','偶尔轻松一句'],['normal','自然接梗'],['high','更爱嘴贫']],
+    play_along:[['low','点到为止'],['normal','愿意接一两轮'],['high','愿意继续演']],
+    callback_frequency:[['off','不主动提旧梗'],['low','很相关时偶尔提'],['normal','相关时自然提起'],['high','更愿意回忆共同梗']],
+    assertiveness:[['low','柔和表达'],['normal','有自己的喜恶'],['high','更坦率地表达意见']]
+  });
+  const styleBox=element('div','settings-grid');styleBox.id='expression-style-controls';
+  const conversationBox=element('div','settings-grid');
+  for(const [name,title] of Object.entries(styleFields)) {
+    const label=element('label','',title), select=element('select');select.id='style-'+name;
+    for(const [value,text] of styleOptions[name] || [['low','低'],['normal','适中'],['high','高']]) {
+      const o=element('option','',text);o.value=value;select.append(o);
+    }
+    label.append(select);(name in conversationFields ? conversationBox : styleBox).append(label);
   }
-  async function refreshPersonaLive(){renderPersonaLive(await api('persona-state?chat='+encodeURIComponent(liveChatSelect.value||'')));}
+  const shortSection=element('section','span-all');shortSection.id='expression-short-controls';
+  const shortEnabled=element('input');shortEnabled.type='checkbox';shortEnabled.id='chat-short-replies-enabled';
+  const shortToggle=element('label','check-label');shortToggle.append(shortEnabled,document.createTextNode('优先短句聊天'));
+  const shortSentences=element('input');shortSentences.type='number';shortSentences.id='chat-short-reply-sentences';shortSentences.min=1;shortSentences.max=5;shortSentences.step=1;
+  const sentenceLabel=element('label','','闲聊目标句数');sentenceLabel.append(shortSentences);
+  const shortChars=element('input');shortChars.type='number';shortChars.id='chat-short-reply-chars';shortChars.min=10;shortChars.max=200;shortChars.step=1;
+  const charsLabel=element('label','','每轮闲聊目标字数');charsLabel.append(shortChars);
+  const shortGrid=element('div','two-fields');shortGrid.append(sentenceLabel,charsLabel);
+  function shortState(){shortSentences.disabled=shortChars.disabled=!shortEnabled.checked;}
+  shortEnabled.onchange=shortState;
+  shortSection.append(element('h3','','短句目标'),shortToggle,shortGrid,element('p','hint','这是闲聊表达目标；明确要求详细时可展开。关闭后使用“一般回复详略”，平台长度与发送保护仍独立生效。'));
+  styleBox.append(shortSection);
+    const stickerCooldownLabel=element('label','','同一表情排序参考窗口 / 秒'),stickerCooldown=element('input');
+  stickerCooldown.type='number';stickerCooldown.id='style-sticker-cooldown';stickerCooldown.min=0;stickerCooldown.max=3600;stickerCooldown.step=1;
+    stickerCooldownLabel.append(stickerCooldown,element('span','hint','近期使用只影响排序，不禁止再次选择；优先提供较少用的其他表情。管理员停用和待确认发送仍受保护。'));styleBox.append(stickerCooldownLabel);
+  const pairingHint=element('p','hint','文字、表情积极性、发送条数与表情冷却已统一在“自主与主动聊天”设置；这里仅保存说话风格和人设参数。');
+  styleBox.append(pairingHint);
+  const conversationSection=element('section','span-all');
+  conversationSection.style.gridColumn='1 / -1';conversationSection.style.minWidth='0';
+  conversationSection.append(element('h3','','接话与玩梗'),element('p','hint','玩梗控制自嘲、找补和顺势发挥；吐槽强度单独控制互损。共同梗只在原群使用，认真求助时收住玩笑。所有选择跟随当前角色，在同一次回复中完成。'),conversationBox);
+  styleBox.append(conversationSection);
+  const humanLikeSection=element('section','record span-all');humanLikeSection.id='expression-live-section';
+  humanLikeSection.style.gridColumn='1 / -1';humanLikeSection.style.minWidth='0';
+  humanLikeSection.style.borderTop='0';humanLikeSection.style.paddingTop='4px';
+  humanLikeSection.append(element('h3','','🌊 真人感动态状态与去人机感看板'),
+    element('p','hint','实时跟踪当前会话的小情绪起伏、后台生活小剧场、反套路熔断器与分群性格面具，全部注入动态上下文，不破坏提示词前缀缓存。'));
+  const liveToolbar=element('div','chat-toolbar'),liveChatSelect=element('select');
+  liveChatSelect.id='persona-live-chat';liveChatSelect.setAttribute('aria-label','查看实时状态的会话');
+  const liveSummary=element('div','live-monitor-grid');liveSummary.id='persona-live-summary';
+  liveSummary.textContent='正在读取实时情绪、生活小剧场与分群面具…';
+  function makeLiveCard(tag,title,desc,progress=null){
+    const c=element('div','live-stat-card');
+    c.append(element('small','',tag),element('strong','',title),element('p','',desc));
+    if(progress!=null){
+      const track=element('div','energy-bar-track'),fill=element('div','energy-bar-fill');
+      fill.style.width=Math.max(6,Math.min(100,Number(progress)||50))+'%';
+      track.append(fill);c.append(track);
+    }
+    return c;
+  }
+  function renderPersonaLive(data){
+    if(!data)return;
+    liveSummary.replaceChildren();
+    const mood=data.mood||{};
+    const af=data.anti_formula||{};
+    const mask=data.group_mask||{};
+    const deltaText=v=>v>0?'+'+v:String(v||0);
+    const guardNames={relaxed:'熟人放松',normal:'正常边界',guarded:'稍微收敛'};
+    const hasBans=Boolean(af.banned_openers?.length||af.banned_self_refs?.length||af.ban_end_question);
+    liveSummary.append(
+      makeLiveCard('🌊 实时小情绪',mood.label||'🌊 平静摸鱼',`活力 ${mood.energy??58}/100 · ${mood.reason||'日常平稳'}`,mood.energy??58),
+      makeLiveCard('🏠 后台生活小剧场',data.life_scene||'正捧着小鲸鱼碗在深海待命','随北京时间作息与贴吧冲浪动态自然演化'),
+      makeLiveCard('🎭 分群性格面具',`防备度：${guardNames[mask.guard_level]||'正常边界'}`,`吐槽 ${deltaText(mask.teasing_delta)} 档 · 玩梗 ${deltaText(mask.banter_delta)} 档`+(mask.vibe_summary?` · ${mask.vibe_summary}`:'')),
+      makeLiveCard('🛡️ 反套路熔断器',hasBans?'⚡ 已激活句式去重保护':'✅ 近 5 轮句式自然',hasBans?`本轮禁用起手词 [${(af.banned_openers||[]).join('/')||'无'}] · 暂停自称 [${(af.banned_self_refs||[]).join('/')||'无'}]`+(af.ban_end_question?' · 禁句尾反问号':''):'无重复口头禅或连续反问审讯')
+    );
+  }
+  async function refreshPersonaLive(){
+    const data=await api('persona-state?chat='+encodeURIComponent(liveChatSelect.value||''));
+    renderPersonaLive(data);
+  }
   liveChatSelect.onchange=()=>refreshPersonaLive().catch(e=>notice(e.message,true));
-  liveToolbar.append(liveChatSelect,button('刷新状态',refreshPersonaLive),button('重置心情为平静',async()=>{
-    renderPersonaLive(await api('persona-state','POST',{op:'reset_mood',chat:liveChatSelect.value||''}));notice('心情已重置');}));
+  liveToolbar.append(
+    liveChatSelect,
+    button('刷新状态',refreshPersonaLive),
+    button('重置情绪为平静',async()=>{const d=await api('persona-state','POST',{op:'reset_mood',chat:liveChatSelect.value||''});renderPersonaLive(d);notice('该群小情绪已重置为平静摸鱼状态');}),
+    button('随机切换小剧场',async()=>{const d=await api('persona-state','POST',{op:'refresh_life_scene',chat:liveChatSelect.value||''});renderPersonaLive(d);notice('已切换新的后台生活小剧场');}),
+    button('重置本群面具',async()=>{const d=await api('persona-state','POST',{op:'reset_group_mask',chat:liveChatSelect.value||''});renderPersonaLive(d);notice('本群性格面具已恢复默认');})
+  );
+  const humanDrawer=element('details','settings-drawer');
+  humanDrawer.open=true;
+  humanDrawer.append(element('summary','','⚙️ 真人感小情绪、生活剧场与极简插话开关'));
+  const humanGrid=element('div','two-fields');humanGrid.style.marginTop='10px';
   const moodCheck=element('input');moodCheck.type='checkbox';moodCheck.id='mood-engine-enabled';
-  const moodCheckLabel=element('label','check-label');moodCheckLabel.append(moodCheck,document.createTextNode('使用真实互动形成的心情'));
+  const moodCheckLabel=element('label','check-label');moodCheckLabel.append(moodCheck,document.createTextNode('启用实时小情绪波动引擎（被夸得瑟、被怼炸毛、半夜犯困）'));
+  const lifeCheck=element('input');lifeCheck.type='checkbox';lifeCheck.id='daily-life-theater-enabled';
+  const lifeCheckLabel=element('label','check-label');lifeCheckLabel.append(lifeCheck,document.createTextNode('旧版生活小剧场（新版体验成长开启时，改用真实聊天与阅读经历）'));
+  const antiCheck=element('input');antiCheck.type='checkbox';antiCheck.id='anti-formula-guard-enabled';
+  const antiCheckLabel=element('label','check-label');antiCheckLabel.append(antiCheck,document.createTextNode('启用反套路熔断器（自动禁用近5轮重复起手词、自称与连续反问）'));
+  const chimeCheck=element('input');chimeCheck.type='checkbox';chimeCheck.id='chime-in-ultra-short';
+  const chimeCheckLabel=element('label','check-label');chimeCheckLabel.append(chimeCheck,document.createTextNode('旧版插话极简模式（新版体验成长开启时，由 AI 按语境决定长度与表达）'));
+  const volSelect=element('select');volSelect.id='mood-volatility';
+  for(const [v,t] of [['low','沉稳内敛'],['normal','自然波动（推荐）'],['high','易开心也易炸毛']]){const o=element('option','',t);o.value=v;volSelect.append(o);}
+  const volLabel=element('label','','小情绪敏感度');volLabel.append(volSelect);
   const halfLifeInput=element('input');halfLifeInput.type='number';halfLifeInput.id='mood-half-life-minutes';halfLifeInput.min=5;halfLifeInput.max=180;halfLifeInput.step=1;
-  const halfLifeLabel=element('label','','心情平复半衰期 / 分钟');halfLifeLabel.append(halfLifeInput);
-  const saveMood=button('保存相处状态设置',async()=>{
-    if(!halfLifeInput.reportValidity())return;
-    await saveSubset({mood_engine_enabled:moodCheck.checked,mood_half_life_minutes:Number(halfLifeInput.value)});notice('相处状态设置已保存');});
-  saveMood.id='save-style-settings';
-  humanLikeSection.append(liveToolbar,liveSummary,moodCheckLabel,halfLifeLabel,saveMood);
+  const halfLifeLabel=element('label','','小情绪自动平复半衰期 / 分钟');halfLifeLabel.append(halfLifeInput);
+  humanGrid.append(moodCheckLabel,lifeCheckLabel,antiCheckLabel,chimeCheckLabel,volLabel,halfLifeLabel);
+  humanDrawer.append(humanGrid);
+  humanLikeSection.append(liveToolbar,liveSummary,humanDrawer);
   $('habits-panel').querySelector('.section-top').after(humanLikeSection);
+  function expressionValues(){
+    const values={};for(const n of Object.keys(styleFields))values[n]=$('style-'+n).value;
+    if(shortEnabled.checked && (!shortSentences.checkValidity() || !shortChars.checkValidity() || !shortSentences.value || !shortChars.value))throw new Error('短句目标需为 1～5 句、10～200 字');
+    values.chat_short_replies_enabled=shortEnabled.checked;
+    if(shortEnabled.checked){values.chat_short_reply_sentences=Number(shortSentences.value);values.chat_short_reply_chars=Number(shortChars.value);}
+    if(moodCheck.checked && (!halfLifeInput.checkValidity() || !halfLifeInput.value))throw new Error('小情绪半衰期需在 5～180 分钟之间');
+    values.mood_engine_enabled=moodCheck.checked;
+    values.daily_life_theater_enabled=lifeCheck.checked;
+    values.anti_formula_guard_enabled=antiCheck.checked;
+    values.chime_in_ultra_short=chimeCheck.checked;
+    values.mood_volatility=volSelect.value;
+    if(moodCheck.checked)values.mood_half_life_minutes=Number(halfLifeInput.value);
+    return {...values,...(window.fishtalkPanel?.values?.() || {})};
+  }
+  const saveStyleBtn=button('保存聊天表达',async()=>{
+    const values={...expressionValues(),...(window.affection?.expressionValues?.() || {})};
+    await saveSubset(values);notice('说话风格与真人感设置已保存，下一轮生效');
+    window.affection?.populate();window.expressionSettings?.populate();
+    window.dispatchEvent(new CustomEvent('whalegirl-panel-saved',{detail:'expression-panel'}));
+  });
+  saveStyleBtn.id='save-style-settings';
+  styleBox.append(saveStyleBtn);
   $('save-habits').parentElement.before(styleBox);
   const contextLabel=element('label','','上下文字符预算');const budget=element('input');budget.type='number';budget.id='context-char-budget';budget.min=4000;budget.max=40000;contextLabel.append(budget);
   const summaryLabel=element('label','check-label');const summary=element('input');summary.type='checkbox';summary.id='digest-enabled';summaryLabel.append(summary,document.createTextNode('后台增量整理话题摘要'));
@@ -121,22 +221,107 @@
   }
   function populate(){
     if(!cfg)return;
-    for(const n of Object.keys(styleFields))$('style-'+n).value=cfg[n] ?? (['reply_warmth','sticker_after_text'].includes(n)?'high':'normal');
+    for(const n of Object.keys(styleFields))$('style-'+n).value=cfg[n] ?? (n==='girlish_tone'?'natural':(['reply_warmth','sticker_after_text'].includes(n)?'high':'normal'));
+    shortEnabled.checked=cfg.chat_short_replies_enabled !== false;
+    shortSentences.value=cfg.chat_short_reply_sentences ?? 2;
+    shortChars.value=cfg.chat_short_reply_chars ?? 48;
+    shortState();
     stickerCooldown.value=cfg.sticker_cooldown_seconds ?? 180;
     moodCheck.checked=cfg.mood_engine_enabled !== false;
+    lifeCheck.checked=cfg.daily_life_theater_enabled !== false;
+    antiCheck.checked=cfg.anti_formula_guard_enabled !== false;
+    chimeCheck.checked=cfg.chime_in_ultra_short !== false;
+    volSelect.value=cfg.mood_volatility || 'normal';
     halfLifeInput.value=cfg.mood_half_life_minutes ?? 25;
     budget.value=cfg.context_char_budget;
     summary.checked=cfg.background_digest_enabled;
     auto.checked=cfg.memory_auto_capture;
     selfCap.checked=cfg.memory_self_capture_enabled !== false;
     halfLifeMem.value=cfg.memory_half_life_days ?? 30;
+    window.fishtalkPanel?.populate();
     chatLabels();
     refreshPersonaLive().catch(()=>{});
+    window.expressionSettings?.populate();
   }
   function stateUpdated(s){
     if(!styleBox.dataset.ready){populate();styleBox.dataset.ready='true';}
     if(s?.persona_live && (!liveChatSelect.value || s.persona_live.chat===liveChatSelect.value)){renderPersonaLive(s.persona_live);}
     if(location.hash==='#inbox-panel' && Date.now()-lastInbox>10000){lastInbox=Date.now();loadInbox(false).catch(e=>notice(e.message,true));}
   }
-  window.improvements={stateUpdated,chatLabels,populate};if(cfg){populate();window.habits?.populate();}
+  function buildExpressionPanel(){
+    if($('expression-panel'))return;
+    const panel=element('section','panel span-all expression-panel');panel.id='expression-panel';
+    const heading=element('div','section-top'),copy=element('div');
+    copy.append(element('span','section-index','CHAT / EXPRESSION'),element('h2','','聊天表达'),
+      element('p','muted','语气、接梗、回复长短与情绪关系，集中在这里调整。普通回复和主动聊天共用，核心身份与世界观仍在角色卡中设置。'));
+    heading.append(copy);panel.append(heading);
+    const toolbar=element('div','expression-toolbar'),viewLabel=element('label','','调节方式'),view=element('select');view.id='expression-view-mode';
+    for(const [v,t] of [['combined','合并调节 · 常用'],['fine','分项调节 · 精细']]){const option=element('option','',t);option.value=v;view.append(option);}
+    viewLabel.append(view);toolbar.append(viewLabel,element('p','hint','切换视图不改配置；选择合并选项时才联动相近参数。独立组合会显示为“自定义”。'));panel.append(toolbar);
+    const presets=element('div','expression-presets'),bindings=[];
+    const control=name=>name==='chat_short_replies_enabled'?shortEnabled:$('style-'+name);
+    const read=name=>control(name).type==='checkbox'?control(name).checked:control(name).value;
+    function compound(id,title,description,options){
+      const card=element('div','expression-card'),label=element('label','',title),select=element('select');select.id=id;
+      for(const [key,item] of Object.entries(options)){const option=element('option','',item.label);option.value=key;select.append(option);}
+      const custom=element('option','','自定义 · 保留当前组合');custom.value='custom';select.append(custom);label.append(select);
+      card.append(label,element('p','hint',description));presets.append(card);
+      function sync(){select.value=Object.keys(options).find(k=>Object.entries(options[k].values).every(([name,value])=>read(name)===value)) || 'custom';}
+      select.onchange=()=>{const item=options[select.value];if(!item)return;
+        for(const [name,value] of Object.entries(item.values)){const input=control(name);if(typeof value==='boolean')input.checked=value;else input.value=value;input.dispatchEvent(new Event('change',{bubbles:true}));}
+        sync();};
+      bindings.push(sync);return card;
+    }
+    compound('expression-tone','语气与亲和','联动少女语气和亲切程度，保留角色卡中的身份与关系。',{
+      natural:{label:'自然亲切',values:{girlish_tone:'natural',reply_warmth:'normal'}},
+      bright:{label:'轻快俏皮',values:{girlish_tone:'bright',reply_warmth:'normal'}},
+      soft:{label:'温柔细腻',values:{girlish_tone:'soft',reply_warmth:'high'}},
+      calm:{label:'平静克制',values:{girlish_tone:'off',reply_warmth:'low'}}});
+    compound('expression-banter','接梗与调侃','联动玩梗、吐槽和顺着玩笑聊下去的意愿。',{
+      gentle:{label:'温和少调侃',values:{banter_level:'low',teasing:'low',play_along:'normal'}},
+      natural:{label:'自然接梗',values:{banter_level:'normal',teasing:'normal',play_along:'normal'}},
+      playful:{label:'更爱接梗',values:{banter_level:'high',teasing:'normal',play_along:'high'}}});
+    compound('expression-length','回复详略','联动短句偏好与一般回复详略；短句目标可在下方继续调整。',{
+      short:{label:'短句优先',values:{chat_short_replies_enabled:true,reply_length:'short'}},
+      normal:{label:'自然适中',values:{chat_short_replies_enabled:false,reply_length:'normal'}},
+      detailed:{label:'充分说明',values:{chat_short_replies_enabled:false,reply_length:'detailed'}}});
+    panel.append(presets);
+    const fine=element('details','settings-drawer expression-fine');fine.id='expression-fine-controls';
+    fine.append(element('summary','','分项与高级表达设置'));
+    const fineGrid=element('div','settings-grid expression-fine-grid');
+    for(const name of Object.keys(styleFields))fineGrid.append($('style-'+name).closest('label'));
+    fine.append(fineGrid);panel.append(fine,shortSection);
+    const stateGrid=element('div','expression-state-grid'),emotion=element('section','expression-card'),relations=element('section','expression-card');
+    emotion.append(element('h3','','情绪与重复表达'),element('p','hint','情绪影响当下语气；减少重复只调整表达提醒。两项可独立开关。'));
+    antiCheckLabel.lastChild.textContent='减少重复表达';moodCheckLabel.lastChild.textContent='启用互动小情绪';
+    const legacy=element('details','settings-drawer');legacy.id='expression-legacy-controls';legacy.append(element('summary','','旧模式兼容选项'));
+    legacy.append(lifeCheckLabel,chimeCheckLabel,element('p','hint','当前使用体验成长时，下列两个旧选项不参与回复。切换兼容模式后才会生效。'));
+    emotion.append(humanGrid,legacy);humanDrawer.remove();
+    relations.id='expression-relationships';relations.append(element('h3','','好感与私聊分寸'),element('p','hint','这里控制好感度系统及私聊语气；计分规则和单个人物资料在“人物好感度”中管理。'));
+    const affection=$('affection-enabled'),privateStyle=$('expression-affection-private-style');
+    if(affection){relations.append(affection.closest('.setting-row'),$('affection-enabled-status'));affection.onchange=()=>{$('affection-enabled-status').textContent='尚未保存，点击“保存聊天表达”后生效';};}
+    if(privateStyle)relations.append(privateStyle.closest('label'));
+    const privateUnreservedLabel=$('expression-private-unreserved-label');
+    if(privateUnreservedLabel)relations.append(privateUnreservedLabel);
+    const manage=element('a','expression-link','管理人物分数与计分规则 →');manage.href='#affection-panel';relations.append(manage);
+    stateGrid.append(emotion,relations);panel.append(stateGrid);
+    const live=element('details','settings-drawer');live.append(element('summary','','查看当前会话的情绪与表达参考'),humanLikeSection);panel.append(live);
+    const footer=element('div','panel-footer');footer.append(element('span','hint','只保存本页表达设置，不修改模型、人设正文或发送额度。'),saveStyleBtn);panel.append(footer);
+    window.fishtalkPanel?.mount(panel);
+    $('habits-panel').before(panel);
+    // Later proactive / unified settings builders move this control by its ID.
+    pairingHint.remove();conversationSection.remove();
+    const habitsHeading=$('habits-panel').querySelector('h2');habitsHeading.textContent='消息收取与上下文';
+    $('habits-panel').querySelector('.muted').textContent='调整连续消息缓冲、等待补充与历史输入。说话语气和情绪关系已集中到“聊天表达”。';
+    const nav=element('a','','聊天表达');nav.href='#expression-panel';const habitsNav=document.querySelector('nav a[href="#habits-panel"]');
+    if(habitsNav){habitsNav.before(nav);habitsNav.textContent='消息收取与上下文';}else document.querySelector('nav').append(nav);
+    let mode='combined';try{mode=localStorage.getItem('whalegirl-expression-view') || mode;}catch{}
+    view.value=mode==='fine'?'fine':'combined';
+    function setView(){const fineMode=view.value==='fine';presets.hidden=fineMode;fine.open=fineMode;try{localStorage.setItem('whalegirl-expression-view',view.value);}catch{}}
+    view.onchange=setView;setView();
+    function sync(){for(const update of bindings)update();const experienced=!!(cfg?.autonomy_enabled && cfg.experience_growth_enabled!==false);lifeCheck.disabled=chimeCheck.disabled=experienced;}
+    panel.addEventListener('change',event=>{if(event.target!==view)sync();});
+    window.expressionSettings={populate:sync};sync();
+  }
+  window.improvements={stateUpdated,chatLabels,populate,expressionValues,buildExpressionPanel};if(cfg)populate();
 })();

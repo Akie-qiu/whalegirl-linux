@@ -65,11 +65,9 @@ class ReadOnlyDatabase:
 
     def start(self):
         path = next(BASE.glob('*/' + self.name))
-        stat = path.stat()
-        self.identity = (stat.st_dev, stat.st_ino)
         self.process = subprocess.Popen(
             ['/usr/local/bin/sqlcipher', '-readonly', 'file:' + str(path) + '?mode=ro'],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, bufsize=1)
         self.output = queue.Queue()
         output, process = self.output, self.process
@@ -84,11 +82,6 @@ class ReadOnlyDatabase:
 
     def query(self, sql):
         with self.lock:
-            if self.process is not None:
-                path = next(BASE.glob('*/' + self.name))
-                stat = path.stat()
-                if self.identity != (stat.st_dev, stat.st_ino):
-                    self.close()
             if self.process is None or self.process.poll() is not None:
                 self.start()
             marker = 'whale_end_' + uuid.uuid4().hex
@@ -289,7 +282,7 @@ def messages(chat, limit, offset=0, *, before_time=None, before_id=0, after_time
         if before_time is not None:
             conditions.append(f'(m.create_time<{int(float(before_time))} OR (m.create_time={int(float(before_time))} AND m.local_id<{int(before_id)}))')
         if after_time is not None:
-            # Strict forward pagination; runtime separately reconciles the tail.
+            # Re-read the boundary second: server IDs and bodies can be enriched later.
             conditions.append(f'(m.create_time>{int(float(after_time))} OR '
                               f'(m.create_time={int(float(after_time))} AND m.local_id>{int(after_id)}))')
         if server_id is not None:conditions.append(f'm.server_id={int(server_id)}')
@@ -441,16 +434,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             payload = json.dumps({'error': type(exc).__name__}).encode()
             status = 503
-        try:
-            self.send_response(status)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-        except (BrokenPipeError, ConnectionResetError):
-            # The caller timed out/cancelled; don't turn that into a traceback
-            # or attempt a second response. Its poll cursor remains unchanged.
-            return
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def log_message(self, *args):
         pass
