@@ -16,3 +16,14 @@
 - 构建所用固定 OCI 摘要及微信安装包哈希见 README 和 `deploy/` 脚本；安装包、镜像层不纳入源码仓库。
 
 本文件记录来源和修改范围，不改变上游各自的授权条款，也不为上游代码重新指定许可证。
+
+## dsh-bili-humanism
+
+- 来源：[InariNGT-Ofiicial/dsh-bili-humanism](https://github.com/InariNGT-Ofiicial/dsh-bili-humanism)，参考提交 `2ec50417e64a72a28b9445c06872d7f14d9dbf24`。
+- 借鉴真实材料覆盖、来源核对、事实/观点/推测分离、可修正反思和风险暂停；`bilibili_client.py` 的公开 WBI 签名算法按 `lib/wbi.mjs` 适配为 Python。
+- MIT 原文保留在 `whalegirl_linux/vendor/humanism/LICENSE`。没有引入 DSH、其浏览器凭据提取器或 B 站写入执行器。
+
+## fishtalk
+
+- 来源：[Nozzi2455/fishtalk](https://github.com/Nozzi2455/fishtalk)，固定 `0.3.6 / bb621c3da31052e7e52b6307db3e27c508e4d502`。
+- 授权、固定来源及上游 CLI 保留在 `whalegirl_linux/vendor/fishtalk/`。Python 适配保留角色人设、会话隔离和零额外模型检测。

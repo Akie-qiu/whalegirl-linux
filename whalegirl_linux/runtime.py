@@ -127,6 +127,8 @@ class Runtime:
         self.proactive = ProactiveService(self)
         self.autonomy = AutonomyService(self)
         self.recovery = RecoveryService(self)
+        from .bilibili import BilibiliService
+        self.bilibili=BilibiliService(self)
         from .growth import GrowthService
         self.growth=GrowthService(self)
         self.ensure_authority_files()
@@ -164,6 +166,7 @@ class Runtime:
         if hasattr(self.web_search, 'close'):
             await self.web_search.close()
         await self.growth.close()
+        await self.bilibili.close()
         await self.gateway.close()
         self.store.close()
 
@@ -1746,6 +1749,7 @@ class Runtime:
                 "memory":{**self.store.memory_status(),'global':self.config.settings.global_memory,'archive_error':self.archive_error},
                 "last_reply_timing":self.last_timing,
                 "web_search":{'enabled':self.config.settings.web_search_enabled,'last':self.web_search.last},
+                "bilibili_alert":self.bilibili.alert(),
                 "recovery":self.recovery.snapshot(),
                 "learning": self.learning.status(),
                 "autonomy": {'enabled':self.autonomy.active(),'busy':self.autonomy.busy,

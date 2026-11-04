@@ -50,6 +50,17 @@ class FishtalkCheckRequest(FishtalkChatRequest):
     text: str = Field(min_length=1, max_length=2000, repr=False)
 
 
+class BilibiliAccountRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    action: Literal['login', 'poll', 'check', 'logout', 'resume']
+    acknowledge: bool = False
+
+
+class BilibiliReadingRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    enabled: bool
+
+
 class ConfigRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     settings: Settings
@@ -514,6 +525,48 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
 
     @app.get('/api/growth')
     def growth_state():return runtime.growth.snapshot()
+
+    @app.get('/bilibili.js')
+    async def bilibili_script():
+        return FileResponse(root/'whalegirl_linux'/'bilibili.js',media_type='text/javascript')
+
+    @app.get('/api/bilibili')
+    def bilibili_state():return runtime.bilibili.snapshot()
+
+    @app.post('/api/bilibili/account')
+    async def bilibili_account(body:BilibiliAccountRequest):
+        client=runtime.bilibili.client
+        try:
+            if body.action=='login':return await client.start_login()
+            if body.action=='poll':return await client.poll_login()
+            if body.action=='check':return await client.check_login()
+            if body.action=='logout':return client.logout()
+            if not body.acknowledge:raise ValueError('请先核对账号与访问条件，再明确确认恢复读取')
+            client.resume();runtime.bilibili.reschedule();return client.status()
+        except ValueError as exc:
+            raise HTTPException(400,str(exc)) from None
+
+    @app.get('/api/bilibili/account/qr')
+    def bilibili_qr():
+        try:return Response(runtime.bilibili.client.qr_png(),media_type='image/png',headers={'Cache-Control':'no-store'})
+        except ValueError as exc:raise HTTPException(400,str(exc)) from None
+
+    @app.post('/api/bilibili/explore')
+    def bilibili_explore():
+        try:return runtime.growth.request('bilibili')
+        except ValueError as exc:raise HTTPException(400,str(exc)) from None
+
+    @app.post('/api/bilibili/readings/{identity}')
+    def bilibili_reading(identity:str,body:BilibiliReadingRequest):
+        try:
+            runtime.bilibili.set_reading_enabled(identity,body.enabled)
+            return {'ok':True}
+        except ValueError as exc:raise HTTPException(400,str(exc)) from None
+
+    @app.get('/api/bilibili/readings/{identity}/frames/{index}')
+    def bilibili_frame(identity:str,index:int):
+        try:return FileResponse(runtime.bilibili.frame_path(identity,index),media_type='image/jpeg',headers={'Cache-Control':'no-store'})
+        except ValueError as exc:raise HTTPException(404,str(exc)) from None
 
     @app.post('/api/growth/run')
     def growth_run(body:dict):

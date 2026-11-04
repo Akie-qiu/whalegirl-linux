@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/InariNGT-Ofiicial/dsh-bili-humanism",
+  "commit": "2ec50417e64a72a28b9445c06872d7f14d9dbf24",
+  "license": "MIT",
+  "adaptation": "Public WBI signing algorithm in bilibili_client.py; provenance, coverage and reflection design. No DSH runtime or platform writer is included."
+}

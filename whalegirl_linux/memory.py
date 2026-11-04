@@ -52,6 +52,7 @@ class MemoryBook:
 
     def get(self, account, memory_id, allowed):
         row = self.store.db.execute('SELECT * FROM memories WHERE id=? AND account=?',(memory_id,account)).fetchone()
+        if row and row['source_class']=='bilibili_learning' and '@bilibili-learning' not in allowed:return None
         world=bool(row and row['source_class']=='world_learning' and row['role_id']==self.hub.role())
         return dict(row) if row and (row['chat'] in allowed or world) else None
 

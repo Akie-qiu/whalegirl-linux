@@ -79,6 +79,7 @@ function populateSettings() {
   window.learning?.populate();
   window.memoryHub?.populate();
   window.growthConsole?.populate();
+  window.bilibiliConsole?.populate();
   window.improvements?.populate();
   window.affection?.populate();
   window.stickerLibrary?.populate();
@@ -260,6 +261,7 @@ function renderState(s) {
   window.learning?.stateUpdated(s);
   window.memoryHub?.stateUpdated(s);
   window.growthConsole?.stateUpdated(s);
+  window.bilibiliConsole?.stateUpdated(s);
   window.affection?.stateUpdated(s);
   window.stickerLibrary?.stateUpdated(s);
   window.proactiveChat?.refresh().catch(() => {});
@@ -809,6 +811,7 @@ document.addEventListener('DOMContentLoaded', () => {
     'category-limits-panel':['save-category-limits'],
     'learning-panel':['learning-save'],
     'memory-panel':['hub-save-settings'],
+    'bilibili-console':['bili-save'],
     'affection-panel':['save-affection-rules']
   };
   let dirtyPanelId='';
@@ -824,7 +827,7 @@ document.addEventListener('DOMContentLoaded', () => {
   contentGrid.addEventListener('change',markDirty);
   function markDirty(e){
     const el=e.target;if(!el||ignoreDirtyIds.has(el.id)||el.type==='search')return;
-    const panel=el.closest('.panel');if(!panel||!panelSaveMap[panel.id])return;
+    const panel=el.closest('#bilibili-console')||el.closest('.panel');if(!panel||!panelSaveMap[panel.id])return;
     dirtyPanelId=panel.id;
     const h2=panel.querySelector('h2')?.textContent?.trim()||'当前面板';
     text('sticky-save-text',`「${h2}」有未保存的设置修改`);
@@ -849,6 +852,10 @@ document.addEventListener('DOMContentLoaded', () => {
   function active(rawHref){
     let href=rawHref||'#overview';
     if(['#timing-panel','#safety-panel','#category-limits-panel'].includes(href))href='#send-limits-panel';
+    if(['#growth-console','#bilibili-console'].includes(href)){
+      for(let element=$(href.slice(1));element;element=element.parentElement)if(element.tagName==='DETAILS')element.open=true;
+      href='#memory-panel';
+    }
     const target=links.find(a=>a.getAttribute('href')===href)||overview;
     const resolvedHref=target?.getAttribute('href')||'#overview';
     updating=true;

@@ -6,4 +6,5 @@ loguru>=0.7,<1
 cryptography>=44,<51
 websockets>=15,<16
 Pillow>=11,<13
+qrcode>=8,<9
 aiotieba==4.8.1

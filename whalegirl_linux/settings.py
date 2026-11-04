@@ -138,6 +138,18 @@ class Settings(BaseModel):
     growth_interval_minutes: int = Field(default=180, ge=30, le=1440)
     growth_exploration: int = Field(default=25, ge=0, le=100)
     growth_interests: list[str] = Field(default_factory=list, max_length=30)
+    bilibili_enabled: bool = False
+    bilibili_interval_minutes: int = Field(default=120, ge=30, le=1440)
+    bilibili_reads_per_day: int = Field(default=4, ge=0, le=20)
+    bilibili_requests_per_day: int = Field(default=200, ge=20, le=1000)
+    bilibili_visual_enabled: bool = True
+    bilibili_comments_enabled: bool = True
+    bilibili_danmaku_enabled: bool = True
+    bilibili_interest_seeds: list[str] = Field(default_factory=list, max_length=20)
+    bilibili_feeds: list[Literal['recommend', 'search', 'following', 'favorites', 'history']] = Field(
+        default_factory=lambda: ['recommend', 'search', 'following', 'favorites', 'history'], max_length=5)
+    bilibili_cache_mb: int = Field(default=64, ge=8, le=256)
+    bilibili_cache_days: int = Field(default=7, ge=1, le=30)
     memory_cold_after_days: int = Field(default=30, ge=3, le=365)
     memory_scope_mode: Literal['shared_profiles', 'isolated'] = 'shared_profiles'
     memory_auto_capture: bool = True
@@ -308,7 +320,7 @@ class Settings(BaseModel):
     expected_wechat_version: Literal["4.1.0.16", "4.1.1.8"] = "4.1.0.16"
 
     @field_validator("allowed_chat_ids", "keywords", "trigger_only_chat_ids", "interest_keywords", "moments_topics", "moments_friend_ids",
-                     "tieba_forums", "tieba_interests", "tieba_share_chat_ids", "growth_interests",
+                     "tieba_forums", "tieba_interests", "tieba_share_chat_ids", "growth_interests", "bilibili_interest_seeds",
                      "proactive_chat_ids", "proactive_strict_chat_ids", "owner_ids")
     @classmethod
     def clean_strings(cls, values):

@@ -323,7 +323,7 @@ class ProactiveService:
                     'last_bot_age_seconds': round(max(0,now-self.store.latest_sent(s.account_id,chat)))
                         if self.store.latest_sent(s.account_id,chat) else None}
             growth_context={}
-            growth_prompt=r.growth.prompt(first,humans,growth_context)
+            growth_prompt=r.growth.prompt(first,humans,growth_context,proactive=True)
             loaded_memory_ids.update(growth_context.get('ids',[]))
             dynamic = (memory_dynamic + growth_prompt + r.images.tools.dynamic_prompt(image_context, base_image_ids)
                        + r.fishtalk.dynamic_prompt(first)

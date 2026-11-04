@@ -58,7 +58,7 @@
       const s=await api('growth'),u=s.usage;
       $('growth-status').textContent=(s.enabled?(s.busy?'正在后台学习':'等待空闲学习'):'自主成长已关闭')+' · 今日 '+u.tokens.toLocaleString('zh-CN')+' / '+u.budget.toLocaleString('zh-CN')+' Token · 阅读 '+u.reads+' / '+u.read_limit+(u.estimated?' · 含估算用量':'')+(s.last_error?' · '+s.last_error:'')+' · 下次阅读 '+when(s.schedule.world_at);
       const notes=$('growth-insights');notes.replaceChildren();
-      for(const r of s.insights){const card=el('article','record');card.append(el('p','hint','#'+r.id+' · '+(r.category==='knowledge'?'新知识':'人格认识')+' · '+({active:'生效',pending:'待启用',forgotten:'已停用',superseded:'已被新认识替代',expired:'已过期'}[r.status]||r.status)+(r.locked?' · 已锁定':'')),el('p','message',r.content));
+      for(const r of s.insights){const card=el('article','record');card.append(el('p','hint','#'+r.id+' · '+(r.category==='interest'?'兴趣变化':r.category==='knowledge'?'新知识':'人格认识')+' · '+({active:'生效',pending:'待启用',forgotten:'已停用',superseded:'已被新认识替代',expired:'已过期'}[r.status]||r.status)+(r.locked?' · 已锁定':'')),el('p','message',r.content));
         if(r.conditions)card.append(el('p','hint','适用：'+r.conditions));if(r.counterexamples)card.append(el('p','hint','例外：'+r.counterexamples));
         const tools=el('div','row');tools.append(button('编辑',async()=>edit(r)),button('来源与反思',()=>showJournal(r.journal_id)));
         if(['active','pending','forgotten'].includes(r.status))tools.append(button(r.status==='forgotten'?'恢复':r.status==='pending'?'启用':'停用',async()=>{
@@ -70,7 +70,7 @@
         row.append(button('展开深层细节',async()=>{const box=$('growth-detail-body');box.replaceChildren();$('growth-detail-title').textContent='概括与原始细节';
           for(const id of r.detail_ids){const d=await api('memory-hub/'+id);box.append(el('h3','','记忆 #'+id),el('p','message',d.memory.content),el('p','hint','版本 '+d.memory.version+' · '+when(d.memory.updated)));}
           $('growth-detail').showModal();}));summaries.append(row);}
-      const runs=$('growth-runs');runs.replaceChildren();for(const r of s.runs){const row=el('article','record');row.append(el('strong','',(r.kind==='world'?'外界学习':'同类记忆整理')+' · '+(states[r.state]||r.state)),el('p','hint',when(r.created)+' · '+r.tokens+' Token'+(r.estimated?'（含估算）':'')),el('p','hint',r.error||r.result.reason||r.result.topic||('概括 '+(r.result.summaries??0)+' 组 · 新认识 '+(r.result.learned??0)+' 条')));runs.append(row);}
+      const runs=$('growth-runs');runs.replaceChildren();for(const r of s.runs){const row=el('article','record');row.append(el('strong','',(r.kind==='bilibili'?'B站探索':r.kind==='world'?'外界学习':'同类记忆整理')+' · '+(states[r.state]||r.state)),el('p','hint',when(r.created)+' · '+r.tokens+' Token'+(r.estimated?'（含估算）':'')),el('p','hint',r.error||r.result.reason||r.result.topic||('概括 '+(r.result.summaries??0)+' 组 · 新认识 '+(r.result.learned??0)+' 条')));runs.append(row);}
       lastFetch=Date.now();
     }finally{loading=false;}
   }
