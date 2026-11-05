@@ -526,6 +526,10 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     @app.get('/api/growth')
     def growth_state():return runtime.growth.snapshot()
 
+    @app.get('/api/growth/insights')
+    def growth_insights(before:int=0,limit:int=80,source:str=''):
+        return runtime.growth.memory_page(max(0,before),limit,source)
+
     @app.get('/bilibili.js')
     async def bilibili_script():
         return FileResponse(root/'whalegirl_linux'/'bilibili.js',media_type='text/javascript')
@@ -568,6 +572,11 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
         try:return FileResponse(runtime.bilibili.frame_path(identity,index),media_type='image/jpeg',headers={'Cache-Control':'no-store'})
         except ValueError as exc:raise HTTPException(404,str(exc)) from None
 
+    @app.get('/api/bilibili/readings/{identity}/boards/{index}')
+    def bilibili_board(identity:str,index:int):
+        try:return FileResponse(runtime.bilibili.board_path(identity,index),media_type='image/jpeg',headers={'Cache-Control':'no-store'})
+        except ValueError as exc:raise HTTPException(404,str(exc)) from None
+
     @app.post('/api/growth/run')
     def growth_run(body:dict):
         try:return runtime.growth.request(body.get('kind','world'))
@@ -577,6 +586,16 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     def growth_journal(identity:str):
         try:return runtime.growth.journal(identity)
         except ValueError as exc:raise HTTPException(404,str(exc)) from exc
+
+    @app.get('/api/growth/sources/{identity}')
+    def growth_source(identity:str):
+        try:return runtime.growth.source(identity)
+        except ValueError as exc:raise HTTPException(404,str(exc)) from None
+
+    @app.get('/api/growth/insights/{identity}/revisions')
+    def growth_insight_revisions(identity:int):
+        try:return runtime.growth.revisions(identity)
+        except ValueError as exc:raise HTTPException(404,str(exc)) from None
 
     @app.post('/api/growth/insights/{identity}')
     def growth_edit(identity:int,body:dict):

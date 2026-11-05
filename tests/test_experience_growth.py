@@ -378,17 +378,21 @@ class ExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.service.considered(event,event['key'])
         self.assertFalse(self.service.opportunity(event['chat'],anchor=event['key']))
         g = world_fixtures.GrowthTests.fake(self)
-        g.request('world')
+        g.request('tieba')
         await g.run_once()
+        # Expression sharing alone is never a factual proactive opening.
+        self.assertFalse(self.service.opportunity(event['chat'],anchor=event['key']))
+        row=g.memories()[0]
+        with self.store.db:self.store.db.execute("UPDATE growth_insights SET category='knowledge' WHERE memory_id=?",(row['id'],))
         self.assertTrue(self.service.opportunity(event['chat'],anchor=event['key']))
         first = {**event, 'key':'proactive:test', 'trigger':'proactive'}
         prompt = self.service.dynamic_prompt(first,[event],proactive=True)
-        self.assertIn('实际读过的新见闻',prompt)
-        self.assertIn('https://example.org/ocean',prompt)
+        self.assertIn('管理员允许用于聊天的公开认识',prompt)
+        self.assertNotIn('https://tieba.baidu.com',prompt)
         self.service.accept(first,[event],{'should_reply':False,'actions':[]},proactive=True)
         self.assertFalse(self.service.opportunity(event['chat'],anchor=event['key']))
         self.assertEqual(self.gateway.sent,[])
-        self.configure(growth_web_enabled=False)
+        current=g.memories()[0];g.edit(current['id'],{'version':current['version'],'chat_enabled':False})
         self.assertIsNone(self.experience.fresh_reading(first))
 
     async def test_new_reading_does_not_bypass_a_strict_group_or_quiet_state(self):

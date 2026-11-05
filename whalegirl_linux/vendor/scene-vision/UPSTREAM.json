@@ -1,0 +1,14 @@
+{
+  "references": [
+    {
+      "repository": "https://github.com/SAOS-3624/dsh-see-now",
+      "commit": "93342e6122b278139281d71346314048170a034b"
+    },
+    {
+      "repository": "https://github.com/SAOS-3624/dsh-video-storyboard",
+      "commit": "11d8b8f057a56b3e27b8a740a6f8d29e3848de87"
+    }
+  ],
+  "license": "Apache-2.0",
+  "adaptations": "HSV circular weighted difference adapted to bounded Pillow grids; offline cut/motion integration and numbered timestamped storyboard implemented for sparse official snapshots and optional single-process local FFmpeg. No DSH, ASR, OCR, browser-cookie extractor, or external platform writer."
+}

@@ -302,14 +302,15 @@ class ProactiveService:
                 + r.images.tools.static_prompt(first, include_catalog=False)
                 + sticker_static_prompt(s)
                 + r.tieba.tools.static_prompt()
+                + r.bilibili.tools.static_prompt()
                 + '\n【主动聊天】你现在有一次自主发起聊天的机会，并没有人刚向你提问。'
                   '结合人设、关系、当前北京时间和真实话题，顺着第一直觉决定是否值得开口；没具体想说的就沉默。'
                   '可分享有依据的兴趣见闻、接续尚未解决的话题、关心近况或找一个具体群友搭话。'
                   '先分清是正在接话还是隔了一段时间重新开聊：已结束的旧话题不再逐句点评；隔得久时只有确有新意或值得关心才开口，不固定打招呼或催促回复。'
                   '像一个在场的年轻女孩自然抛出一句短话或表情，不当话题主持人或总结员；忙碌人员不可点名或@。'
-                  '可按需使用已授权工具（联网搜索、贴吧、记忆、表情库、图库与生图）；记忆和收藏的source_key只用真实群友消息，不因自己准备开口而改好感度。'
+                  '可按需使用已授权工具（联网搜索、贴吧、B站异步探索、记忆、表情库、图库与生图）；记忆和收藏的source_key只用真实群友消息，不因自己准备开口而改好感度。'
                   '输出JSON：{"should_reply":false,"reason":"供管理员查看的简短依据，不含内部推理",'
-                  '"sources":["确切消息key或memory:ID"],"actions":[],"image_request":null,"tieba_request":null,"tieba_used_meme_ids":[],"search_query":"","fetch_url":"","memory_ops":[],"memory_used_ids":[],"sticker_ops":[],"image_descriptions":[]}。'
+                  '"sources":["确切消息key或memory:ID"],"actions":[],"image_request":null,"tieba_request":null,"bilibili_request":null,"tieba_used_meme_ids":[],"search_query":"","fetch_url":"","memory_ops":[],"memory_used_ids":[],"sticker_ops":[],"image_descriptions":[]}。'
                   'actions为有序发送计划，文字为{"type":"text","text":"自然短句","mentions":[]}，表情为{"type":"sticker","id":"目录ID"}；每轮最多'+str(s.reply_max_parts)+'个动作，沉默时actions=[]且image_request=null。')
             system += r.autonomy.static_prompt()
             # Chat-specific catalog and venue belong after all common rules;

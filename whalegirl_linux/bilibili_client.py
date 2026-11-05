@@ -17,16 +17,17 @@ from .settings import private_write
 API = 'https://api.bilibili.com'
 PASSPORT = 'https://passport.bilibili.com'
 PATHS = frozenset({
-    '/x/web-interface/nav', '/x/web-interface/view', '/x/player/wbi/v2',
+    '/x/web-interface/nav', '/x/web-interface/view', '/x/player/wbi/v2', '/x/web-interface/popular',
     '/x/web-interface/wbi/index/top/feed/rcmd', '/x/web-interface/wbi/search/type',
     '/x/polymer/web-dynamic/v1/feed/all', '/x/web-interface/history/cursor',
     '/x/v3/fav/folder/created/list-all', '/x/v3/fav/resource/list',
     '/x/v2/reply/main', '/x/v1/dm/list.so', '/x/player/videoshot',
+    '/x/v2/reply/reply', '/x/player/wbi/playurl',
 })
 LOGIN_PATHS = frozenset({'/x/passport-login/web/qrcode/generate', '/x/passport-login/web/qrcode/poll',
                          '/x/passport-login/web/crossDomain'})
 COOKIE_NAMES = frozenset({'SESSDATA', 'bili_jct', 'DedeUserID', 'DedeUserID__ckMd5', 'buvid3', 'buvid4', 'sid'})
-RISK_CODES = frozenset({-352, -412, -509, -799, -7992})
+RISK_CODES = frozenset({-352, -403, -412, -509, -799, -7992})
 LOGIN_CODES = frozenset({-101, -102, -111})
 MIXIN = (46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,
          37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52)
@@ -42,7 +43,8 @@ class PrivacyFilter(logging.Filter):
     def filter(self, record):
         text = record.getMessage().casefold()
         return not any(word in text for word in ('passport.bilibili.com', 'qrcode_key', 'crossdomain',
-                                                 'sessdata', 'bili_jct', 'set-cookie', 'dedeuserid'))
+                                                 'sessdata', 'bili_jct', 'set-cookie', 'dedeuserid',
+                                                 '.bilivideo.', 'auth_key=', 'upsig=', 'deadline='))
 
 
 def signed(params, images, now=None):
@@ -191,7 +193,13 @@ class BilibiliClient:
             return url.hostname in ('aisubtitle.hdslb.com', 'i0.hdslb.com', 'i1.hdslb.com') and (
                 url.path.endswith('.json') or url.path.startswith('/bfs/ai_subtitle/'))
         if kind == 'frame':
-            return url.hostname in ('i0.hdslb.com', 'i1.hdslb.com', 'i2.hdslb.com') and url.path.startswith('/bfs/videoshot/')
+            return ((url.hostname in ('i0.hdslb.com','i1.hdslb.com','i2.hdslb.com') and url.path.startswith('/bfs/videoshot/')) or
+                    (url.hostname=='bimp.hdslb.com' and url.path.startswith('/videoshotpvhdboss/') and url.path.endswith(('.jpg','.png'))))
+        if kind == 'frame_index':
+            return url.hostname=='boss.hdslb.com' and url.path.startswith('/videoshotpvhdboss/') and url.path.endswith('.bin')
+        if kind == 'media':
+            return bool(url.hostname and (url.hostname.endswith('.bilivideo.com') or url.hostname.endswith('.bilivideo.cn'))
+                        and url.path.startswith('/upgcxcode/'))
         return False
 
     async def get(self, raw, *, params=None, kind='api', budget=None, cap=1024*1024, json_body=True, cookie_only=False):
@@ -235,6 +243,10 @@ class BilibiliClient:
                         if not crossdomain:
                             raise BiliError('url_denied', '仅允许登录确认接收会话')
                         return {}, response.cookies
+                    if kind=='media':
+                        try:declared=int(response.headers.get('content-length','0'))
+                        except ValueError:declared=0
+                        if declared>cap:raise BiliError('response_limit','媒体体积超过本次轻量读取上限，未下载整片')
                     raw_body = bytearray()
                     async for chunk in response.aiter_bytes(chunk_size=65536):
                         observed+=len(chunk)

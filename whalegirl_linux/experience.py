@@ -380,47 +380,34 @@ class ExperienceService:
         return result
 
     def fresh_reading(self, first):
-        """One genuine public observation can provide a new, optional social opening."""
-        s = self.settings
-        if not self.active() or not self.permitted(first) or not s.memory_enabled or not s.growth_enabled:
-            return None
-        rows = self.store.db.execute('''SELECT m.*,i.topic,i.journal_id,s.kind AS reading_kind,s.url,s.title
-            FROM growth_insights i JOIN memories m ON m.id=i.memory_id
-            JOIN growth_sources s ON s.id=substr(m.source_key,7) AND s.account=m.account AND s.role_id=m.role_id
-            WHERE m.account=? AND m.role_id=?
-            AND m.source_class='world_learning' AND m.status='active' AND m.archived=0 AND m.tier!='cold'
-            AND m.created>? AND NOT EXISTS(SELECT 1 FROM autonomy_events e WHERE e.account=m.account
-                AND e.role_id=m.role_id AND e.chat=? AND e.kind='reading_considered' AND e.source_key='reading:'||m.id)
-            ORDER BY m.created DESC,m.id DESC LIMIT 20''',
-            (s.account_id, self.hub.role(), time.time()-86400, first['chat'])).fetchall()
-        for raw in rows:
-            row = dict(raw)
-            from .growth import tieba_url
-            if row['reading_kind'] == 'tieba' or tieba_url(row['url']):
-                if not (s.growth_tieba_enabled and s.tieba_enabled):
-                    continue
-            elif not s.growth_web_enabled:
-                continue
-            return row
+        """Only administrator-authorized facts may become a fresh social opening."""
+        if not self.active() or not self.permitted(first) or not self.settings.memory_enabled:return None
+        growth=getattr(self.hub,'growth',None)
+        if not growth:return None
+        for row in growth.memories(chat=True):
+            if row['category']=='expression' or row['created']<time.time()-86400:continue
+            seen=self.store.db.execute("SELECT 1 FROM autonomy_events WHERE account=? AND role_id=? AND chat=? AND kind='reading_considered' AND source_key=?",
+                (first['account'],self.hub.role(),first['chat'],'reading:'+str(row['id']))).fetchone()
+            if not seen:return row
         return None
 
     def reading_prompt(self, first):
-        row = self.fresh_reading(first)
-        if not row:
-            return ''
-        # Bind consumption to the exact item offered, not a later completed read.
-        first['_reading_offered'] = row['id']
-        return '\n【实际读过的新见闻】' + json.dumps({'id':'memory:'+str(row['id']),
-            'topic':row['topic'], 'understanding':row['content'][:160], 'read_at':row['created'],
-            'title':row['title'], 'url':row['url']},
-            ensure_ascii=False) + '。这是公开阅读所得，可以自然聊到或沉默；需要原文与链接时调用记忆get工具，不当作亲身经历。'
+        row=self.fresh_reading(first)
+        if not row:return ''
+        first['_reading_offered']=row['id']
+        return '\n【管理员允许用于聊天的公开认识】'+json.dumps({'id':'memory:'+str(row['id']),
+            'understanding':row['content'][:160],'recorded_at':row['created']},ensure_ascii=False)+\
+            '。可以顺当前话题自然使用，也可以不提；不把外部人物或事件当成与群友共同发生的经历。'
 
     def consume_reading(self, first):
         identity = first.get('_reading_offered')
         if not self.active() or not self.permitted(first) or not isinstance(identity, int):
             return
+        growth=getattr(self.hub,'growth',None)
+        offered=self.hub.book.get(first['account'],identity,[first['chat']])
+        if not growth or not offered or not growth.chat_allowed(offered):return
         row = self.store.db.execute('''SELECT 1 FROM memories WHERE id=? AND account=? AND role_id=?
-            AND source_class='world_learning' AND status='active' AND archived=0''',
+            AND source_class='internet_learning' AND status='active' AND archived=0''',
             (identity, first['account'], self.hub.role())).fetchone()
         if row:
             with self.store.lock, self.store.db:

@@ -17,7 +17,7 @@
     ['tieba_share_enabled','允许主动分享链接','checkbox'],
     ['tieba_context_share_enabled','允许根据聊天话题自主选段分享','checkbox'],
     ['tieba_discovery_share_enabled','允许逛贴吧后主动分享新发现','checkbox'],
-    ['tieba_learn_enabled','学习与调用贴吧梗','checkbox'],
+    ['tieba_learn_enabled','启用已有梗库调用（新学习另受成长面板的贴吧学习开关控制）','checkbox'],
     ['tieba_meme_eagerness','接梗积极性 / 0—100','number',0,100],
     ['tieba_recall_eagerness','查原文积极性 / 0—100','number',0,100],
     ['tieba_share_eagerness','跟话题分享积极性 / 0—100','number',0,100],

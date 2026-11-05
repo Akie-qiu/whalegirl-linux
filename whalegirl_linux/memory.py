@@ -52,6 +52,9 @@ class MemoryBook:
 
     def get(self, account, memory_id, allowed):
         row = self.store.db.execute('SELECT * FROM memories WHERE id=? AND account=?',(memory_id,account)).fetchone()
+        if row and row['source_class']=='internet_learning':
+            growth=getattr(self.hub,'growth',None)
+            return dict(row) if '@internet-learning' in allowed or (allowed and growth and growth.chat_allowed(dict(row))) else None
         if row and row['source_class']=='bilibili_learning' and '@bilibili-learning' not in allowed:return None
         world=bool(row and row['source_class']=='world_learning' and row['role_id']==self.hub.role())
         return dict(row) if row and (row['chat'] in allowed or world) else None
@@ -199,6 +202,8 @@ class MemoryBook:
             raise ValueError('不支持的记忆操作')
         with self.store.lock, self.store.db:
             old = self.get(account,data.get('id'),allowed) if op!='create' else None
+            if old and actor=='model' and old['source_class']=='internet_learning':
+                raise ValueError('互联网成长认识的修改和使用权限由管理员维护')
             if op!='create' and not old:
                 raise ValueError('记忆不存在或会话未授权')
             if old and data.get('version')!=old['version']:
@@ -362,13 +367,14 @@ class MemoryBook:
                     result=self.hub.recall(account,allowed,subject,str(item.get('query',''))[:200],
                         chat=chat,subjects=subjects,shared=shared,limit=8,include_cold=True)
                     growth=getattr(self.hub,'growth',None)
-                    if growth:result+=growth.search_memories(str(item.get('query',''))[:200],limit=3,include_cold=True)
+                    if growth:result += [growth.detail_memory(row) for row in growth.search_memories(
+                        str(item.get('query',''))[:200],limit=3,include_cold=True)]
                 elif op=='get':
                     result=self.get(account,item.get('id'),allowed)
                     if not self.active(result) or (chat is not None and not self.hub.visible(result,chat,subjects,shared)):result=None
                     if result:result=self.hub.layers.expand(result,allowed,chat,subjects,shared)
                     growth=getattr(self.hub,'growth',None)
-                    if result and growth and result.get('source_class')=='world_learning':result=growth.detail_memory(result)
+                    if result and growth and result.get('source_class') in ('world_learning','internet_learning'):result=growth.detail_memory(result)
                 else:
                     old=self.get(account,item.get('id'),allowed) if op!='create' else None
                     if old and chat is not None and not self.hub.visible(old,chat,subjects,shared):

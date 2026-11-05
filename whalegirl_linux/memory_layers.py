@@ -7,6 +7,7 @@ import uuid
 
 WORLD='@world-learning'
 BILIBILI='@bilibili-learning'
+INTERNET='@internet-learning'
 
 
 class MemoryLayers:

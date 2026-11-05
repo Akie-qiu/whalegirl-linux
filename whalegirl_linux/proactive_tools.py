@@ -83,9 +83,16 @@ async def resolve_tools(runtime, engine, messages, system, decision, first, huma
             if not decision.get('actions') or any(not v['ok'] for v in results):
                 if not await followup('proactive_stickers', '表情库工具结果（收藏成功排队不代表已完成）：'+json.dumps(results, ensure_ascii=False)):return None
                 continue
+        if isinstance(decision.get('bilibili_request'),dict) and 'bilibili' not in used:
+            used.add('bilibili');updated_history=[]
+            decision=await r.bilibili.tools.resolve(engine,history,system,decision,first,generation,diagnostics,s.max_tokens+240,
+                allowed=allowed,history_out=updated_history)
+            if decision is None:return None
+            if updated_history:history=updated_history
+            continue
         break
     # Follow-ups cannot enqueue a second instance of a completed read/write.
-    decision.update(search_query='', fetch_url='', memory_ops=[], sticker_ops=[])
+    decision.update(search_query='', fetch_url='', memory_ops=[], sticker_ops=[],bilibili_request=None)
     request = decision.get('tieba_request')
     if isinstance(request,dict) and request.get('tool') in ('search_tieba','read_tieba'):
         decision['tieba_request'] = None

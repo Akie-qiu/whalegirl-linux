@@ -1,5 +1,12 @@
 # 上游来源
 
+## dsh-see-now / dsh-video-storyboard
+
+- [SAOS-3624/dsh-see-now](https://github.com/SAOS-3624/dsh-see-now)，提交93342e6122b278139281d71346314048170a034b。
+- [SAOS-3624/dsh-video-storyboard](https://github.com/SAOS-3624/dsh-video-storyboard)，提交11d8b8f057a56b3e27b8a740a6f8d29e3848de87。
+- video_scene.py的低分辨率HSV差按See Now方法改写；镜头变化确认、运动累计、时间编号及分镜组织参考两项目，适配为有上限的Python/Pillow离线抽样。video_media.py仅处理合法取得且体积受限的官方媒体。
+- Apache-2.0原文及两份原始NOTICE保留于whalegirl_linux/vendor/scene-vision/；来源与改动见UPSTREAM.json。未引入DSH、完整实时扫描、ASR、OCR或外部凭据提取器。
+
 ## DeepSeekGirl
 
 - 项目：`https://github.com/linxisama/deepseekgirl`

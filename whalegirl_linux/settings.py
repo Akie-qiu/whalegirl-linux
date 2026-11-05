@@ -11,7 +11,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 
 class StickerChatPermission(BaseModel):
@@ -69,6 +69,17 @@ class ModelProfile(BaseModel):
 
 class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode='before')
+    @classmethod
+    def retired_growth_settings(cls,value):
+        # Retired caps/sources remain loadable but do not control execution.
+        if isinstance(value,dict):
+            value=dict(value)
+            value.pop('growth_daily_tokens',None)
+            value.pop('growth_web_enabled',None)
+            value.pop('bilibili_reads_per_day',None)
+        return value
     enabled: bool = False
     account_id: str = Field(default="", max_length=200)
     allowed_chat_ids: list[str] = Field(default_factory=list, max_length=100)
@@ -130,24 +141,32 @@ class Settings(BaseModel):
     memory_token_budget: int = Field(default=1400, ge=400, le=6000)
     memory_item_limit: int = Field(default=8, ge=2, le=30)
     growth_enabled: bool = True
-    growth_web_enabled: bool = True
     growth_tieba_enabled: bool = False
     growth_auto_apply: bool = True
-    growth_daily_tokens: int = Field(default=20000, ge=0, le=500000)
+    growth_bilibili_expression_shared: bool = True
+    growth_tieba_expression_shared: bool = True
+    growth_internet_model_profile: Literal['current', 'flash', 'pro', 'responses', 'custom'] = 'flash'
     growth_reads_per_day: int = Field(default=3, ge=0, le=20)
     growth_interval_minutes: int = Field(default=180, ge=30, le=1440)
     growth_exploration: int = Field(default=25, ge=0, le=100)
     growth_interests: list[str] = Field(default_factory=list, max_length=30)
     bilibili_enabled: bool = False
     bilibili_interval_minutes: int = Field(default=120, ge=30, le=1440)
-    bilibili_reads_per_day: int = Field(default=4, ge=0, le=20)
     bilibili_requests_per_day: int = Field(default=200, ge=20, le=1000)
     bilibili_visual_enabled: bool = True
     bilibili_comments_enabled: bool = True
     bilibili_danmaku_enabled: bool = True
+    bilibili_comments_limit: int = Field(default=60,ge=20,le=80)
+    bilibili_comment_pages: int = Field(default=4,ge=1,le=5)
+    bilibili_reply_threads: int = Field(default=3,ge=0,le=5)
+    bilibili_danmaku_limit: int = Field(default=120,ge=24,le=200)
+    bilibili_keyframes_limit: int = Field(default=16,ge=6,le=24)
+    bilibili_segment_seconds: int = Field(default=300,ge=60,le=600)
+    bilibili_media_enabled: bool = True
+    bilibili_media_max_mb: int = Field(default=16,ge=4,le=32)
     bilibili_interest_seeds: list[str] = Field(default_factory=list, max_length=20)
-    bilibili_feeds: list[Literal['recommend', 'search', 'following', 'favorites', 'history']] = Field(
-        default_factory=lambda: ['recommend', 'search', 'following', 'favorites', 'history'], max_length=5)
+    bilibili_feeds: list[Literal['recommend', 'popular', 'search', 'following', 'favorites', 'history']] = Field(
+        default_factory=lambda: ['recommend', 'popular', 'search', 'following', 'favorites', 'history'], max_length=6)
     bilibili_cache_mb: int = Field(default=64, ge=8, le=256)
     bilibili_cache_days: int = Field(default=7, ge=1, le=30)
     memory_cold_after_days: int = Field(default=30, ge=3, le=365)
@@ -489,6 +508,12 @@ class Config:
             key: {**profile.model_dump(), 'api_key_configured': bool(keys.get(key))}
             for key, profile in self._model_profiles.items()
         }
+
+    def model_profile(self, profile_id):
+        """A copy of a saved card, without activating it or reading its secret."""
+        if profile_id not in self._model_profiles:
+            raise ValueError('模型卡片不存在')
+        return self._model_profiles[profile_id].model_copy()
 
     def authorize_admin(self, supplied):
         if not supplied or len(supplied)>1024:

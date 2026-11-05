@@ -16,7 +16,7 @@ from PIL import Image
 from whalegirl_linux.bilibili_client import API, PASSPORT, BiliError, BilibiliClient, ReadBudget, signed
 from whalegirl_linux.bilibili_reader import VideoReader, crop_frames, subtitle_fraction, subtitle_segments
 from whalegirl_linux.growth import GrowthStopped
-from whalegirl_linux.memory_layers import WORLD,BILIBILI
+from whalegirl_linux.memory_layers import WORLD,BILIBILI,INTERNET
 from whalegirl_linux.settings import Config, Settings
 from whalegirl_linux.store import Store
 
@@ -215,7 +215,7 @@ class GrowthIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.loop = asyncio.get_running_loop();self.loop.slow_callback_duration=5
         self.config.save(self.config.settings.model_copy(update={'bilibili_enabled': True, 'bilibili_visual_enabled': False,
             'bilibili_danmaku_enabled': False, 'bilibili_comments_enabled': False, 'bilibili_feeds': ['search'],
-            'growth_daily_tokens': 500000}))
+            'growth_internet_model_profile':'current'}))
         self.calls=[];self.requests=[];self.empty=False;self.mismatch=False;self.bvid=BV;self.interest_delta=1.2
         self.bili=self.runtime.bilibili
         await self.bili.client.http.aclose()
@@ -261,9 +261,9 @@ class GrowthIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row['state'],'done',row['error'])
         self.assertEqual(len(self.calls),3)
         self.assertEqual(self.bili.interests()[0]['topic'],'街头音乐')
-        memory=self.runtime.memory_book.get('account',self.bili.interests()[0]['memory_id'],[BILIBILI])
-        self.assertEqual(memory['source_class'],'bilibili_learning')
-        self.assertEqual(memory['chat'],BILIBILI)
+        memory=self.runtime.memory_book.get('account',self.bili.interests()[0]['memory_id'],[INTERNET])
+        self.assertEqual(memory['source_class'],'internet_learning')
+        self.assertEqual(memory['chat'],INTERNET)
         self.assertNotEqual(memory['tier'],'core')
         self.assertEqual(self.config.settings.system_prompt_override,before)
         self.assertTrue(all(request.method=='GET' for request in self.requests))
@@ -282,6 +282,17 @@ class GrowthIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bili.readings()[0]['state'],'unconfirmed')
         self.assertEqual(self.bili.interests(),[])
         self.assertEqual(len(self.calls),2)
+
+    async def test_empty_model_understanding_is_not_shown_as_understood(self):
+        original=self.runtime.growth.reflect_sources
+        async def empty(engine,generation,role,sources,topic,**kwargs):
+            async def answer(*args,**options):return '{}'
+            engine.chat=answer
+            return await original(engine,generation,role,sources,topic,**kwargs)
+        self.runtime.growth.reflect_sources=empty
+        self.runtime.growth.request('bilibili');await self.runtime.growth.run_once()
+        self.assertEqual(self.bili.readings()[0]['state'],'unconfirmed')
+        self.assertEqual(self.bili.interests(),[])
 
     async def test_subtitle_identity_conflict_stops_before_downloading_or_learning(self):
         self.mismatch=True
@@ -340,7 +351,7 @@ class GrowthIntegrationTests(unittest.IsolatedAsyncioTestCase):
         growth.request('bilibili');await growth.run_once()
         self.assertEqual(growth.snapshot()['runs'][0]['state'],'done')
         self.assertLess(self.bili.interests()[0]['strength'],0)
-        previous=self.runtime.memory_book.get('account',old,[BILIBILI])
+        previous=self.runtime.memory_book.get('account',old,[INTERNET])
         self.assertEqual(previous['status'],'superseded')
         self.assertTrue(self.bili.schedule()['curiosity'])
 
@@ -354,15 +365,15 @@ class GrowthIntegrationTests(unittest.IsolatedAsyncioTestCase):
         growth.request('bilibili');await growth.run_once()
         row=self.bili.snapshot()['insights'][0]
         self.assertNotIn(daily['content'],json.dumps(self.calls,ensure_ascii=False))
-        self.assertEqual([item['id'] for item in growth.memories()],[daily['id']])
+        self.assertEqual([item['id'] for item in growth.memories()],[row['id']])
         self.assertEqual(growth.search_memories('街头音乐'),[])
         self.assertIsNone(book.get('account',row['id'],['group@chatroom']))
         results=book.model_ops('account',['group@chatroom'],[{'op':'get','id':row['id']},{'op':'search','query':'街头音乐'}],[],True,chat='group@chatroom')
         self.assertIsNone(results[0]['result']);self.assertEqual(results[1]['result'],[])
         self.assertFalse(self.runtime.memory_hub.visible(row,'group@chatroom',[],True))
         edited=growth.edit(row['id'],{'op':'update','version':row['version'],'content':'只在B站范围保留的新认识'})
-        self.assertEqual(edited['chat'],BILIBILI)
-        self.assertNotIn(row['id'],[item['id'] for item in growth.snapshot()['insights']])
+        self.assertEqual(edited['chat'],INTERNET)
+        self.assertIn(row['id'],[item['id'] for item in growth.snapshot()['insights']])
 
     async def test_legacy_bilibili_memory_migration_is_audited_idempotent_and_does_not_delete(self):
         growth=self.runtime.growth;growth.request('bilibili');await growth.run_once()
@@ -370,26 +381,48 @@ class GrowthIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with self.store.db:self.store.db.execute("UPDATE memories SET chat=?,source_class='world_learning' WHERE id=?",(WORLD,row['id']))
         self.assertEqual(self.bili.isolate_memories(),1)
         self.assertEqual(self.bili.isolate_memories(),0)
-        after=self.runtime.memory_book.get('account',row['id'],[BILIBILI])
+        after=self.runtime.memory_book.get('account',row['id'],[INTERNET])
         self.assertEqual(after['content'],row['content']);self.assertEqual(after['status'],row['status'])
         self.assertEqual(after['version'],row['version']+1)
         self.assertIsNone(self.runtime.memory_book.get('account',row['id'],['group@chatroom']))
-        revision=self.store.db.execute("SELECT id FROM memory_revisions WHERE memory_id=? AND operation='bilibili_isolate'",(row['id'],)).fetchone()
+        revision=self.store.db.execute("SELECT id FROM memory_revisions WHERE memory_id=? AND operation='internet_scope_migration'",(row['id'],)).fetchone()
         self.assertIsNotNone(revision)
         with self.assertRaises(ValueError):self.runtime.memory_book.undo('account',['group@chatroom'],revision[0])
         self.assertEqual(len(self.bili.readings()),1)
 
-    async def test_global_growth_budget_stops_bilibili_before_model_or_network(self):
+    async def test_retired_global_budget_does_not_stop_bilibili(self):
         self.config.save(self.config.settings.model_copy(update={'growth_daily_tokens':0}))
         growth=self.runtime.growth;growth.request('bilibili');await growth.run_once()
-        self.assertEqual(growth.snapshot()['runs'][0]['state'],'skipped')
-        self.assertEqual(self.calls,[])
-        self.assertEqual(self.requests,[])
+        self.assertEqual(growth.snapshot()['runs'][0]['state'],'done')
+        self.assertEqual(len(self.calls),3)
+        self.assertGreater(len(self.requests),0)
+
+    async def test_video_count_and_total_read_cap_do_not_block_bilibili(self):
+        self.config.save(self.config.settings.model_copy(update={'growth_reads_per_day':0}))
+        with self.store.db:
+            for index in range(30):
+                self.store.db.execute('INSERT INTO bilibili_readings(id,account,role,bvid,created,state) VALUES(?,?,?,?,?,?)',
+                    ('past-'+str(index),'account',self.runtime.memory_hub.role(),'BV0000000000',time.time(),'done'))
+        self.bili.schedule()
+        with self.store.db:self.store.db.execute('UPDATE bilibili_schedule SET next_at=0')
+        self.assertTrue(self.bili.due())
+        growth=self.runtime.growth;growth.request('bilibili');await growth.run_once()
+        self.assertEqual(growth.runs()[0]['state'],'done')
+        self.assertEqual(growth.runs()[0]['actual_readings'],1)
+        self.assertTrue(self.bili.snapshot()['video_limit_removed'])
+        self.assertIsNone(self.bili.snapshot()['read_limit'])
+
+    async def test_network_request_protection_remains_without_paying_for_a_model_choice(self):
+        with self.store.db:self.store.db.executemany('INSERT INTO bilibili_requests(created,operation) VALUES(?,?)',
+            [(time.time(),'api')]*self.config.settings.bilibili_requests_per_day)
+        requested=self.runtime.growth.request('bilibili')
+        self.assertEqual(requested['state'],'skipped');self.assertIn('网络请求保护',requested['reason'])
+        self.assertEqual(self.calls,[]);self.assertFalse(self.bili.client.status()['paused'])
 
     async def test_pending_qr_stops_background_and_private_feeds_require_login(self):
         self.bili.client.qr={'state':'waiting_confirm','expires':time.time()+60}
         self.assertFalse(self.bili.available())
-        with self.assertRaises(ValueError):self.runtime.growth.request('bilibili')
+        self.assertEqual(self.runtime.growth.request('bilibili')['state'],'skipped')
         self.bili.client.qr=None
         self.config.save(self.config.settings.model_copy(update={'bilibili_feeds':['history']}))
         with self.assertRaisesRegex(BiliError,'登录'):await self.bili.feed('history','',ReadBudget())
@@ -400,7 +433,7 @@ class GrowthIntegrationTests(unittest.IsolatedAsyncioTestCase):
         source=self.runtime.growth.save_source({'url':'https://www.bilibili.com/video/'+BV+'/',
             'title':'不能通过网页来源绕过暂停','content':BODY,'kind':'web'},self.runtime.memory_hub.role())
         self.assertIsNone(source)
-        self.assertIsNotNone(self.runtime.growth.save_source({'url':'https://example.org/allowed',
+        self.assertIsNone(self.runtime.growth.save_source({'url':'https://example.org/allowed',
             'title':'其他网页保持可读','content':BODY},self.runtime.memory_hub.role()))
         self.assertTrue(self.bili.alert())
         self.assertFalse(self.runtime.paused_reason)

@@ -545,6 +545,9 @@ class MemoryHub:
 
     def visible(self,row,chat,subjects,shared):
         if not row or not self.enabled():return False
+        if row.get('source_class')=='internet_learning':
+            growth=getattr(self,'growth',None)
+            return bool(growth and self.settings and chat in self.settings.allowed_chat_ids and growth.chat_allowed(row))
         if row.get('source_class')=='bilibili_learning' or row.get('chat')=='@bilibili-learning':return False
         if row.get('source_class') == 'experience' and self.settings and not self.settings.experience_growth_enabled:
             return False

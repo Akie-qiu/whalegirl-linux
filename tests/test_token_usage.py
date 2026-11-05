@@ -33,6 +33,28 @@ class NormalizationTests(unittest.TestCase):
 
 
 class LedgerTests(unittest.TestCase):
+    def test_estimates_cost_currency_and_operation_scope_preserve_numeric_history(self):
+        folder=ROOT/'test-runs';folder.mkdir(exist_ok=True)
+        store=Store(Path(tempfile.mkdtemp(prefix='token-growth-',dir=folder))/'state.sqlite3')
+        book=TokenLedger(store)
+        try:
+            self.assertEqual(len(list(store.db.execute('PRAGMA table_info(model_token_usage)'))),15)
+            # The old release must still be able to append numeric usage.
+            store.db.execute('INSERT INTO model_token_usage VALUES('+','.join('?' for _ in range(15))+')',
+                ('legacy-usage','other',time.time(),'p','m','chat','success',1,1,1,2,None,None,None,None))
+            store.db.commit()
+            book.record('account',{'operation':'chat','total_tokens':999,'status':'success'})
+            book.record('account',{'operation':'growth_learn','input_tokens':80,'output_tokens':20,'total_tokens':100,
+                'status':'success',**normalize_usage({'input_tokens':80,'output_tokens':20,'cost':.004,'currency':'USD'})})
+            book.record('account',{'operation':'growth_learn','input_tokens':30,'output_tokens':10,'total_tokens':40,
+                'estimated_fields':['input_tokens','output_tokens','total_tokens'],'status':'success'})
+            result=book.snapshot('account',operation_prefix='growth_')
+            self.assertEqual(result['summary']['total_tokens'],140)
+            self.assertEqual(result['summary']['total_tokens_exact_reports'],1)
+            self.assertEqual(result['estimated_requests'],1);self.assertEqual(result['cost_unreported'],1)
+            self.assertEqual(result['costs'][0]['currency'],'USD');self.assertEqual(result['costs'][0]['value'],.004)
+        finally:store.close()
+
     def test_persistence_scope_unknowns_and_weighted_cache_rate(self):
         folder=ROOT/'test-runs';folder.mkdir(exist_ok=True);path=Path(tempfile.mkdtemp(prefix='token-usage-',dir=folder))/'state.sqlite3'
         store=Store(path);book=TokenLedger(store)

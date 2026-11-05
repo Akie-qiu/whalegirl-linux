@@ -53,7 +53,7 @@ class TiebaTests(unittest.IsolatedAsyncioTestCase):
         self.root = directory()
         self.config = Config(self.root)
         self.config.save(Settings(enabled=True, account_id='account', allowed_chat_ids=['a@chatroom', 'b@chatroom'],
-            tieba_enabled=True, tieba_start_hour=0, tieba_end_hour=0,
+            tieba_enabled=True, growth_tieba_enabled=True, tieba_start_hour=0, tieba_end_hour=0,
             tieba_share_chat_ids=['a@chatroom'], tieba_images_enabled=False), 'test-key')
         self.store = Store(self.root/'state.sqlite3')
         self.gateway = Gateway()
@@ -84,6 +84,12 @@ class TiebaTests(unittest.IsolatedAsyncioTestCase):
         await self.b.scan()
         self.assertEqual(Engine.calls, 1)
         self.assertEqual(len(self.b.snapshot()['shares']), 1)
+
+    async def test_growth_source_switch_stops_new_meme_learning_but_preserves_browsing(self):
+        self.config.settings.growth_tieba_enabled=False
+        await self.b.scan()
+        state=self.b.snapshot()
+        self.assertEqual(len(state['posts']),1);self.assertEqual(state['memes'],[])
 
     async def test_keyword_priority_and_adjusted_score_select_the_share(self):
         self.config.settings.tieba_interests = ['同人文']
@@ -170,6 +176,8 @@ class TiebaTests(unittest.IsolatedAsyncioTestCase):
             prompt = self.b.prompt(query, diagnostics)
             self.assertIn('摸鱼是物种优势', prompt)
             self.assertIn('拿物种特点给摸鱼找借口', prompt)
+            self.assertNotIn('source_url',prompt)
+            self.assertNotIn('related_sources',prompt)
             self.assertEqual(diagnostics['mode'], 'inventory')
             self.assertEqual(diagnostics['recalled'], 1)
         self.assertIn('摸鱼是物种优势', self.b.prompt('找借口是什么意思'))

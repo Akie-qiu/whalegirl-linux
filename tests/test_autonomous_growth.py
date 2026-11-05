@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 import test_chat_habits as fixtures
 from whalegirl_linux.memory import memory_parts
-from whalegirl_linux.memory_layers import WORLD
+from whalegirl_linux.memory_layers import INTERNET
 
 
 BODY='海洋动物的协作行为体现出不同个体之间的沟通。理解一个行为需要结合环境和具体处境。' * 12
@@ -48,16 +48,22 @@ class GrowthTests(unittest.IsolatedAsyncioTestCase):
     def configure(self,**values):self.config.save(self.config.settings.model_copy(update=values))
 
     def fake(self,answer=None,documents=None):
-        self.configure(web_search_enabled=True)
+        self.configure(web_search_enabled=True,growth_tieba_enabled=True,tieba_enabled=True,growth_internet_model_profile='current')
         self.calls=[]
         def default(data,n):
-            if 'sources' not in data:return {'mode':'web','query':'海洋动物的协作行为'}
             return {'encounter':'读到协作行为','facts':'材料说明环境会影响行为','revision':'先理解处境',
-                'insights':[{'category':'persona','text':'遇到人际矛盾时先理解具体处境，不急着替人下结论',
+                'insights':[{'category':'expression','text':'遇到人际矛盾时先理解具体处境，不急着替人下结论',
+                    'scene':'朋友轻松吐槽人际误会时','emotion':'好奇又体贴','intent':'先接话再了解',
+                    'examples':['先让我听听嘛，怎么闹成这样的'],
                     'source_id':data['sources'][0]['id'],'evidence':BODY[:28],
                     'conditions':'讨论他人的行为时','counterexamples':'对方只想分享开心的事时不说教'}]}
         self.runtime.engine_factory=lambda **kwargs:Engine(answer or default,self.calls)
-        self.runtime.growth.search=Search(documents)
+        async def read(engine,generation,role):
+            source=self.runtime.growth.save_source({'kind':'tieba','url':'https://tieba.baidu.com/p/12345678',
+                'title':'协作与处境','content':BODY},role)
+            self.runtime.growth.note_read(source,{'complete_thread':False})
+            return await self.runtime.growth.reflect_sources(engine,generation,role,[source],'协作与处境')
+        self.runtime.growth.learn_tieba=read
         return self.runtime.growth
 
     async def test_shallow_summary_and_deep_get_keep_the_originals(self):
@@ -90,45 +96,41 @@ class GrowthTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.runtime.memory_hub.layers.save('account',[{'ids':[a['id'],b['id']],'summary':'都喜欢猫'}],
             [a,b],allowed=self.config.settings.allowed_chat_ids))
 
-    async def test_world_learning_uses_canonical_memory_and_reaches_the_next_reply(self):
-        g=self.fake();self.assertFalse(self.config.settings.growth_tieba_enabled)
-        self.runtime.tieba.tools.search=Mock(side_effect=AssertionError('Tieba must be off'))
-        g.request('world');self.assertTrue(await g.run_once())
+    async def test_internet_expression_uses_canonical_memory_and_reaches_the_next_reply(self):
+        g=self.fake();g.request('tieba');self.assertTrue(await g.run_once())
         snapshot=g.snapshot();self.assertEqual(snapshot['runs'][0]['state'],'done')
-        self.assertEqual(len(self.calls),2);self.assertEqual(snapshot['usage']['tokens'],460)
-        row=snapshot['insights'][0];self.assertEqual(row['chat'],WORLD);self.assertEqual(row['source_class'],'world_learning')
+        self.assertEqual(len(self.calls),1);self.assertEqual(snapshot['usage']['tokens'],180)
+        row=snapshot['insights'][0];self.assertEqual(row['chat'],INTERNET);self.assertEqual(row['source_class'],'internet_learning')
         prompt=g.prompt(self.event(),[self.event(content='你觉得大家为什么会吵架')])
         self.assertIn(row['content'],prompt)
         details=self.runtime.memory_book.model_ops('account',self.config.settings.allowed_chat_ids,
             [{'op':'get','id':row['id']}],[],True,chat='group@chatroom',subjects=['person'])
-        self.assertIn('public_evidence',details[0]['result'])
+        self.assertNotIn('public_evidence',details[0]['result']);self.assertIn('examples',details[0]['result'])
         self.assertEqual(self.gateway.sent,[])
 
     async def test_tieba_search_results_are_filtered_when_source_is_disabled(self):
-        g=self.fake(documents=[{'url':'https://tieba.baidu.com/p/123','content':BODY},
-                              {'url':'https://example.org/ocean','content':BODY}])
-        g.request('world');await g.run_once()
-        self.assertTrue(all(not s['url'].startswith('https://tieba.baidu.com') for s in g.journal(g.snapshot()['journals'][0]['id'])['sources']))
+        g=self.fake();self.configure(growth_tieba_enabled=False)
+        request=g.request('tieba');self.assertEqual(request['state'],'skipped')
+        self.assertEqual(self.calls,[])
+        self.assertIsNone(g.save_source({'url':'https://tieba.baidu.com/p/123','content':BODY},self.runtime.memory_hub.role()))
 
-    async def test_budget_prevents_any_paid_request(self):
+    async def test_retired_budget_cannot_prevent_a_paid_request(self):
         g=self.fake();self.configure(growth_daily_tokens=10)
         g.request('world');await g.run_once()
-        self.assertEqual(self.calls,[]);self.assertEqual(g.search.calls,0)
-        self.assertEqual(g.snapshot()['runs'][0]['state'],'skipped')
+        self.assertEqual(len(self.calls),1);self.assertFalse(hasattr(g,'search'))
+        self.assertEqual(g.snapshot()['runs'][0]['state'],'done')
 
-    async def test_cached_unfinished_read_resumes_without_search_or_a_second_planner(self):
-        g=self.fake();self.configure(growth_daily_tokens=4000)
-        g.save_source({'url':'https://example.org/cached','title':'协作与处境','content':BODY},self.runtime.memory_hub.role())
-        g.request('world');await g.run_once()
-        self.assertEqual(g.search.calls,0);self.assertEqual(len(self.calls),1)
+    async def test_cached_tieba_material_does_not_need_general_web_search(self):
+        g=self.fake();g.request('tieba');await g.run_once()
+        self.assertFalse(hasattr(g,'search'));self.assertEqual(len(self.calls),1)
         self.assertEqual(g.snapshot()['runs'][0]['state'],'done')
 
     async def test_switch_off_during_model_call_does_not_apply_or_continue_search(self):
         def answer(data,n):
             self.configure(growth_enabled=False)
-            return {'mode':'web','query':'海洋动物'}
+            return {'encounter':'设置已经变更','insights':[]}
         g=self.fake(answer);g.request('world');await g.run_once()
-        self.assertEqual(g.search.calls,0);self.assertEqual(g.memories(include_inactive=True),[])
+        self.assertFalse(hasattr(g,'search'));self.assertEqual(g.memories(include_inactive=True),[])
         self.assertEqual(g.snapshot()['runs'][0]['state'],'skipped')
 
     async def test_auto_apply_off_keeps_new_insights_pending_and_role_isolates_them(self):
@@ -143,12 +145,11 @@ class GrowthTests(unittest.IsolatedAsyncioTestCase):
     async def test_repeated_read_does_not_add_a_second_journal_or_insight(self):
         g=self.fake();g.request('world');await g.run_once();g.request('world');await g.run_once()
         self.assertEqual(len(g.snapshot()['journals']),1)
-        self.assertEqual(len(g.memories()),1);self.assertEqual(len(self.calls),3)
+        self.assertEqual(len(g.memories()),1);self.assertEqual(len(self.calls),1)
 
     async def test_unfounded_insight_is_not_accepted(self):
         def answer(data,n):
-            if 'sources' not in data:return {'mode':'web','query':'海洋动物'}
-            return {'insights':[{'text':'我以后要保持一个有趣的新习惯','source_id':data['sources'][0]['id'],
+            return {'encounter':'读过合成材料','insights':[{'text':'我以后要保持一个有趣的新习惯','source_id':data['sources'][0]['id'],
                                  'evidence':'正文根本没有这句依据'}]}
         g=self.fake(answer);g.request('world');await g.run_once()
         self.assertEqual(g.memories(include_inactive=True),[])

@@ -812,6 +812,7 @@ document.addEventListener('DOMContentLoaded', () => {
     'learning-panel':['learning-save'],
     'memory-panel':['hub-save-settings'],
     'bilibili-console':['bili-save'],
+    'growth-console':['growth-save'],
     'affection-panel':['save-affection-rules']
   };
   let dirtyPanelId='';
@@ -827,7 +828,8 @@ document.addEventListener('DOMContentLoaded', () => {
   contentGrid.addEventListener('change',markDirty);
   function markDirty(e){
     const el=e.target;if(!el||ignoreDirtyIds.has(el.id)||el.type==='search')return;
-    const panel=el.closest('#bilibili-console')||el.closest('.panel');if(!panel||!panelSaveMap[panel.id])return;
+    if(el.closest('dialog'))return;
+    const panel=el.closest('#bilibili-console')||el.closest('#growth-console')||el.closest('.panel');if(!panel||!panelSaveMap[panel.id])return;
     dirtyPanelId=panel.id;
     const h2=panel.querySelector('h2')?.textContent?.trim()||'当前面板';
     text('sticky-save-text',`「${h2}」有未保存的设置修改`);
