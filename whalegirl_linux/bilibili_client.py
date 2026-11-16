@@ -17,17 +17,21 @@ from .settings import private_write
 API = 'https://api.bilibili.com'
 PASSPORT = 'https://passport.bilibili.com'
 PATHS = frozenset({
-    '/x/web-interface/nav', '/x/web-interface/view', '/x/player/wbi/v2', '/x/web-interface/popular',
-    '/x/web-interface/wbi/index/top/feed/rcmd', '/x/web-interface/wbi/search/type',
-    '/x/polymer/web-dynamic/v1/feed/all', '/x/web-interface/history/cursor',
+    '/x/web-interface/nav', '/x/frontend/finger/spi', '/x/web-interface/view', '/x/player/wbi/v2', '/x/web-interface/popular',
+    '/x/web-interface/ranking/v2', '/x/web-interface/popular/series/list', '/x/web-interface/popular/series/one',
+    '/x/web-interface/wbi/index/top/feed/rcmd', '/x/web-interface/wbi/search/type', '/x/web-interface/wbi/search/square',
+    '/x/polymer/web-dynamic/v1/feed/all', '/x/polymer/web-dynamic/v1/feed/space', '/x/web-interface/history/cursor',
     '/x/v3/fav/folder/created/list-all', '/x/v3/fav/resource/list',
     '/x/v2/reply/main', '/x/v1/dm/list.so', '/x/player/videoshot',
-    '/x/v2/reply/reply', '/x/player/wbi/playurl',
+    '/x/v2/reply/reply', '/x/player/wbi/playurl', '/x/msgfeed/at', '/x/msgfeed/reply',
+    '/x/relation/tag', '/x/relation/followings', '/x/web-interface/card',
 })
+WRITE_PATHS = frozenset({'/x/v2/reply/add'})
 LOGIN_PATHS = frozenset({'/x/passport-login/web/qrcode/generate', '/x/passport-login/web/qrcode/poll',
                          '/x/passport-login/web/crossDomain'})
 COOKIE_NAMES = frozenset({'SESSDATA', 'bili_jct', 'DedeUserID', 'DedeUserID__ckMd5', 'buvid3', 'buvid4', 'sid'})
 RISK_CODES = frozenset({-352, -403, -412, -509, -799, -7992})
+REPLY_RISK_CODES = frozenset({-105, -352, -403, -412, -509, -799, -7992, 12015, 12051})
 LOGIN_CODES = frozenset({-101, -102, -111})
 MIXIN = (46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,
          37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52)
@@ -43,7 +47,7 @@ class PrivacyFilter(logging.Filter):
     def filter(self, record):
         text = record.getMessage().casefold()
         return not any(word in text for word in ('passport.bilibili.com', 'qrcode_key', 'crossdomain',
-                                                 'sessdata', 'bili_jct', 'set-cookie', 'dedeuserid',
+                                                 'sessdata', 'bili_jct', 'csrf=', 'csrf_token=', 'set-cookie', 'dedeuserid',
                                                  '.bilivideo.', 'auth_key=', 'upsig=', 'deadline='))
 
 
@@ -92,6 +96,8 @@ class BilibiliClient:
         self.auth_generation = 0
         self.wbi = None
         self.wbi_at = 0
+        self._anon_buvid = {}
+        self._buvid_at = 0.0
         self.last_request = 0
         for name in ('httpx', 'httpcore.http11', 'httpcore.http2'):
             logger = logging.getLogger(name)
@@ -150,6 +156,12 @@ class BilibiliClient:
         # Admin-only action; model tools never expose this method.
         self.set_meta(paused='0', pause_code='')
 
+    def pause_reply(self, code):
+        self.set_meta(reply_paused='1', reply_pause_code=code, reply_pause_time=time.time())
+
+    def resume_reply(self):
+        self.set_meta(reply_paused='0', reply_pause_code='')
+
     def logout(self):
         if self.session_path.is_symlink():
             raise BiliError('credential_error', '登录状态路径异常，未执行退出')
@@ -157,6 +169,8 @@ class BilibiliClient:
         private_write(self.session_path, self.config.fernet.encrypt(b'{}').decode())
         self.http.cookies.clear()
         self.qr = self.wbi = None
+        self._anon_buvid = {}
+        self._buvid_at = 0.0
         self.set_meta(session_state='anonymous', account_name='', last_check=0)
         # Logout cannot silently clear a platform risk pause.
         return self.status()
@@ -175,8 +189,9 @@ class BilibiliClient:
             'account_name': self.meta('account_name') if exists else '',
             'last_check': float(self.meta('last_check', '0')),
             'paused': self.meta('paused') == '1', 'pause_code': self.meta('pause_code'),
+            'reply_paused': self.meta('reply_paused') == '1', 'reply_pause_code': self.meta('reply_pause_code'),
             'qr_state': (self.qr or {}).get('state', ''),
-            'qr_expires': (self.qr or {}).get('expires', 0), 'read_only': True,
+            'qr_expires': (self.qr or {}).get('expires', 0), 'read_only': not self.config.settings.bilibili_comment_reply_enabled,
             'requests_today': self.db.execute('SELECT count(*) FROM bilibili_requests WHERE created>?',
                 (time.time()-24*3600,)).fetchone()[0], 'request_limit': self.config.settings.bilibili_requests_per_day}
 
@@ -187,11 +202,19 @@ class BilibiliClient:
             return False
         if kind == 'api':
             return url.hostname == 'api.bilibili.com' and url.path in PATHS
+        if kind == 'write_api':
+            return url.hostname == 'api.bilibili.com' and url.path in WRITE_PATHS
         if kind == 'login':
             return url.hostname == 'passport.bilibili.com' and url.path in LOGIN_PATHS
+        if kind == 'shortlink':
+            return url.hostname == 'b23.tv' and bool(re.fullmatch(r'/[A-Za-z0-9_-]{2,80}/?',url.path))
         if kind == 'subtitle':
             return url.hostname in ('aisubtitle.hdslb.com', 'i0.hdslb.com', 'i1.hdslb.com') and (
                 url.path.endswith('.json') or url.path.startswith('/bfs/ai_subtitle/'))
+        if kind == 'watch_image':
+            return (url.scheme == 'https'
+                    and url.hostname in ('i0.hdslb.com', 'i1.hdslb.com', 'i2.hdslb.com')
+                    and url.path.startswith(('/bfs/new_dyn/', '/bfs/album/', '/bfs/archive/', '/bfs/opus/')))
         if kind == 'frame':
             return ((url.hostname in ('i0.hdslb.com','i1.hdslb.com','i2.hdslb.com') and url.path.startswith('/bfs/videoshot/')) or
                     (url.hostname=='bimp.hdslb.com' and url.path.startswith('/videoshotpvhdboss/') and url.path.endswith(('.jpg','.png'))))
@@ -225,7 +248,8 @@ class BilibiliClient:
                 row = self.db.execute('INSERT INTO bilibili_requests(created,operation) VALUES(?,?)',
                                      (time.time(), kind))
                 request_id = row.lastrowid
-            headers = {'Cookie': '; '.join(key+'='+value for key, value in cookies.items())}
+            send_cookies = {**self._anon_buvid, **cookies} if (kind == 'api' and self._anon_buvid) else cookies
+            headers = {'Cookie': '; '.join(key+'='+value for key, value in send_cookies.items())}
             remaining = max(.1, budget.deadline-time.monotonic()) if budget else 12
             observed=0
             try:
@@ -237,6 +261,12 @@ class BilibiliClient:
                             self.pause('http_'+str(response.status_code))
                         raise BiliError('access_stopped', 'B 站拒绝本次读取，相关操作已停止，请查看账号状态')
                     crossdomain = kind == 'login' and urlsplit(raw).path == '/x/passport-login/web/crossDomain'
+                    if kind=='shortlink' and response.status_code in (301,302,303,307,308):
+                        location=response.headers.get('location','')
+                        if not location or len(location)>2000:raise BiliError('shortlink_invalid','短链接没有有效的B站目标')
+                        return {'location':location},response.cookies
+                    if kind=='shortlink' and response.status_code==200:
+                        return {'location':raw},response.cookies
                     if response.status_code >= 300 and not (cookie_only and crossdomain and response.status_code in (301, 302)):
                         raise BiliError('http_error', 'B 站读取暂不可用（HTTP '+str(response.status_code)+'）')
                     if cookie_only:
@@ -295,15 +325,103 @@ class BilibiliClient:
                 self.http.cookies.clear()
                 self.last_request = time.monotonic()
 
-    async def api(self, path, params=None, *, budget=None, wbi=False):
+    async def api(self, path, params=None, *, budget=None, wbi=False, allow_list=False):
         if wbi:
             if not self.wbi or time.time()-self.wbi_at > 6*3600:
                 await self.check_login(budget=budget)
+            if path != '/x/frontend/finger/spi':
+                await self.ensure_buvid(budget=budget)
             params = signed(params or {}, self.wbi or {})
         value, _ = await self.get(API+path, params=params, budget=budget)
-        data=value.get('data') or {}
-        if not isinstance(data,dict):raise BiliError('invalid_response','B站材料结构未确认')
+        data = value.get('data')
+        if allow_list and isinstance(data, list):
+            return data
+        data = data or {}
+        if not isinstance(data, dict):raise BiliError('invalid_response','B站材料结构未确认')
         return data
+
+    async def post_api(self, path, data, *, budget=None):
+        """Bounded authenticated POST for explicitly allowed comment reply APIs."""
+        raw = API + path
+        if not self.permitted(raw, 'write_api'):
+            raise BiliError('url_denied', 'B 站写入地址不在获准范围')
+        if self.meta('reply_paused') == '1':
+            raise BiliError('reply_risk_paused', 'B 站评论发送因风控暂停，请在后台确认后恢复')
+        cookies = self.cookies()
+        if not cookies.get('SESSDATA') or not cookies.get('bili_jct') or not re.fullmatch(r'[1-9][0-9]{0,19}', str(cookies.get('DedeUserID') or '')):
+            raise BiliError('login_incomplete', 'B 站评论发送需要完整扫码登录态与 CSRF 凭据')
+        if self.meta('session_state') in ('expired', 'credential_error'):
+            raise BiliError('login_expired', 'B 站登录已失效，请重新扫码')
+        form = {**dict(data or {}), 'csrf': cookies['bili_jct'], 'csrf_token': cookies['bili_jct']}
+        async with self.lock:
+            if budget:
+                budget.claim()
+            count = self.db.execute('SELECT count(*) FROM bilibili_requests WHERE created>?',
+                                    (time.time()-24*3600,)).fetchone()[0]
+            if count >= self.config.settings.bilibili_requests_per_day:
+                raise BiliError('request_budget', 'B 站滚动24小时请求额度已用完')
+            await asyncio.sleep(max(0, self.last_request+1-time.monotonic()))
+            with self.store.lock, self.db:
+                row = self.db.execute('INSERT INTO bilibili_requests(created,operation) VALUES(?,?)',
+                                     (time.time(), 'write_api'))
+                request_id = row.lastrowid
+            send_cookies = {**self._anon_buvid, **cookies} if self._anon_buvid else cookies
+            headers = {'Cookie': '; '.join(key+'='+value for key, value in send_cookies.items())}
+            observed = 0
+            try:
+                response = await self.http.post(raw, data=form, headers=headers, timeout=12)
+                observed = len(response.content or b'')
+                if response.status_code in (401, 403, 412, 429):
+                    if response.status_code == 401:
+                        self.set_meta(session_state='expired')
+                        raise BiliError('login_expired', 'B 站登录已失效，未发送评论')
+                    self.pause_reply('http_' + str(response.status_code))
+                    raise BiliError('reply_risk_paused', 'B 站评论发送触发访问限制，已单独暂停评论写入')
+                if response.status_code >= 300:
+                    raise BiliError('http_error', 'B 站评论提交失败（HTTP ' + str(response.status_code) + '）')
+                value = json.loads((response.content or b'{}')[:256*1024])
+                if not isinstance(value, dict):
+                    raise BiliError('invalid_response', 'B 站评论返回格式未确认')
+                code = value.get('code', 0)
+                if not isinstance(code, int) or isinstance(code, bool):
+                    raise BiliError('invalid_response', 'B 站评论状态码未确认')
+                if code in LOGIN_CODES:
+                    self.set_meta(session_state='expired')
+                    raise BiliError('login_expired', 'B 站登录已失效，未发送评论')
+                if code in REPLY_RISK_CODES:
+                    self.pause_reply('api_' + str(code))
+                    raise BiliError('reply_risk_paused', 'B 站评论发送触发风控或验证码限制（代码 ' + str(code) + '），已单独暂停写入')
+                if code != 0:
+                    raise BiliError('reply_api_error', 'B 站评论未提交成功（代码 ' + str(code) + '）')
+                result_data = value.get('data') or {}
+                return result_data if isinstance(result_data, dict) else {}
+            except BiliError:
+                raise
+            except (httpx.HTTPError, ValueError, UnicodeError):
+                raise BiliError('reply_network_uncertain', 'B 站评论提交结果待核对，不自动重发') from None
+            finally:
+                with self.store.lock, self.db:
+                    self.db.execute('UPDATE bilibili_requests SET bytes=? WHERE id=?', (observed, request_id))
+                self.http.cookies.clear()
+                self.last_request = time.monotonic()
+
+    async def resolve_video_short(self,raw,budget,*,max_hops=3):
+        """Follow only a few HTTPS b23.tv redirects, without sending cookies."""
+        import posixpath
+        from urllib.parse import urljoin
+        current=raw
+        for _ in range(max_hops+1):
+            value,_=await self.get(current,kind='shortlink',budget=budget,cap=4096)
+            location=value.get('location') if isinstance(value,dict) else ''
+            if not isinstance(location,str):raise BiliError('shortlink_invalid','短链接目标未确认')
+            target=urlsplit(urljoin(current,location))
+            if target.scheme!='https' or target.username or target.password or target.port not in (None,443):
+                raise BiliError('url_denied','短链接跳转不在HTTPS安全范围')
+            if target.hostname in ('b23.tv','www.bilibili.com','m.bilibili.com'):
+                if target.hostname!='b23.tv':return target.geturl()
+                current=target.geturl();continue
+            raise BiliError('url_denied','短链接跳转到了未允许的域名')
+        raise BiliError('shortlink_limit','短链接跳转超过安全次数')
 
     async def check_login(self, *, budget=None):
         value, _ = await self.get(API+'/x/web-interface/nav', budget=budget)
@@ -315,6 +433,30 @@ class BilibiliClient:
         if has_cookies and not data.get('isLogin'):
             raise BiliError('login_expired', 'B 站登录失效，请重新扫码')
         return self.status()
+
+    async def ensure_buvid(self, *, budget=None):
+        """Fetch anonymous buvid3/buvid4 via official /spi endpoint when missing."""
+        cookies = self.cookies()
+        if cookies and cookies.get('buvid3'):
+            return True
+        if self._anon_buvid.get('buvid3') and time.time() - self._buvid_at < 12 * 3600:
+            return True
+        try:
+            data = await self.api('/x/frontend/finger/spi', budget=budget)
+        except BiliError as exc:
+            if exc.code in ('risk_paused', 'task_budget', 'request_budget'):
+                raise
+            return False
+        parsed = {}
+        for api_key, cookie_key in (('b_3', 'buvid3'), ('b_4', 'buvid4')):
+            value = data.get(api_key)
+            if isinstance(value, str) and 0 < len(value) <= 256 and not any(ch in value for ch in ';\r\n'):
+                parsed[cookie_key] = value
+        if not parsed.get('buvid3'):
+            return False
+        self._anon_buvid = parsed
+        self._buvid_at = time.time()
+        return True
 
     async def start_login(self):
         async with self.login_lock:

@@ -47,7 +47,7 @@ class FakeGateway:
     async def messages(self, chat):
         return self.rows
 
-    async def send(self, chat, text):
+    async def send(self, chat, text, **options):
         self.sent.append((chat, text))
         return Receipt(self.confirm, "verified-1", "不确定")
 
@@ -111,11 +111,13 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         await self.runtime.poll_once()
         self.assertIsNone(self.store.queue())
 
-    async def test_self_media_old_and_ambiguous_sender_ignored(self):
+    async def test_self_old_and_ambiguous_sender_ignored_but_explicit_photo_kept(self):
         await self.runtime.poll_once()
         self.gateway.rows = [raw(1, isSelf=True), raw(2, type=3), raw(3, timestamp=time.time()-120), raw(4, isSelf=None)]
         await self.runtime.poll_once()
-        self.assertIsNone(self.store.queue())
+        queued = self.store.queue()
+        self.assertIsNotNone(queued)
+        self.assertEqual(queued['local_id'], 2)
 
     async def test_unicode_casefold_keyword(self):
         s = self.config.settings
@@ -167,15 +169,19 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         await self.runtime.poll_once()
 
         reached_send=asyncio.Event()
-        async def broken_send(*args):
+        async def broken_send(*args, **options):
             reached_send.set()
             raise RuntimeError("模拟发送期间连接断开")
 
         self.gateway.send = broken_send
         worker = asyncio.create_task(self.runtime._worker_loop())
-        await asyncio.wait_for(reached_send.wait(),2)
-        worker.cancel()
-        await asyncio.gather(worker, return_exceptions=True)
+        sender = asyncio.create_task(self.runtime.pipeline.loop())
+        try:
+            await asyncio.wait_for(reached_send.wait(), 2)
+        finally:
+            worker.cancel()
+            sender.cancel()
+            await asyncio.gather(worker, sender, return_exceptions=True)
         self.assertEqual(self.store.stats().get("uncertain"), 1)
         self.assertFalse(self.runtime.paused_reason)
 
@@ -318,7 +324,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         await gateway._observe_login()
         self.assertEqual(gateway.login["state"], "attention")
         self.assertEqual(gateway.login["message"], "请核对客户端提示")
-        self.assertEqual(requests, [("POST", "/api/status/login"), ("GET", "/api/debug/a11y")])
+        self.assertEqual(requests, [("GET", "/api/debug/a11y"), ("POST", "/api/status/login"), ("GET", "/api/debug/a11y")])
         await gateway.close()
 
     async def test_timeout_send_is_confirmed_by_readback_without_second_post(self):
@@ -350,7 +356,13 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
 
         client = httpx.AsyncClient(base_url="http://127.0.0.1:6175", transport=httpx.MockTransport(handle))
         gateway = AgentGateway("http://127.0.0.1:6175", "test", client=client)
-        with patch("whalegirl_linux.gateway.asyncio.sleep", new=AsyncMock()):
+        from types import SimpleNamespace
+        real_sleep = asyncio.sleep
+        ticks = iter((0, 25, 50, 75, 100))
+        async def yield_to_submission(*args):
+            await real_sleep(0)
+        with patch("whalegirl_linux.gateway.asyncio.sleep", new=yield_to_submission), \
+             patch('whalegirl_linux.gateway.time', SimpleNamespace(monotonic=lambda: next(ticks, 100), time=time.time)):
             result = await gateway.send("g", "回复")
         self.assertFalse(result.confirmed)
         self.assertEqual(posts, 1)

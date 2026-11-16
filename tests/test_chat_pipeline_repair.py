@@ -18,6 +18,20 @@ import test_chat_habits as habits
 
 
 class PhotoContextTests(photos.IncomingImageContextTests):
+    async def test_initiative_can_use_visible_thumbnail_without_navigating(self):
+        photo = self.message(1, kind=3)
+        seen = []
+        class Gateway:
+            async def media(self, *args, **kwargs):
+                return {'quality': 'not_visible'}
+            async def visible_media(self, *args, **kwargs):
+                seen.append(kwargs)
+                return {**photos.photo_media(), 'quality': 'visible_chat_thumbnail'}
+        _, keys, counts = await build_context(self.store, Gateway(), Settings(), photo, [], {}, initiative=True)
+        self.assertEqual(keys, [photo['key']])
+        self.assertEqual(counts['pending_images'], 0)
+        self.assertIs(seen[0]['navigate'], False)
+
     async def test_provisional_inbox_key_attaches_canonical_photo_once(self):
         photo=self.message(1,kind=3)
         provisional={**photo,'key':'account/a@chatroom/local:1'}
@@ -38,7 +52,10 @@ class PhotoContextTests(photos.IncomingImageContextTests):
         photo=self.message(1,kind=3)
         class Gateway:
             async def media(self,*args,**kwargs):return {}
-            async def visible_media(self,*args,**kwargs):raise AssertionError('No proactive scrolling')
+            async def visible_media(self,*args,**kwargs):
+                if kwargs.get('navigate') is not False:
+                    raise AssertionError('No proactive scrolling')
+                return {}
         _,keys,counts=await build_context(self.store,Gateway(),Settings(),photo,[],{},initiative=True)
         self.assertFalse(keys);self.assertEqual(counts['pending_images'],1)
 

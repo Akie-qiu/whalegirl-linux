@@ -55,15 +55,24 @@ def png_rows(path):
     return width, height, rows
 
 
+COMMENT_WIDTHS = (438, 548)
+
+
+def comment_width(width):
+    """A bounded current capture, rather than a list of past window sizes."""
+    return isinstance(width, int) and not isinstance(width, bool) and 240 <= width <= 2048
+
+
 def comment_dividers(width,rows):
-    if width!=548:
-        raise ValueError('Unrecognized pinned comment list width')
+    if not comment_width(width):
+        raise ValueError('Invalid native comment list width')
     # Detail rows draw separators across the content column, including wrapped text.
     dividers = []
     for y, row in enumerate(rows):
-        colors = Counter(tuple(row[x*3:x*3+3]) for x in range(160, width-40))
+        left, right = width//2, width-max(20, round(width*.073))
+        colors = Counter(tuple(row[x*3:x*3+3]) for x in range(left, right))
         color, amount = colors.most_common(1)[0]
-        if 225 <= min(color) <= max(color) <= 240 and amount >= (width-200)*.94:
+        if 220 <= min(color) <= max(color) <= 237 and amount >= (right-left)*.94:
             if not dividers or y > dividers[-1]+2:
                 dividers.append(y)
     return dividers
@@ -82,8 +91,8 @@ def visible_comment_points(path,starts_at_top=False):
 def timeline_comment_points(path):
     """Find text baselines in timeline comments, whose rows have no dividers."""
     width, height, rows = png_rows(path)
-    if width != 548:
-        raise ValueError('Unrecognized pinned timeline comment width')
+    if not comment_width(width):
+        raise ValueError('Invalid native timeline comment width')
     ink = [y for y, row in enumerate(rows) if sum(
         max(row[x*3:x*3+3]) < 190 for x in range(10, width-20)) >= 4]
     bands = []

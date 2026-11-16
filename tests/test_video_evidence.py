@@ -58,6 +58,44 @@ class EvidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len({row['text'] for row in rows}),80)
         self.assertTrue(all('返现' not in row['text'] for row in rows))
 
+    async def test_minimum_comment_limit_reserves_slots_across_multiple_reply_threads(self):
+        settings=Settings(bilibili_comments_limit=20,bilibili_comment_pages=2,bilibili_reply_threads=3)
+        calls=[]
+        class Client:
+            async def api(self,path,params,**kwargs):
+                calls.append((path,params))
+                if path.endswith('/reply'):
+                    return {'replies':[{'rpid':1000+int(params['root'])*10+i,
+                        'content':{'message':'不同楼层的自然回复 '+str(i)+' '+str(params['root'])}} for i in range(10)]}
+                return {'replies':[{'rpid':i+1,'content':{'message':'父楼提出不同问题 '+str(i)}} for i in range(30)],
+                    'cursor':{'next':1,'is_end':False}}
+        rows,coverage=await VideoReader(Client()).comments(1,BV,ReadBudget(),settings,[])
+        reply_calls=[params for path,params in calls if path.endswith('/reply')]
+        self.assertEqual(len(rows),20)
+        self.assertEqual(len(reply_calls),3)
+        self.assertEqual([params['ps'] for params in reply_calls],[4,4,4])
+        roots={row['id'] for row in rows if not row['parent_id']}
+        self.assertEqual(len(roots),8)
+        self.assertTrue(all(row['parent_id'] in roots for row in rows if row['parent_id']))
+        self.assertEqual({row['parent_id'] for row in rows if row['parent_id']},
+            {str(params['root']) for params in reply_calls})
+        self.assertEqual(coverage['reply_threads_read'],3)
+
+    async def test_nested_reply_keeps_its_actual_parent_identity(self):
+        settings=Settings(bilibili_comments_limit=20,bilibili_comment_pages=1,bilibili_reply_threads=1)
+        class Client:
+            async def api(self,path,params,**kwargs):
+                if path.endswith('/reply'):
+                    return {'replies':[{'rpid':21,'parent':11,'content':{'message':'第一层回应'}},
+                        {'rpid':22,'parent':21,'content':{'message':'接着第一层回应'}}]}
+                return {'replies':[{'rpid':11,'content':{'message':'父楼提出讨论'}}],
+                    'cursor':{'next':1,'is_end':False}}
+        rows,_=await VideoReader(Client()).comments(1,BV,ReadBudget(),settings,[])
+        by_id={row['id']:row for row in rows}
+        self.assertEqual(by_id['21']['parent_id'],'11')
+        self.assertEqual(by_id['22']['parent_id'],'21')
+        self.assertEqual(by_id['22']['root_id'],'11')
+
     async def test_empty_comments_never_fabricate_target_and_risk_has_no_fallback(self):
         client=type('Client',(),{})();client.api=AsyncMock(return_value={'replies':[],'cursor':{'is_end':True}})
         reader=VideoReader(client);rows,coverage=await reader.comments(1,BV,ReadBudget(),Settings(),[])

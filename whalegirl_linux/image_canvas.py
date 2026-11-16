@@ -4,9 +4,13 @@ from __future__ import annotations
 import re
 
 RATIOS = ('1:1', '4:3', '3:4', '16:9', '9:16', '3:2', '2:3', '4:5', '5:4', '2:1', '1:2')
+MAX_EDGE = 8192
+AUTO_EDGE = 1024
+MAX_GENERATED_PIXELS = MAX_EDGE * MAX_EDGE
 CANVAS_RULES = ('同时返回image_aspect_ratio，按本次画面和分镜自主选择1:1、4:3、3:4、16:9、9:16、'
                 '3:2、2:3、4:5、5:4、2:1或1:2。方格漫画可选方图，横向互动可选横图，纵向分镜可选竖图，'
-                '不要每次固定方图；具体尺寸由服务器按后台分辨率换算，不把尺寸和比例写进朋友圈文案。')
+                '不要每次固定方图；具体尺寸由服务器按后台分辨率换算，最长边不超过8192像素，'
+                '不把尺寸和比例写进朋友圈文案。')
 
 
 def canvas(base, aspect='auto'):
@@ -14,15 +18,32 @@ def canvas(base, aspect='auto'):
         raise ValueError('无效图片比例')
     if not re.fullmatch(r'auto|[0-9]{3,4}x[0-9]{3,4}', str(base)):
         raise ValueError('无效基础分辨率')
+    base = cap_base_size(base)
     if aspect in ('auto', ''):
-        return {'base_size': base, 'aspect_ratio': 'auto', 'size': base}
-    edge = max(map(int, base.split('x'))) if base != 'auto' else 1024
+        return {'base_size': base, 'aspect_ratio': 'auto',
+                'size': base if base != 'auto' else f'{AUTO_EDGE}x{AUTO_EDGE}'}
+    edge = max(map(int, base.split('x'))) if base != 'auto' else AUTO_EDGE
     a, b = map(int, aspect.split(':'))
-    # Eight-pixel alignment keeps common image backends compatible while
-    # preserving the long edge (4096 for the requested 4K configuration).
+    # Eight-pixel alignment keeps common image backends compatible.
     width = edge if a >= b else max(8, round(edge * a / b / 8) * 8)
     height = edge if b >= a else max(8, round(edge * b / a / 8) * 8)
     return {'base_size': base, 'aspect_ratio': aspect, 'size': f'{width}x{height}'}
+
+
+def cap_base_size(base):
+    """Keep saved or queued image sizes within the supported 8192px canvas."""
+    if base == 'auto':
+        return base
+    if not re.fullmatch(r'[0-9]{3,4}x[0-9]{3,4}', str(base)):
+        raise ValueError('无效基础分辨率')
+    width, height = map(int, base.split('x'))
+    edge = max(width, height)
+    if edge <= MAX_EDGE:
+        return base
+    scale = MAX_EDGE / edge
+    width = min(MAX_EDGE, max(100, round(width * scale)))
+    height = min(MAX_EDGE, max(100, round(height * scale)))
+    return f'{width}x{height}'
 
 
 def reference_required(plan):

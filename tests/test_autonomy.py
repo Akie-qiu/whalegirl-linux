@@ -169,7 +169,7 @@ class AutonomyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(client.post('/api/config',headers=headers,json={'settings':values}).status_code, 200)
                 state = client.get('/api/autonomy',headers=headers).json()
                 self.assertEqual(state['enabled'], active)
-                self.assertEqual(config.settings.context_messages, 40)
+                self.assertEqual(config.settings.context_messages, 100)
                 self.assertEqual(config.settings.proactive_chat_ids, [])
 
     async def test_unified_chat_settings_save_mode_and_contact_choices_together(self):
@@ -189,7 +189,7 @@ class AutonomyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(config.settings.proactive_chat_ids,['room@chatroom'])
             self.assertEqual(config.settings.participation,'quiet')
             self.assertEqual(config.settings.proactive_per_day,17)
-            self.assertEqual(config.settings.context_messages,40)
+            self.assertEqual(config.settings.context_messages,100)
             self.assertTrue(config.settings.memory_enabled)
 
     async def test_invalid_unified_contact_selection_does_not_partially_switch_modes(self):

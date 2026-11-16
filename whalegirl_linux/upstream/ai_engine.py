@@ -18,6 +18,20 @@ class IncompleteModelResponse(ValueError):
     """A paid response began but cannot be safely used as an action plan."""
 
 
+class ContentFilteredResponse(IncompleteModelResponse):
+    """A terminal provider rejection, not a format or WeChat transport error."""
+
+    def __init__(self, stage=None):
+        self.stage = stage
+        super().__init__('模型服务内容审核拦截（content_filter）：本次模型回复不可用；'
+                         '这不是微信发送故障，请检查接口服务。')
+
+
+def content_filter_error(engine):
+    """Recognize the current failure without retaining provider response text."""
+    return str(ContentFilteredResponse()) if 'content_filter' in str(getattr(engine, 'last_error', '') or '') else ''
+
+
 class OutputTokenLimit(IncompleteModelResponse):
     """A terminal token limit, safe to recompute before any action executes."""
 
@@ -28,6 +42,28 @@ class EmptyModelResponse(ValueError):
 
 class InvalidAPIResponse(ValueError):
     """The endpoint returned a page or an incompatible HTTP response."""
+
+
+def http_error_metadata(response):
+    """Useful bounded diagnostics without retaining provider text or echoes."""
+    known = {'invalid_request_error', 'insufficient_quota', 'insufficient_balance',
+             'model_not_found', 'authentication_error', 'permission_denied',
+             'rate_limit_exceeded', 'invalid_api_key', 'unsupported_parameter', 'content_filter'}
+    allowed_fields = {'model', 'temperature', 'max_tokens', 'max_output_tokens', 'stream',
+                      'tools', 'tool_choice', 'reasoning_effort', 'response_format', 'messages'}
+    result = {'http_status': response.status_code}
+    try:
+        body = response.json()
+        error = body.get('error', {}) if isinstance(body, dict) else {}
+        if isinstance(error, dict):
+            code = error.get('code') or error.get('type')
+            if isinstance(code, str) and code in known:
+                result['provider_error_code'] = code
+            if error.get('param') in allowed_fields:
+                result['provider_parameter'] = error['param']
+    except (ValueError, TypeError):
+        pass
+    return result
 
 
 @dataclass
@@ -82,6 +118,7 @@ class AIEngine:
         self.stream_enabled = stream_enabled
         self.usage = TokenUsage()
         self.usage_callback = None
+        self.pricing_snapshot = {}
         self._clients: dict[int, httpx.AsyncClient] = {}
         self._available = True
         self.last_error = ""
@@ -291,20 +328,21 @@ class AIEngine:
             self.last_response_meta['request_fingerprint']=request_fingerprint
         return self.last_response_meta
 
-    def _output_budget(self, requested, *, stream=False):
+    def _output_budget(self, requested, *, stream=False, reasoning_effort=None):
         """Reserve reasoning space without changing configured reply style/effort.
 
         DeepSeek thinking shares max_tokens between reasoning and text. Unknown
-        providers stay unchanged unless an effort was selected. Streaming keeps
-        its existing budget and completion handling.
+        providers stay unchanged unless an effort was selected. Both receiving
+        modes share the same reasoning/output allowance.
         """
         requested = int(requested or self.max_tokens)
         model = self.model.lower()
-        thinking = (self.reasoning_effort != 'default' or 'reasoner' in model
+        effort = reasoning_effort if reasoning_effort is not None else self.reasoning_effort
+        thinking = (effort != 'default' or 'reasoner' in model
                     or model.startswith(('deepseek-v4', 'deepseek-flash')))
-        if stream or not thinking or self.api_style not in ('openai', 'responses'):
+        if not thinking or self.api_style not in ('openai', 'responses'):
             return requested
-        return requested + (1024 if self.reasoning_effort == 'low' else 2048)
+        return requested + (1024 if effort == 'low' else 2048)
 
     @staticmethod
     def _expand_output_budget(payload):
@@ -324,14 +362,20 @@ class AIEngine:
         stream: bool = False,
         max_tokens: int | None = None,
         response_format: dict | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict:
+        effort = reasoning_effort if reasoning_effort is not None else self.reasoning_effort
         payload = {
             "model": self.model,
-            "max_tokens": self._output_budget(max_tokens, stream=stream),
+            "max_tokens": self._output_budget(max_tokens, stream=stream, reasoning_effort=effort),
             "temperature": temperature if temperature is not None else self.temperature,
         }
         # Chat replies use Flash's direct-answer mode rather than its default reasoning pass.
-        if self.api_style == "openai" and self.model in ("deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"):
+        if (
+            self.api_style == "openai"
+            and self.model in ("deepseek-flash", "deepseek-v4-flash", "deepseek-v4.1-flash", "deepseek-v4-pro")
+            and effort == "default"
+        ):
             payload["thinking"] = {"type": "disabled"}
 
         dynamic_marker = "\n【本轮动态上下文】"
@@ -368,15 +412,15 @@ class AIEngine:
             full_messages.extend(effective_messages)
             payload["messages"] = full_messages
 
-        if self.reasoning_effort != "default":
-            if self.reasoning_effort not in {"low", "medium", "high"}:
+        if effort != "default":
+            if effort not in {"low", "medium", "high"}:
                 raise ValueError("不支持的思考强度")
             if self.api_style == "responses":
-                payload["reasoning"] = {"effort": self.reasoning_effort}
+                payload["reasoning"] = {"effort": effort}
             elif self.api_style == "anthropic":
-                payload["output_config"] = {"effort": self.reasoning_effort}
+                payload["output_config"] = {"effort": effort}
             else:
-                payload["reasoning_effort"] = self.reasoning_effort
+                payload["reasoning_effort"] = effort
         if response_format and self.api_style == "responses":
             format_spec = dict(response_format)
             if format_spec.get("type") == "json_schema":
@@ -408,6 +452,7 @@ class AIEngine:
 
     async def _stream_parts(self, client, payload, usage, started):
         completed, has_text = False, False
+        token_limit = None
         async with client.stream("POST", self.api_url, json=payload) as response:
             response.raise_for_status()
             try:
@@ -424,6 +469,8 @@ class AIEngine:
                         if event in {"response.failed", "response.cancelled", "response.incomplete"}:
                             usage.update((data.get("response") or {}).get("usage") or {})
                             reason = ((data.get("response") or {}).get("incomplete_details") or {}).get("reason")
+                            if reason == 'max_output_tokens':
+                                raise OutputTokenLimit('Responses 流未完成：length（达到回复 Token 上限）')
                             detail = "（达到回复 Token 上限）" if reason == "max_output_tokens" else ""
                             raise IncompleteModelResponse("Responses 流未完成" + detail)
                         if event == "response.completed":
@@ -440,8 +487,10 @@ class AIEngine:
                         if event == "message_start":
                             usage.update((data.get("message") or {}).get("usage") or {})
                         delta = data.get("delta") or {}
-                        if event == "message_delta" and delta.get("stop_reason") in {"max_tokens", "model_context_window_exceeded"}:
-                            raise IncompleteModelResponse("Claude 回复未完成（达到 Token 上限）")
+                        if event == "message_delta" and delta.get("stop_reason") == 'max_tokens':
+                            token_limit = OutputTokenLimit('Claude 回复未完成：length（达到 Token 上限）')
+                        elif event == "message_delta" and delta.get("stop_reason") == 'model_context_window_exceeded':
+                            raise IncompleteModelResponse('Claude 上下文超过容量，未执行未完成的回复')
                         if event == "message_stop":
                             completed = True
                         if delta.get("type") == "text_delta":
@@ -451,8 +500,11 @@ class AIEngine:
                         if choices:
                             choice = choices[0]
                             reason = choice.get("finish_reason")
-                            if reason in {"length", "content_filter"}:
-                                raise IncompleteModelResponse("模型回复未完成：" + reason)
+                            if reason == "content_filter":
+                                raise ContentFilteredResponse()
+                            if reason == "length":
+                                # Drain the trailing usage event before retrying.
+                                token_limit = OutputTokenLimit('模型回复未完成：length（达到输出 Token 上限）')
                             if reason:
                                 completed = True
                             content = (choice.get("delta") or {}).get("content") or ""
@@ -466,6 +518,8 @@ class AIEngine:
             except (httpx.HTTPError, json.JSONDecodeError) as exc:
                 # Never promote partial JSON or repeat a request whose response has begun.
                 raise IncompleteModelResponse("模型流在完成前断开，未执行未完成的回复") from exc
+        if token_limit:
+            raise token_limit
         if not completed:
             raise IncompleteModelResponse("模型流在完成前断开，未执行未完成的回复")
 
@@ -477,6 +531,7 @@ class AIEngine:
         max_tokens: int | None = None,
         response_format: dict | None = None,
         operation: str = "chat",
+        reasoning_effort: str | None = None,
     ) -> str:
         """发送聊天请求，返回回复文本"""
         if not self._available:
@@ -494,6 +549,7 @@ class AIEngine:
             stream=self.stream_enabled,
             max_tokens=max_tokens,
             response_format=response_format,
+            reasoning_effort=reasoning_effort,
         )
         request_fingerprint=self._request_fingerprint(payload)
 
@@ -547,7 +603,7 @@ class AIEngine:
                     if choice.get('finish_reason') == 'length':
                         raise OutputTokenLimit('模型回复未完成：length（达到输出 Token 上限）')
                     if choice.get('finish_reason') == 'content_filter':
-                        raise IncompleteModelResponse('模型回复未完成：'+choice['finish_reason'])
+                        raise ContentFilteredResponse()
                     content=self._message_text(message.get('content'))
                 if not content:
                     raise EmptyModelResponse('模型返回空内容（未提供可用文本）')
@@ -568,6 +624,8 @@ class AIEngine:
                 return ""
             except IncompleteModelResponse as exc:
                 self.last_error = str(exc)
+                if isinstance(exc, ContentFilteredResponse):
+                    response_meta.update(error_code='content_filter', retryable=False)
                 logger.warning(self.last_error)
                 return ""
             except EmptyModelResponse as exc:
@@ -577,13 +635,14 @@ class AIEngine:
                 last_error = f"请求超时 ({self.timeout}s)"
                 logger.warning(f"AI 请求超时 (attempt {attempt + 1}/{attempts})")
             except httpx.HTTPStatusError as e:
+                response_meta.update(http_error_metadata(e.response))
                 last_error = f"HTTP {e.response.status_code}"
                 if e.response.status_code == 404:
                     last_error += "（模型或接口不可用，请核对模型名称和接口地址）"
                 self.last_error = last_error
                 logger.warning(f"AI 请求失败: {last_error} (attempt {attempt + 1}/{attempts})")
                 if 400 <= e.response.status_code < 500 and e.response.status_code not in (408, 409, 429):
-                    logger.error("模型接口拒绝请求，请检查协议、模型、参数或凭据")
+                    logger.error('模型接口拒绝请求：' + json.dumps(http_error_metadata(e.response), ensure_ascii=False))
                     return ""
             except Exception as e:
                 last_error = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
@@ -614,14 +673,13 @@ class AIEngine:
         response_format: dict | None = None,
         operation: str = "chat",
         tool_choice: str = "auto",
+        reasoning_effort: str | None = None,
     ) -> dict:
         """Return a complete non-streamed tool decision with usage accounting."""
         if not self._available:
             return {"content": "", "tool_calls": [], "assistant_message": {}}
         if self.api_style != "openai":
             raise ValueError("工具调用仅支持 Chat Completions 接口")
-        if self.stream_enabled:
-            raise ValueError("接话等待工具需要关闭流式接收")
 
         self.last_error = ""
         self.last_first_token_ms = None
@@ -633,6 +691,7 @@ class AIEngine:
             stream=False,
             max_tokens=max_tokens,
             response_format=response_format,
+            reasoning_effort=reasoning_effort,
         )
         if tools:
             payload['tools']=tools
@@ -658,7 +717,7 @@ class AIEngine:
                 if choice.get('finish_reason') == 'length':
                     raise OutputTokenLimit('模型工具调用未完成：length（达到输出 Token 上限）')
                 if choice.get('finish_reason') == 'content_filter':
-                    raise IncompleteModelResponse('模型工具调用未完成：'+choice['finish_reason'])
+                    raise ContentFilteredResponse()
                 tool_calls=message.get('tool_calls') or []
                 if not isinstance(tool_calls,list) or any(
                     not isinstance(call,dict) or not call.get('id')
@@ -697,6 +756,8 @@ class AIEngine:
                 break
             except IncompleteModelResponse as exc:
                 self.last_error=str(exc)
+                if isinstance(exc, ContentFilteredResponse):
+                    response_meta.update(error_code='content_filter', retryable=False)
                 break
             except EmptyModelResponse as exc:
                 self.last_error=recovery=str(exc)
@@ -706,6 +767,7 @@ class AIEngine:
             except httpx.TimeoutException:
                 self.last_error=f'请求超时 ({self.timeout}s)'
             except httpx.HTTPStatusError as exc:
+                response_meta.update(http_error_metadata(exc.response))
                 code=exc.response.status_code;self.last_error=f'HTTP {code}'
                 if code==404:self.last_error+='（模型或接口不可用，请核对模型名称和接口地址）'
                 if 400<=code<500 and code not in (408,409,429):break
@@ -730,6 +792,7 @@ class AIEngine:
             if self.usage_callback:
                 self.usage_callback({'created':created,'provider':urlsplit(self.api_url).hostname or '',
                     'model':self.model,'operation':operation,'status':status,
+                    **({'pricing_snapshot':self.pricing_snapshot} if self.pricing_snapshot else {}),
                     'elapsed_ms':round((time.monotonic()-started)*1000),**normalized})
         except Exception as exc:
             logger.warning('Token统计记录失败: '+type(exc).__name__)
@@ -758,16 +821,20 @@ class AIEngine:
         request_fingerprint=self._request_fingerprint(payload)
 
         started,created=time.monotonic(),time.time();raw_usage={};outcome='error'
+        blocked = False
         try:
             client = await self._get_client()
             async for content in self._stream_parts(client, payload, raw_usage, started):
                 yield content
             outcome = 'success'
         except Exception as e:
+            blocked = isinstance(e, ContentFilteredResponse)
             self.last_error = str(e) if isinstance(e, IncompleteModelResponse) else "流式请求失败：" + type(e).__name__
             logger.error(self.last_error)
         finally:
             self.last_response_meta={'request_fingerprint':request_fingerprint,'attempts':1}
+            if blocked:
+                self.last_response_meta.update(error_code='content_filter', retryable=False)
             self.record_usage(raw_usage,started=started,created=created,status=outcome)
 
     async def test_connection(self) -> tuple[bool, str]:
@@ -778,7 +845,7 @@ class AIEngine:
             )
             if response:
                 return True, f"连接成功: {response[:50]}"
-            return False, "未收到回复"
+            return False, self.last_error or "未收到回复"
         except Exception as e:
             return False, f"连接失败: {e}"
 

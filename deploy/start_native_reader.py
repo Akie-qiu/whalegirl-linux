@@ -9,6 +9,11 @@ import time
 
 
 NAME = 'whalegirl-wechat-candidate-4118'
+RUNTIME_SPEC = Path('/opt/whalegirl-linux/native-runtime.json')
+runtime_spec = json.loads(RUNTIME_SPEC.read_text()) if RUNTIME_SPEC.is_file() else {}
+expected_version = runtime_spec.get('wechat_version', '4.1.1.8')
+if expected_version not in ('4.1.1.8', '4.1.13.26'):
+    raise SystemExit('Unsupported pinned native WeChat version')
 info = json.loads(subprocess.check_output(['docker', 'inspect', NAME], text=True))[0]
 
 
@@ -53,11 +58,14 @@ if sys.argv[1:] == ['--stop']:
 if sys.argv[1:]:
     raise SystemExit('Unsupported native reader command')
 image = json.loads(subprocess.check_output(['docker', 'image', 'inspect', info['Image']], text=True))[0]
-pinned_image = any(tag.startswith('whalegirl-wechat:4.1.1.8-') for tag in image.get('RepoTags') or [])
+pinned_image = any(tag.startswith('whalegirl-wechat:' + expected_version + '-') for tag in image.get('RepoTags') or [])
+if runtime_spec.get('mode') == 'verified-bind-package':
+    pinned_image = (info['Image'] == runtime_spec.get('base_image_sha256') and
+                    expected_version == '4.1.13.26')
 if not info['State']['Running'] or not pinned_image:
     raise SystemExit('The pinned native WeChat container is not running')
 version = Path('/var/lib/whalegirl-linux/candidate-4.1.1.8/gateway/runtime-version.json')
-if json.loads(version.read_text())['wechat_version'] != '4.1.1.8':
+if json.loads(version.read_text())['wechat_version'] != expected_version:
     raise SystemExit('Unexpected native WeChat version')
 def install_helper(name, destination):
     # Resolve the actual inode inside the running container. Atomic host updates

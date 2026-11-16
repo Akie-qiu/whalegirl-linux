@@ -24,6 +24,43 @@ class VirtualCommentBlockTests(unittest.TestCase):
         return {'role': 'frame', 'name': 'Moments', 'children': [{'role': 'list',
             'bounds': {'x': 366, 'y': 156, 'width': 548, 'height': 508}, 'children': rows}]}
 
+    def test_open_moments_minimizes_existing_editor_without_touching_draft(self):
+        editor = {'role':'text','name':'','states':['EDITABLE'],
+                  'bounds':{'x':0,'y':0,'width':300,'height':80}}
+        draft_frame = {'role':'frame','name':'Moments','children':[editor]}
+        main = {'role':'frame','name':'Main','children':[
+            {'role':'push-button','name':'Moments'}]}
+        timeline = {'role':'frame','name':'Moments','children':[
+            {'role':'push-button','name':'Messages'}]}
+        snapshots = iter([draft_frame, main])
+        def tree():
+            return next(snapshots, timeline)
+        clicks = []
+        result = type('Result', (), {'stdout':b'123\n'})()
+        with patch.object(moments_ui,'tree',side_effect=tree), \
+             patch.object(moments_ui,'command',return_value=result), \
+             patch.object(moments_ui,'click_node',side_effect=lambda node: clicks.append(node)), \
+             patch.object(moments_ui.time,'sleep'), \
+             patch('native_recovery.minimize_moments_editor') as minimize:
+            opened = moments_ui.open_moments()
+        minimize.assert_called_once()
+        self.assertIs(minimize.call_args.args[1], draft_frame)
+        self.assertEqual([node.get('name') for node in clicks], ['Moments'])
+        self.assertIs(opened, timeline)
+
+    def test_publish_does_not_hide_or_replace_an_existing_draft(self):
+        editor = {'role':'text','name':'','states':['EDITABLE'],
+                  'bounds':{'x':0,'y':0,'width':300,'height':80}}
+        draft_frame = {'role':'frame','name':'Moments','children':[editor]}
+        clicks = []
+        with patch.object(moments_ui,'tree',return_value=draft_frame), \
+             patch.object(moments_ui,'click_node',side_effect=lambda node: clicks.append(node)), \
+             patch('native_recovery.minimize_moments_editor') as minimize:
+            with self.assertRaisesRegex(ValueError,'preserve the draft'):
+                moments_ui.open_moments(minimize_existing_editor=False)
+        minimize.assert_not_called()
+        self.assertEqual(clicks, [])
+
     def test_verified_post_at_bottom_scrolls_until_its_comment_object_is_created(self):
         step = [0]
         def snapshot():

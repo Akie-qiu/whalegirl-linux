@@ -44,9 +44,17 @@ class CompletionTests(unittest.IsolatedAsyncioTestCase):
                       {'state':'recovered','main_ready':True,'operation':'open_chat'}):
             with self.subTest(saved=saved),self.assertRaises(UIJobError):await self.run_job('reset_ui',saved)
 
-    async def test_submitted_send_is_not_reclassified_as_a_navigation_success(self):
-        with self.assertRaises(UIJobError) as caught:await self.run_job('send_text',{'state':'submitted'})
-        self.assertEqual(caught.exception.state,'submitted')
+    async def test_submitted_send_keeps_submission_state_for_db_receipt_check(self):
+        result, calls = await self.run_job('send_text', {'state': 'submitted'})
+        self.assertEqual(result['state'], 'submitted')
+        self.assertEqual(result['transport_warning'], 'planner_exhausted_after_native_submission')
+        self.assertEqual(len(calls), 1)
+
+    async def test_unsubmitted_or_wrong_destination_send_is_not_accepted(self):
+        for saved in ({'state': 'sending'}, {'state': 'submitted', 'chat': 'other'},
+                      {'state': 'submitted', 'error': 'click failed'}):
+            with self.subTest(saved=saved), self.assertRaises(UIJobError):
+                await self.run_job('send_sticker', saved)
 
 
 if __name__=='__main__':unittest.main()

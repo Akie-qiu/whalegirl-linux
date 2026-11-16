@@ -1,0 +1,43 @@
+/* A focused model editor within the existing flat Morandi console. */
+.harbor-console #model-panel.model-manager {padding-top:8px}
+.mm-overview {display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 0 22px;color:var(--muted);font-size:13px}
+.mm-workspace {display:grid;grid-template-columns:245px minmax(0,1fr);gap:30px;align-items:start}
+.mm-sidebar {position:sticky;top:100px;border-right:1px solid var(--line);padding-right:22px}
+.mm-list-tools {display:flex;gap:8px;align-items:center;margin-bottom:18px}
+.harbor-console .mm-list-tools input {min-width:0;font-size:12px;padding:9px}
+.mm-list-tools button {white-space:nowrap;padding:8px 10px}
+.mm-profiles {display:flex;flex-direction:column;gap:5px;max-height:65vh;overflow:auto;padding:2px}
+.harbor-console .mm-profile {text-align:left;display:block;position:relative;width:100%;padding:12px;color:var(--ink);background:transparent;border-radius:12px;line-height:1.5}
+.harbor-console .mm-profile:hover {background:var(--mist-soft)}
+.harbor-console .mm-profile[aria-current=true] {background:#e1ebfa;color:var(--accent)}
+.mm-profile-top {display:flex;align-items:center;justify-content:space-between;gap:8px;font-weight:550;font-size:13px}
+.mm-profile small {display:block;font-size:12px;color:var(--muted);margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mm-active-badge {font-size:10px;font-weight:450;white-space:nowrap;color:#27665a;background:#e7f0eb;padding:2px 5px;border-radius:5px}
+.mm-draft-dot {font-size:11px;color:var(--warm-ink);margin-left:5px}
+.mm-editor {min-width:0;max-width:850px}
+.mm-editor-heading {display:flex;align-items:end;justify-content:space-between;gap:18px;margin-bottom:22px}
+.mm-name-field {flex:1;max-width:440px}
+.harbor-console .model-manager label {display:flex;flex-direction:column;align-items:stretch;gap:6px;line-height:1.6;margin:0;font-size:13px}
+.harbor-console .model-manager .mm-check {flex-direction:row;align-items:center;gap:9px;padding-top:27px}
+.mm-fields {display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);column-gap:22px;row-gap:18px}
+.mm-span {grid-column:1/-1}
+.model-manager .hint {margin:0}
+.mm-fields > p.hint {margin-top:-10px}
+.mm-model-input {display:flex;gap:9px;align-items:center;min-width:0}
+.mm-model-input input {flex:1;min-width:0}
+.mm-model-input button {white-space:nowrap}
+.mm-disclosure {margin-top:22px;border-top:1px solid var(--line);padding:17px 0 0}
+.mm-disclosure summary {cursor:pointer;color:var(--ink);font-weight:500;font-size:14px;list-style-position:inside}
+.mm-disclosure summary .hint {float:right;font-weight:400;margin-left:12px}
+.mm-disclosure-body {padding-top:20px}
+.mm-actions {display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 0;margin-top:12px;border-top:1px solid var(--line);position:sticky;bottom:10px;z-index:5;background:var(--bg,#fbfcff)}
+.mm-action-spacer {flex:1}
+.mm-actions #save-model {display:inline-flex!important}
+.harbor-console .model-manager .mm-result {min-height:22px;margin-top:20px;color:var(--muted);white-space:pre-wrap}
+.harbor-console .model-manager .mm-result.error {color:var(--danger);background:none;padding:0;border:0}
+.harbor-console .model-manager .mm-save-help {margin-top:10px}
+.mm-sidebar > p {padding:18px 8px 0}
+.mm-empty {padding:18px 8px;color:var(--muted);font-size:13px}
+@media(max-width:1100px) {.mm-workspace {grid-template-columns:205px minmax(0,1fr);gap:22px}.mm-sidebar {padding-right:16px}.mm-list-tools {flex-wrap:wrap}.mm-list-tools input {flex-basis:100%}.mm-list-tools button {width:100%}}
+@media(max-width:760px) {.mm-workspace {grid-template-columns:minmax(0,1fr);gap:24px}.mm-sidebar {position:static;border-right:0;border-bottom:1px solid var(--line);padding:0 0 18px}.mm-list-tools {flex-wrap:nowrap;margin-bottom:12px}.mm-list-tools input {flex:1;min-width:0}.mm-list-tools button {width:auto}.mm-profiles {max-height:210px}.mm-sidebar > p {padding:10px 0 0}.mm-editor-heading {gap:10px}.mm-fields {column-gap:14px}.mm-overview {align-items:start;flex-direction:column;gap:5px}.mm-disclosure summary .hint {float:none;display:block;margin:4px 0 0 16px}.mm-actions {gap:8px}.mm-model-input {gap:6px}.mm-model-input button {padding:8px 10px}}
+@media(max-width:420px) {.mm-fields {grid-template-columns:minmax(0,1fr)}.mm-span {grid-column:auto}.harbor-console .model-manager .mm-check {padding-top:4px}.mm-actions #test-model {padding:8px 4px}.mm-action-spacer {display:none}.mm-actions {justify-content:space-between}.mm-editor-heading {align-items:end}}

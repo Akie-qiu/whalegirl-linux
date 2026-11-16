@@ -602,6 +602,52 @@ class MomentsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row['text'], '回复')
         self.assertEqual(json.loads(row['payload']).get('gen_attempts'), 2)
 
+    async def test_weather_search_and_caption_naturalization_and_life_scene_sync(self):
+        from whalegirl_linux.conversation import current_life_scene
+        from whalegirl_linux.moments import _clean_moment_comment, _naturalize_moment_caption, parse_moments_json
+
+        # 1. 9-line punctuation-less script is compressed into a natural 18-55 char caption
+        script_caption = (
+            '晚上小龙娘在厨房煮热饮\n我凑过去问是什么\n她说姜和桂花，驱寒的\n我说就尝一口\n'
+            '她说好，一口\n结果那杯我捧着喝掉小半\n她伸手把杯子挪回去，问这算一口？\n'
+            '我说杯口那么大，一口就这么多\n她没接话，又给我倒了半杯'
+        )
+        natural = _naturalize_moment_caption(script_caption)
+        self.assertNotIn('\n', natural)
+        self.assertGreaterEqual(len(natural), 18)
+        self.assertLessEqual(len(natural), 68)
+        self.assertIn('小龙娘在厨房煮热饮', natural)
+        self.assertIn('又给我倒了半杯', natural)
+
+        # 2. Think tags and multi-paragraph comment replies are cleaned
+        parsed_think = parse_moments_json('<think>先思考怎么回</think>{"participate": true, "text": "唔，想得美，最后半碗是我的！\\n\\n下次让小龙娘多放点姜。"}')
+        cleaned_comment = _clean_moment_comment(parsed_think['text'])
+        self.assertEqual(cleaned_comment, '想得美，最后半碗是我的！')
+
+        # 3. Weather lookup (Guangzhou) is injected when eligible, and suppressed when recent posts already touched weather
+        search_queries = []
+        async def fake_search_run(engine, query, settings):
+            search_queries.append(query)
+            return {'ok': True, 'documents': [{'title': '广州今日天气实况', 'summary': '阴转小雨，气温18~24℃，微风'}]}
+        self.runtime.web_search = SimpleNamespace(run=fake_search_run)
+        self.generation_fixture(
+            {'participate': True, 'text': '外面突然飘小雨有点凉，窝在沙发里抱紧小鲸鱼抱枕取暖', 'media_mode': 'none'},
+            web_search_enabled=True,
+        )
+        row = await self.service.generate('publish')
+        self.assertEqual(row['state'], 'draft')
+        self.assertEqual(len(search_queries), 1)
+        self.assertIn('广州今日天气', search_queries[0])
+        data, _ = self.model_inputs[0]
+        self.assertIn('阴转小雨', data.get('today_weather', ''))
+
+        # 4. Published Moment syncs into current_life_scene AND blocks weather on the next consecutive post
+        self.service.book.change(row['id'], 'sent', receipt='moment-rcpt-1')
+        self.assertFalse(self.service._should_include_weather(self.service.publication_history('next-id')))
+        scene = current_life_scene(self.store, self.runtime.config.settings, 'account', 'group-1')
+        self.assertIn('不久前刚发了一条朋友圈', scene)
+        self.assertIn('外面突然飘小雨有点凉', scene)
+
 
 class MomentsQueueApiTests(unittest.TestCase):
     def test_click_publish_queues_and_edit_withdraws_request_without_deleting_draft(self):

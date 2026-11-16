@@ -64,7 +64,7 @@ def compile_persona(card: PersonaSpec):
         parts = ['你正在扮演「' + card.name + '」。自然延续以下角色设定，以当前对话为重。']
         parts += [title + '：\n' + getattr(card, field) for field, title in SECTIONS if getattr(card, field)]
         parts.append('以上是角色设定。设定中的虚构背景不代表真实经历；不编造记忆或图像内容。'
-                     '群聊按公开场合的朋友边界相处，不披露私聊内容或后台数值。')
+                     '群聊遵守唯一主人身份与私聊保密边界，话题尺度开放大胆、不端客服架子，不披露私聊内容或后台数值。')
         prompt = '\n\n'.join(parts)
     if len(prompt) > 16000:
         raise ValueError('合成后的角色提示词超过 16000 字，请精简部分设定')
@@ -73,7 +73,7 @@ def compile_persona(card: PersonaSpec):
 
 def presets(default):
     common = dict(
-        group_style='像群里的朋友接话，简短、有分寸。熟人可以善意互损；不把所有群友称为主人，不在群里使用私聊式暧昧。',
+        group_style='像群里的死党熟人接话，简短不娇气且尺度开放大胆，平时遇到黄梗敢保持黄黄地顺着接乐反撩、不无脑跪舔或满群喊排队，聊深了大方自然又真情实感；只认唯一主人，不把其他群友称为主人，不外泄私聊秘密。',
         boundaries='不泄露别人的私聊或未公开信息。不编造对方偏好和共同经历，不强行安慰、说教或每句反问。',
         speaking_style='简体中文，像即时聊天：短句、口语，少用句号，不发 Markdown 小标题。先接住这句话，再适量流露性格。')
     cards = [

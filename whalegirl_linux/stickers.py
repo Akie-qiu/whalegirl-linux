@@ -107,16 +107,30 @@ class StickerCatalog:
         self.indexed=0
         self.lock=asyncio.Lock()
         self.retry_after={}
+        self.unreachable_until={}
+
+    def mark_unreachable(self, md5, seconds=21600):
+        if isinstance(md5, str) and md5:
+            self.unreachable_until[md5] = time.time() + max(60, int(seconds))
 
     def choices(self):
+        now = time.time()
+        reachable = {
+            md5: self.entries[md5]
+            for md5 in self.available
+            if md5 in self.entries and md5 not in self.disabled and self.unreachable_until.get(md5, 0) <= now
+        }
+        if reachable:
+            return reachable
         return {md5:self.entries[md5] for md5 in self.available if md5 in self.entries and md5 not in self.disabled}
 
     def chat_signal(self, md5):
         return sticker_emotional_signal(self.profiles.get(md5), self.entries.get(md5, ''))
 
-    def candidates(self,text,limit=8,used=(),history=None):
+    def candidates(self,text,limit=8,used=(),history=None,fresh_bonus=None):
         available=self.choices()
         history=history or {}
+        fresh_bonus=fresh_bonus or {}
         if limit<=0:return {}
         words=set(re.findall(r'[A-Za-z0-9_]{2,}|[\u3400-\u9fff]{2}',text.casefold()))
         for phrase in re.findall(r'[\u3400-\u9fff]{2,}',text):words.update(phrase[i:i+2] for i in range(len(phrase)-1))
@@ -127,15 +141,20 @@ class StickerCatalog:
         def usage(md5):
             item=history.get(md5) or {}
             return (bool(item.get('recent')),int(item.get('count') or 0),float(item.get('last') or 0))
+        def bonus(md5):
+            item=history.get(md5) or {}
+            if item.get('recent') or int(item.get('count') or 0)>0:
+                return 0
+            return int(fresh_bonus.get(md5,0) or 0)
         ids=[m for m in available if m not in used]
         scores={m:score(m) for m in ids}
         # Keep most slots relevant and reserve a small tail for less-used options.
-        # The order stays stable until the actual catalog or usage changes.
-        ranked=sorted(ids,key=lambda m:(-scores[m],*usage(m),m))
+        # Put recent (cooldown) options strictly behind all non-recent options.
+        ranked=sorted(ids,key=lambda m:(bool((history.get(m) or {}).get('recent')),-(scores[m]+bonus(m)),*usage(m),m))
         primary=max(1,limit-max(1,limit//4)) if limit>1 else 1
         chosen=ranked[:primary]
         remaining=[m for m in ids if m not in chosen]
-        remaining.sort(key=lambda m:(*usage(m),-scores[m],m))
+        remaining.sort(key=lambda m:(*usage(m),-(scores[m]+bonus(m)),m))
         chosen.extend(remaining[:max(0,limit-len(chosen))])
         return {m:available[m] for m in chosen}
 

@@ -42,6 +42,11 @@ class ExplorationToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(g.runs()[0]['result']['request']['feed'],'popular')
         b.client.set_meta(last_check=str(time.time()))
         b.feed=AsyncMock(return_value=[{'bvid':BV,'views':500,'likes':20}])
+        # Candidate selection now verifies actual subtitle availability before
+        # invoking the chooser. Keep this test isolated from live Bilibili.
+        b.reader.metadata=AsyncMock(return_value={'bvid':BV,'aid':123,'pages':[{'page':1,'cid':456,'duration':60}]})
+        b.reader.subtitle_listing=AsyncMock(return_value={'bvid':BV,'cid':456,'aid':123,
+            'subtitle':{'subtitles':[{'subtitle_url':'https://aisubtitle.hdslb.com/synthetic.json'}]}})
         g.model_call=AsyncMock(side_effect=[{'mode':'popular','question':'大家为什么爱看'}, {'bvid':''}])
         result=await b.prepare(g,object(),self.config.generation,self.runtime.memory_hub.role(),feed='popular')
         self.assertIsNone(result)
@@ -65,7 +70,7 @@ class ExplorationToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(options[0]['model'],'learning-fixture')
         self.assertEqual(self.config.active_model_profile,'custom')
         self.assertEqual(self.config.settings.model,'chat-fixture')
-        self.assertEqual(g.learn_bilibili.call_args.kwargs,{'feed':'popular'})
+        self.assertEqual(g.learn_bilibili.call_args.kwargs,{'feed':'popular','target':None,'requester':None})
         self.assertEqual(next(r for r in g.runs() if r['id']==request['id'])['state'],'done')
         self.assertNotIn('fixture-learning-key',json.dumps(g.internet_worker()))
 

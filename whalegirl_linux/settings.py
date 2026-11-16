@@ -6,12 +6,41 @@ import hmac
 import os
 import secrets
 import time
+import threading
+import re
+import uuid
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
+
+from .image_canvas import MAX_EDGE, cap_base_size
+from .usage_pricing import ModelPricing
+
+UNRESTRICTED_IMAGE_MAX_PER_DAY = 10
+
+
+DEFAULT_BILIBILI_WATCH_TARGETS = (
+    {'mid': '401742377', 'name': '原神', 'game': 'genshin', 'kind': 'official', 'enabled': True},
+    {'mid': '1340190821', 'name': '崩坏：星穹铁道', 'game': 'starrail', 'kind': 'official', 'enabled': True},
+    {'mid': '1636034895', 'name': '绝区零', 'game': 'zzz', 'kind': 'official', 'enabled': True},
+)
+
+DEFAULT_BILIBILI_WATCH_CALENDARS = {
+    'genshin': {'version': '7.2', 'anchor_date': '2026-11-04', 'cycle_days': 42, 'preview_lead_days': 12},
+    'starrail': {'version': '4.7', 'anchor_date': '2026-11-11', 'cycle_days': 42, 'preview_lead_days': 12},
+    'zzz': {'version': '3.3', 'anchor_date': '2026-10-21', 'cycle_days': 42, 'preview_lead_days': 12},
+}
+
+
+def default_bilibili_watch_targets() -> list[dict]:
+    return [dict(item) for item in DEFAULT_BILIBILI_WATCH_TARGETS]
+
+
+def default_bilibili_watch_calendars() -> dict[str, dict]:
+    return {game: dict(cfg) for game, cfg in DEFAULT_BILIBILI_WATCH_CALENDARS.items()}
 
 
 class StickerChatPermission(BaseModel):
@@ -22,6 +51,14 @@ class StickerChatPermission(BaseModel):
 
 
 MODEL_PROFILE_IDS = ('flash', 'pro', 'responses', 'custom')
+MODEL_PROFILE_NAMES = {'flash':'DeepSeek Flash', 'pro':'DeepSeek V4 Pro',
+                       'responses':'OpenAI Responses', 'custom':'自定义接口'}
+MODEL_CONNECTION_FIELDS = ('api_url','api_style','model','max_tokens','model_temperature',
+                          'reasoning_effort','model_stream_enabled')
+
+
+def valid_model_profile_id(value):
+    return isinstance(value,str) and value != 'current' and re.fullmatch(r'[a-z][a-z0-9_-]{0,63}',value) is not None
 
 
 def validate_model_temperature(value, info):
@@ -44,13 +81,25 @@ class ModelProfile(BaseModel):
     never travel through the public config response.
     """
     model_config = ConfigDict(extra="forbid")
+    name: str = Field(default='', max_length=80)
+    pricing: ModelPricing = Field(default_factory=ModelPricing)
     api_url: str = "https://api.deepseek.com/chat/completions"
     api_style: Literal['auto', 'openai', 'responses', 'anthropic'] = 'auto'
     model: str = Field(default="deepseek-chat", min_length=1, max_length=100)
-    max_tokens: int = Field(default=220, ge=32, le=1200)
+    max_tokens: int = Field(default=220, ge=32, le=4000)
     model_temperature: float | None = Field(default=None, ge=0, le=2)
     reasoning_effort: Literal['default', 'low', 'medium', 'high'] = 'default'
     model_stream_enabled: bool = False
+
+    @field_validator('name')
+    @classmethod
+    def valid_name(cls,value):
+        value=value.strip()
+        if any(ord(c)<32 for c in value):raise ValueError('配置名称不能包含换行或控制字符')
+        return value
+
+    def connection_settings(self):
+        return self.model_dump(include=set(MODEL_CONNECTION_FIELDS))
 
     @field_validator('model_temperature')
     @classmethod
@@ -80,6 +129,12 @@ class Settings(BaseModel):
             value.pop('growth_web_enabled',None)
             value.pop('bilibili_reads_per_day',None)
         return value
+
+    @model_validator(mode='after')
+    def valid_debounce_window(self):
+        if 0 < self.debounce_max_seconds < max(self.debounce_single_seconds, self.debounce_burst_seconds):
+            raise ValueError('消息合并总等待上限不能小于单条或连发等待；设为 0 可关闭合并')
+        return self
     enabled: bool = False
     account_id: str = Field(default="", max_length=200)
     allowed_chat_ids: list[str] = Field(default_factory=list, max_length=100)
@@ -103,11 +158,11 @@ class Settings(BaseModel):
     stickers_enabled: bool = True
     sticker_aggressiveness: Literal['low','normal','high','very_high','sticker_first'] = 'normal'
     sticker_usage_target: int = Field(default=0, ge=0, le=100)
-    sticker_after_text: Literal['off','normal','high'] = 'high'
-    sticker_pair_probability: int = Field(default=90, ge=0, le=100)
-    sticker_text_pair_eagerness: int = Field(default=90, ge=0, le=100)
-    sticker_only_eagerness: int = Field(default=75, ge=0, le=100)
-    sticker_reaction_eagerness: int = Field(default=90, ge=0, le=100)
+    sticker_after_text: Literal['off','normal','high'] = 'normal'
+    sticker_pair_probability: int = Field(default=55, ge=0, le=100)
+    sticker_text_pair_eagerness: int = Field(default=55, ge=0, le=100)
+    sticker_only_eagerness: int = Field(default=60, ge=0, le=100)
+    sticker_reaction_eagerness: int = Field(default=50, ge=0, le=100)
     sticker_max_per_reply: int = Field(default=1, ge=1, le=3)
     sticker_style_note: str = Field(default='', max_length=1200)
     api_url: str = "https://api.deepseek.com/chat/completions"
@@ -115,7 +170,7 @@ class Settings(BaseModel):
     reasoning_effort: Literal['default', 'low', 'medium', 'high'] = 'default'
     model_stream_enabled: bool = False
     model: str = Field(default="deepseek-chat", min_length=1, max_length=100)
-    max_tokens: int = Field(default=220, ge=32, le=1200)
+    max_tokens: int = Field(default=220, ge=32, le=4000)
     model_temperature: float | None = Field(default=None, ge=0, le=2)
     @field_validator('model_temperature')
     @classmethod
@@ -127,7 +182,7 @@ class Settings(BaseModel):
     fast_reply_enabled: bool = True
     chat_cooldown: float = Field(default=15, ge=0, le=300)
     poll_interval: float = Field(default=1, ge=0.25, le=60)
-    context_messages: int = Field(default=40, ge=10, le=100)
+    context_messages: int = Field(default=100, ge=10, le=100)
     fishtalk_enabled: bool = True
     fishtalk_auto_learn: bool = True
     fishtalk_reference_level: Literal['subtle', 'normal', 'strong'] = 'normal'
@@ -141,18 +196,39 @@ class Settings(BaseModel):
     memory_token_budget: int = Field(default=1400, ge=400, le=6000)
     memory_item_limit: int = Field(default=8, ge=2, le=30)
     growth_enabled: bool = True
+    life_autonomy_enabled: bool = True
+    growth_mature_traits_chat_enabled: bool = False
     growth_tieba_enabled: bool = False
     growth_auto_apply: bool = True
     growth_bilibili_expression_shared: bool = True
     growth_tieba_expression_shared: bool = True
-    growth_internet_model_profile: Literal['current', 'flash', 'pro', 'responses', 'custom'] = 'flash'
+    growth_internet_model_profile: str = Field(default='flash', pattern=r'^[a-z][a-z0-9_-]{0,63}$')
     growth_reads_per_day: int = Field(default=3, ge=0, le=20)
     growth_interval_minutes: int = Field(default=180, ge=30, le=1440)
     growth_exploration: int = Field(default=25, ge=0, le=100)
     growth_interests: list[str] = Field(default_factory=list, max_length=30)
     bilibili_enabled: bool = False
+    # Independent, opt-in ways to enqueue a specifically requested video read.
+    # Bilibili mention polling can mark notifications as seen on the platform.
+    bilibili_comment_mentions_enabled: bool = False
+    bilibili_comment_reply_enabled: bool = False
+    bilibili_reply_scope: Literal['all', 'whitelist'] = 'all'
+    bilibili_reply_to_replies_enabled: bool = True
+    bilibili_reply_allowed_sender_mids: list[str] = Field(default_factory=list, max_length=100)
+    bilibili_reply_use_special_following: bool = True
+    bilibili_reply_mode: Literal['auto', 'review'] = 'auto'
+    bilibili_reply_deep_max_minutes: int = Field(default=30, ge=5, le=120)
+    bilibili_reply_deep_max_windows: int = Field(default=6, ge=1, le=12)
+    bilibili_reply_per_day: int = Field(default=12, ge=1, le=50)
+    bilibili_reply_min_interval_seconds: int = Field(default=60, ge=15, le=3600)
+    bilibili_reply_max_per_thread: int = Field(default=3, ge=1, le=10)
+    bilibili_reply_max_age_hours: int = Field(default=24, ge=1, le=168)
+    bilibili_reply_retention_limit: int = Field(default=20, ge=5, le=200)
+    bilibili_reply_retention_days: int = Field(default=7, ge=1, le=90)
+    bilibili_reply_record_ignored: bool = True
+    bilibili_wechat_video_enabled: bool = False
     bilibili_interval_minutes: int = Field(default=120, ge=30, le=1440)
-    bilibili_requests_per_day: int = Field(default=200, ge=20, le=1000)
+    bilibili_requests_per_day: int = Field(default=1200, ge=20, le=5000)
     bilibili_visual_enabled: bool = True
     bilibili_comments_enabled: bool = True
     bilibili_danmaku_enabled: bool = True
@@ -165,8 +241,19 @@ class Settings(BaseModel):
     bilibili_media_enabled: bool = True
     bilibili_media_max_mb: int = Field(default=16,ge=4,le=32)
     bilibili_interest_seeds: list[str] = Field(default_factory=list, max_length=20)
-    bilibili_feeds: list[Literal['recommend', 'popular', 'search', 'following', 'favorites', 'history']] = Field(
-        default_factory=lambda: ['recommend', 'popular', 'search', 'following', 'favorites', 'history'], max_length=6)
+    bilibili_excluded_topics: list[str] = Field(
+        default_factory=lambda: ['恐怖', '克苏鲁', '鸣潮'],
+        max_length=50,
+    )
+    bilibili_soft_preferences: str = Field(
+        default='稍微多留意一点米哈游游戏圈（原神、崩坏：星穹铁道、绝区零、崩坏3）的玩家二创、整活切片与社区热梗吐槽；只是平时冲浪略微偏爱一点，全站其他好玩热梗照样正常看，不必每轮都挑游戏',
+        max_length=300,
+    )
+    bilibili_feeds: list[Literal['recommend', 'popular', 'ranking', 'weekly', 'search', 'following', 'favorites', 'history']] = Field(
+        default_factory=lambda: ['recommend', 'popular', 'ranking', 'weekly', 'search', 'following', 'favorites', 'history'], max_length=8)
+    bilibili_memes_enabled: bool = True
+    bilibili_memes_ttl_days: int = Field(default=30, ge=3, le=180)
+    bilibili_meme_eagerness: int = Field(default=75, ge=0, le=100)
     bilibili_cache_mb: int = Field(default=64, ge=8, le=256)
     bilibili_cache_days: int = Field(default=7, ge=1, le=30)
     memory_cold_after_days: int = Field(default=30, ge=3, le=365)
@@ -198,8 +285,10 @@ class Settings(BaseModel):
     affection_private_style: Literal['warm','close','unreserved'] = 'close'
     private_unreserved_enabled: bool = False
     owner_ids: list[str] = Field(default_factory=list, max_length=20)
+    intimate_friend_ids: list[str] = Field(default_factory=list, max_length=20)
     sticker_candidate_limit: int = Field(default=8, ge=4, le=20)
-    sticker_cooldown_seconds: int = Field(default=180, ge=0, le=3600)
+    sticker_cooldown_seconds: int = Field(default=75, ge=0, le=3600)
+    pat_cooldown_seconds: int = Field(default=45, ge=10, le=600)
     sticker_self_manage_enabled: bool = True
     sticker_auto_collect_enabled: bool = True
     sticker_auto_disable_enabled: bool = True
@@ -292,6 +381,10 @@ class Settings(BaseModel):
     image_generation_enabled: bool = True
     image_api_url: str = 'https://image.ai-zjl.cc/v1'
     image_model: str = Field(default='gpt-image-2.5', min_length=1, max_length=120)
+    image_unrestricted_enabled: bool = False
+    image_unrestricted_api_url: str = ''
+    image_unrestricted_model: str = Field(default='', max_length=120)
+    image_unrestricted_per_day: int = Field(default=2, ge=0, le=UNRESTRICTED_IMAGE_MAX_PER_DAY)
     image_size: str = Field(default='1024x1024', pattern=r'^(auto|[0-9]{3,4}x[0-9]{3,4})$')
     image_timeout: int = Field(default=300, ge=120, le=600)
     image_per_day: int = Field(default=10, ge=0, le=100)
@@ -311,6 +404,12 @@ class Settings(BaseModel):
     moments_image_generate_eagerness: int = Field(default=75, ge=0, le=100)
     moments_variety_days: int = Field(default=7, ge=1, le=30)
     tieba_enabled: bool = False
+    bilibili_watch_enabled: bool = True
+    bilibili_watch_chat_ids: list[str] = Field(default_factory=list, max_length=20)
+    bilibili_watch_push_cooldown_minutes: int = Field(default=15, ge=0, le=720)
+    bilibili_watch_spoiler_lock_minutes: int = Field(default=120, ge=15, le=1440)
+    bilibili_watch_targets: list[dict] = Field(default_factory=default_bilibili_watch_targets, max_length=30)
+    bilibili_watch_calendars: dict = Field(default_factory=default_bilibili_watch_calendars)
     tieba_forums: list[str] = Field(default_factory=lambda: ['绝区零内鬼'], max_length=10)
     tieba_interests: list[str] = Field(default_factory=lambda: ['绝区零', '有趣的游戏讨论', '角色趣事', '梗图'], max_length=30)
     tieba_interest_sensitivity: int = Field(default=70, ge=0, le=100)
@@ -336,16 +435,109 @@ class Settings(BaseModel):
     tieba_images_limit: int = Field(default=100, ge=1, le=500)
     tieba_archive_enabled: bool = True
     tieba_archive_limit_mb: int = Field(default=512, ge=64, le=4096)
-    expected_wechat_version: Literal["4.1.0.16", "4.1.1.8"] = "4.1.0.16"
+    expected_wechat_version: Literal["4.1.0.16", "4.1.1.8", "4.1.13.26"] = "4.1.0.16"
 
     @field_validator("allowed_chat_ids", "keywords", "trigger_only_chat_ids", "interest_keywords", "moments_topics", "moments_friend_ids",
                      "tieba_forums", "tieba_interests", "tieba_share_chat_ids", "growth_interests", "bilibili_interest_seeds",
-                     "proactive_chat_ids", "proactive_strict_chat_ids", "owner_ids")
+                     "bilibili_excluded_topics", "bilibili_reply_allowed_sender_mids", "bilibili_watch_chat_ids", "proactive_chat_ids", "proactive_strict_chat_ids", "owner_ids", "intimate_friend_ids")
     @classmethod
     def clean_strings(cls, values):
         if any(not v.strip() or len(v) > 200 for v in values):
             raise ValueError("列表项必须为非空文本且不超过 200 字符")
         return list(dict.fromkeys(v.strip() for v in values))
+
+    @field_validator("bilibili_reply_allowed_sender_mids")
+    @classmethod
+    def valid_bilibili_mids(cls, values):
+        import re
+        cleaned = []
+        for raw in values:
+            v = str(raw or '').strip()
+            match = (
+                re.fullmatch(r'([1-9][0-9]{0,19})(?:\s*(?:#|//|\(|（|:|：|\s).*)?', v)
+                or re.fullmatch(r'[^-\d][^:：]{0,60}[:：]\s*([1-9][0-9]{0,19})(?:\s*(?:#|//|\(|（|\s).*)?', v)
+            )
+            if not match:
+                raise ValueError("B站白名单 UID 必须为正整数数字编号")
+            cleaned.append(match.group(1))
+        return list(dict.fromkeys(cleaned))
+
+    @field_validator("bilibili_watch_targets")
+    @classmethod
+    def valid_bilibili_watch_targets(cls, values):
+        import re
+        if not isinstance(values, list):
+            raise ValueError("追更账号列表格式无效")
+        cleaned = []
+        seen = set()
+        for raw in values:
+            if not isinstance(raw, dict):
+                raise ValueError("追更账号项必须为对象")
+            raw_mid = str(raw.get("mid") or "").strip()
+            match = re.fullmatch(r'([1-9][0-9]{0,19})', raw_mid)
+            if not match:
+                raise ValueError("追更账号 UID 必须为正整数")
+            mid = match.group(1)
+            if mid in seen:
+                continue
+            seen.add(mid)
+            game = str(raw.get("game") or "all").strip()
+            if game not in ("genshin", "starrail", "zzz", "all"):
+                raise ValueError("追更游戏分类无效")
+            kind = str(raw.get("kind") or "summary_up").strip()
+            if kind not in ("official", "summary_up"):
+                raise ValueError("追更账号类型无效")
+            name = str(raw.get("name") or f"UID {mid}").replace("\n", " ").replace("\r", " ").strip()[:80]
+            if not name:
+                name = f"UID {mid}"
+            cleaned.append({
+                "mid": mid,
+                "name": name,
+                "game": game,
+                "kind": kind,
+                "enabled": bool(raw.get("enabled", True)),
+            })
+        return cleaned
+
+    @field_validator("bilibili_watch_calendars")
+    @classmethod
+    def valid_bilibili_watch_calendars(cls, values):
+        from datetime import date
+        if not isinstance(values, dict):
+            raise ValueError("三游版本日历格式无效")
+        defaults = default_bilibili_watch_calendars()
+        cleaned = {}
+        for game, default_cfg in defaults.items():
+            raw = values.get(game)
+            if raw is None:
+                cleaned[game] = dict(default_cfg)
+                continue
+            if not isinstance(raw, dict):
+                raise ValueError(f"{game} 日历配置格式无效")
+            anchor_str = str(raw.get("anchor_date") or default_cfg["anchor_date"]).strip()
+            try:
+                date.fromisoformat(anchor_str)
+            except ValueError as exc:
+                raise ValueError(f"{game} 基准日期需为 YYYY-MM-DD 格式") from exc
+            try:
+                cycle_days = int(raw.get("cycle_days", default_cfg["cycle_days"]))
+                lead_days = int(raw.get("preview_lead_days", default_cfg["preview_lead_days"]))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{game} 周期天数需为整数") from exc
+            if not (21 <= cycle_days <= 84):
+                raise ValueError(f"{game} 版本周期需在 21～84 天之间")
+            if not (5 <= lead_days <= 25):
+                raise ValueError(f"{game} 前瞻提前天数需在 5～25 天之间")
+            version = str(raw.get("version") or default_cfg["version"]).strip()[:24]
+            if not version:
+                version = default_cfg["version"]
+            cleaned[game] = {
+                "version": version,
+                "anchor_date": anchor_str,
+                "cycle_days": cycle_days,
+                "preview_lead_days": lead_days,
+            }
+        return cleaned
 
     @field_validator("api_url", "image_api_url")
     @classmethod
@@ -357,6 +549,30 @@ class Settings(BaseModel):
             protocol='HTTP 或 HTTPS' if info.field_name=='api_url' else 'HTTPS'
             raise ValueError('模型接口需使用不含内嵌凭据、查询参数或片段的 '+protocol+' 地址')
         return value.rstrip("/")
+
+    @field_validator("image_unrestricted_api_url")
+    @classmethod
+    def valid_unrestricted_image_api_url(cls, value):
+        value = (value or '').strip()
+        if not value:
+            return ''
+        parsed = urlsplit(value)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username is not None or parsed.fragment or parsed.query:
+            raise ValueError('无限制生图接口需使用不含内嵌凭据、查询参数或片段的 HTTP 或 HTTPS 地址')
+        return value.rstrip('/')
+
+    @field_validator("image_unrestricted_model")
+    @classmethod
+    def clean_unrestricted_image_model(cls, value):
+        return (value or '').strip()
+
+    @field_validator('image_size')
+    @classmethod
+    def cap_image_size(cls, value):
+        capped = cap_base_size(value)
+        if capped != value:
+            raise ValueError(f'图片基础分辨率最长边不得超过 {MAX_EDGE}px')
+        return value
 
     @field_validator('moments_asset_ids')
     @classmethod
@@ -379,16 +595,30 @@ def private_write(path: Path, value: str):
 
 class Config:
     def __init__(self, directory: Path):
+        self.lock=threading.RLock()
         self.directory = directory
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = directory / "settings.json"
         if self.path.exists():
             saved = json.loads(self.path.read_text("utf-8"))
+            # Accept old contradictory windows in memory, without silently
+            # rewriting settings or making an existing install unbootable.
+            if isinstance(saved, dict):
+                cap = saved.get('debounce_max_seconds', 4)
+                single = saved.get('debounce_single_seconds', .65)
+                burst = saved.get('debounce_burst_seconds', 1.6)
+                if all(isinstance(v, (int, float)) for v in (cap, single, burst)) and 0 < cap < max(single, burst):
+                    saved['debounce_max_seconds'] = max(single, burst)
             # Keep legacy settings within the configurable context window.
             if isinstance(saved, dict) and isinstance(saved.get("context_messages"), int):
                 saved["context_messages"] = max(10, min(100, saved["context_messages"]))
+            if isinstance(saved, dict) and isinstance(saved.get('image_size'), str):
+                previous_image_size = saved['image_size']
+                saved['image_size'] = cap_base_size(previous_image_size)
+                if saved['image_size'] != previous_image_size:
+                    private_write(self.path, json.dumps(saved, ensure_ascii=False))
             self.active_model_profile = (saved.get('active_model_profile') if isinstance(saved, dict) else '') or self._infer_profile_id(saved)
-            if self.active_model_profile not in MODEL_PROFILE_IDS:
+            if not valid_model_profile_id(self.active_model_profile):
                 self.active_model_profile = 'custom'
             if isinstance(saved, dict):
                 saved.pop('active_model_profile', None)
@@ -467,8 +697,13 @@ class Config:
 
     def _write_model_profiles(self):
         private_write(self._model_profiles_path, json.dumps({
+            'version': 2,
             'active': self.active_model_profile,
-            'profiles': {key: value.model_dump() for key, value in self._model_profiles.items()},
+            # Original releases can still read the four legacy connection
+            # records. New presentation/pricing metadata stays separate.
+            'profiles': {key: value.connection_settings() for key, value in self._model_profiles.items()},
+            'metadata': {key: {'name':value.name,'pricing':value.pricing.model_dump()}
+                         for key,value in self._model_profiles.items()},
         }, ensure_ascii=False, indent=2))
 
     def _load_model_profiles(self):
@@ -478,11 +713,13 @@ class Config:
             try:
                 raw = json.loads(self._model_profiles_path.read_text('utf-8'))
                 source = raw.get('profiles') if isinstance(raw, dict) and isinstance(raw.get('profiles'), dict) else raw
-                if isinstance(raw, dict) and raw.get('active') in MODEL_PROFILE_IDS:
+                metadata = raw.get('metadata') if isinstance(raw,dict) and isinstance(raw.get('metadata'),dict) else {}
+                if isinstance(raw, dict) and valid_model_profile_id(raw.get('active')):
                     self.active_model_profile = raw['active']
-                for key in MODEL_PROFILE_IDS:
-                    if isinstance(source, dict) and isinstance(source.get(key), dict):
-                        defaults[key] = ModelProfile.model_validate(source[key])
+                for key,value in source.items() if isinstance(source,dict) else ():
+                    if valid_model_profile_id(key) and isinstance(value,dict):
+                        meta=metadata.get(key) if isinstance(metadata.get(key),dict) else {}
+                        defaults[key] = ModelProfile.model_validate({**value,**meta})
             except (OSError, ValueError, TypeError):
                 migrated = True
         else:
@@ -499,13 +736,14 @@ class Config:
         # cards without changing the active runtime configuration.
         if migrated:
             self._write_model_profiles()
-        if self.active_model_profile not in MODEL_PROFILE_IDS:
+        if self.active_model_profile not in self._model_profiles:
             self.active_model_profile = 'custom'
 
     def model_profiles_public(self):
         keys = self._load_model_keys()
         return {
-            key: {**profile.model_dump(), 'api_key_configured': bool(keys.get(key))}
+            key: {**profile.model_dump(), 'name':profile.name or MODEL_PROFILE_NAMES.get(key) or profile.model,
+                  'api_key_configured': bool(keys.get(key))}
             for key, profile in self._model_profiles.items()
         }
 
@@ -513,7 +751,7 @@ class Config:
         """A copy of a saved card, without activating it or reading its secret."""
         if profile_id not in self._model_profiles:
             raise ValueError('模型卡片不存在')
-        return self._model_profiles[profile_id].model_copy()
+        return self._model_profiles[profile_id].model_copy(deep=True)
 
     def authorize_admin(self, supplied):
         if not supplied or len(supplied)>1024:
@@ -564,10 +802,10 @@ class Config:
         # never inherit another card's legacy key, including after a restart.
         return ''
 
-    def save_model_profile(self, profile_id: str, profile: ModelProfile, api_key: str = '', activate: bool = True):
-        if profile_id not in MODEL_PROFILE_IDS:
+    def save_model_profile(self, profile_id: str, profile: ModelProfile, api_key: str = '', activate: bool = True, *, create=False):
+        if not valid_model_profile_id(profile_id) or (profile_id not in self._model_profiles and not create):
             raise ValueError('模型卡片不存在')
-        profile = ModelProfile.model_validate(profile)
+        profile = ModelProfile.model_validate(profile).model_copy(deep=True)
         supplied_key = api_key.strip()
         existing_key = self.api_key(profile_id)
         if activate and self.settings.enabled and not (supplied_key or existing_key):
@@ -581,9 +819,32 @@ class Config:
             self.active_model_profile = profile_id
         self._write_model_profiles()
         if activate:
-            updated = self.settings.model_copy(update=profile.model_dump())
+            updated = self.settings.model_copy(update=profile.connection_settings())
             self.save(updated, profile_id=profile_id)
         return self.public()
+
+    def create_model_profile(self, profile: ModelProfile, api_key: str = '', *, activate=False):
+        identity='model-'+uuid.uuid4().hex[:16]
+        return identity,self.save_model_profile(identity,profile,api_key,activate,create=True)
+
+    def pricing_for_request(self, *, api_url, model, api_key='', profile_id=None):
+        """Freeze the selected card's non-secret rates when an engine is built."""
+        from .upstream.ai_engine import AIEngine
+        def matches(identity):
+            p=self._model_profiles[identity]
+            return (p.model==model and
+                AIEngine._normalize_api_url(p.api_url,AIEngine._resolve_api_style(p.api_url,p.api_style)) == api_url and
+                (not api_key or hmac.compare_digest(self.api_key(identity).encode(),api_key.encode())))
+        if profile_id and profile_id in self._model_profiles and matches(profile_id):
+            choices=[profile_id]
+        elif self.active_model_profile in self._model_profiles and matches(self.active_model_profile):
+            choices=[self.active_model_profile]
+        else:
+            choices=[identity for identity in self._model_profiles if matches(identity)]
+        if len(choices)!=1:return {}
+        identity=choices[0];p=self._model_profiles[identity]
+        return {'profile_id':identity,'name':p.name or MODEL_PROFILE_NAMES.get(identity) or p.model,
+                'pricing':p.pricing.model_dump()}
 
     def image_api_key(self):
         path = self.directory / 'image-api-key.enc'
@@ -592,6 +853,14 @@ class Config:
     def save_image_key(self, key):
         if key.strip():
             private_write(self.directory / 'image-api-key.enc', self.fernet.encrypt(key.strip().encode()).decode())
+
+    def unrestricted_image_api_key(self):
+        path = self.directory / 'unrestricted-image-api-key.enc'
+        return self.fernet.decrypt(path.read_bytes()).decode() if path.exists() else ''
+
+    def save_unrestricted_image_key(self, key):
+        if key.strip():
+            private_write(self.directory / 'unrestricted-image-api-key.enc', self.fernet.encrypt(key.strip().encode()).decode())
 
     def search_api_key(self):
         path = self.directory / 'search-api-key.enc'
@@ -615,11 +884,22 @@ class Config:
         private_write(self.directory / 'tieba-credentials.enc', self.fernet.encrypt(json.dumps(values).encode()).decode())
 
     def save(self, settings: Settings, api_key: str = "", *, profile_id: str | None = None):
+        with self.lock:
+            return self._save(settings,api_key,profile_id=profile_id)
+
+    def _save(self, settings: Settings, api_key: str = "", *, profile_id: str | None = None):
+        settings = Settings.model_validate(settings.model_dump())
+        image_size = cap_base_size(settings.image_size)
+        if image_size != settings.image_size:
+            settings = settings.model_copy(update={'image_size': image_size})
         if settings.enabled and not settings.allowed_chat_ids:
             raise ValueError("先选择允许回复的会话")
         profile_id = profile_id or self.active_model_profile
-        if profile_id not in MODEL_PROFILE_IDS:
+        if profile_id not in self._model_profiles:
             raise ValueError('模型卡片不存在')
+        worker=settings.growth_internet_model_profile
+        if worker!='current' and worker not in self._model_profiles:
+            raise ValueError('自主学习所用的模型配置不存在')
         if settings.enabled and not (api_key.strip() or self.api_key(profile_id)):
             raise ValueError("先配置模型 API Key")
         if api_key.strip():
@@ -628,7 +908,9 @@ class Config:
             self._save_model_keys(keys)
             private_write(self.directory / "api-key.enc", self.fernet.encrypt(api_key.strip().encode()).decode())
         self.active_model_profile = profile_id
-        self._model_profiles[profile_id] = self._profile_from_settings(settings)
+        profile=self._profile_from_settings(settings)
+        previous=self._model_profiles[profile_id]
+        self._model_profiles[profile_id]=profile.model_copy(update={'name':previous.name,'pricing':previous.pricing})
         self._write_model_profiles()
         private_write(self.path, settings.model_dump_json(indent=2))
         self.sync_authority(settings)
@@ -658,4 +940,5 @@ class Config:
                 'model_profiles': self.model_profiles_public(),
                 "api_key_configured": bool(self.api_key()),
                 "image_api_key_configured": bool(self.image_api_key()),
+                "image_unrestricted_api_key_configured": bool(self.unrestricted_image_api_key()),
                 "search_api_key_configured": bool(self.search_api_key())}

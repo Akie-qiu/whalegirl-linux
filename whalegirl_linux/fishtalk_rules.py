@@ -20,6 +20,10 @@ TAIL = re.compile(r'^(?:希望(?:这|以上)(?:些|的内容|的回答|的说明
     r'(?:对你|能)(?:有|有所|提供)?帮助[哦呀哈呢～~]*|'
     r'(?:如果|若)(?:你)?(?:还有|有)(?:其他|任何)?(?:问题|疑问|需求)[，,]?'
     r'(?:可以|请|欢迎)?随时(?:向我)?(?:提问|咨询|告诉我|联系我))$')
+NAGGING_RE = re.compile(
+    r'(?:别熬|少熬|早点睡|快去睡|赶紧睡|熬到天亮|别太晚|'
+    r'几点了.{0,8}(?:睡|熬|歇)|还(?:没|不)睡.{0,6}(?:呀|嘛|吗)|熬夜.{0,6}(?:伤|不好|累))'
+)
 
 # Addresses and grammatical glue must not become alleged character faults.
 # The detector discovers repeated wording, rather than banning affective words.
@@ -100,6 +104,41 @@ def repeated_expressions(turns, *, limit=3):
     return [{'text': text, 'turns': count} for text, count in chosen]
 
 
+def _is_question_turn(text):
+    lines = [line.strip().rstrip('~～"”\'’ ') for line in str(text or '').splitlines() if line.strip()]
+    return any(line.endswith(('？', '?')) for line in lines)
+
+
+def _is_two_part_turn(text):
+    raw = str(text or '').strip()
+    # Genuine ellipsis pauses or playful tilde endings are soft voice beats,
+    # not mechanical "short reaction + explanation/interrogation" templates.
+    if '……' in raw or '...' in raw or '…' in raw or raw.endswith(('~', '～')):
+        return False
+    clean = raw.strip('。！!？?~～ ')
+    lines = [line.strip() for line in clean.splitlines() if line.strip()]
+    if len(lines) == 2 and 2 <= len(lines[0]) <= 16 and len(lines[1]) >= 5:
+        return True
+    if not lines or len(lines) > 1 or not (8 <= len(clean) <= 38):
+        return False
+    if '，' in clean or ',' in clean:
+        parts = [p.strip() for p in re.split(r'[，,]', clean) if p.strip()]
+        return (
+            len(parts) == 2 and 2 <= len(parts[0]) <= 12
+            and 5 <= len(parts[1]) <= 24
+            and (raw.endswith(('？', '?')) or '?' in parts[1] or '？' in parts[1])
+        )
+    parts = [p.strip() for p in re.split(r'\s+', clean) if p.strip()]
+    return len(parts) == 2 and 2 <= len(parts[0]) <= 17 and 5 <= len(parts[1]) <= 24
+
+
+def _opener_prefix4(text):
+    clean = ADDRESSES.sub(' ', str(text or ''))
+    clean = re.sub(r'^\[[^\]]{1,12}\]\s*', '', clean).lstrip(' ，,。！!？?~～…')
+    m = re.match(r'[\u3400-\u9fff]{4,}', clean)
+    return m[0][:4] if m else ''
+
+
 def check(text, *, previous=(), examples=(), literal=False, recurring=()):
     value = str(text or '')
     masked = mask_quoted(value)
@@ -113,6 +152,17 @@ def check(text, *, previous=(), examples=(), literal=False, recurring=()):
     for code, pattern in PATTERNS.items():
         if pattern.search(masked):
             notes.append(code)
+    if not literal and previous:
+        prev_masked = [mask_quoted(old) for old in previous[:6]]
+        if _is_question_turn(masked) and sum(1 for old in prev_masked[:3] if _is_question_turn(old)) >= 2:
+            notes.append('question_streak')
+        if _is_two_part_turn(masked) and sum(1 for old in prev_masked[:4] if _is_two_part_turn(old)) >= 2:
+            notes.append('two_part_rut')
+        lead = _opener_prefix4(masked)
+        if len(norm(masked)) >= 6 and lead and any(_opener_prefix4(old) == lead for old in prev_masked):
+            notes.append('fast_opener_repeat')
+        if NAGGING_RE.search(masked) and any(NAGGING_RE.search(old) for old in prev_masked[:5]):
+            notes.append('nagging_streak')
     if not literal and any(norm(item['text']) in norm(masked) for item in recurring):
         issues.append('repeated_expression')
     if not literal and len(norm(masked)) >= 12:

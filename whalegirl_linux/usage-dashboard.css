@@ -1,0 +1,40 @@
+.usage-dashboard { --usage-blue:#1043ab; --usage-pink:#b76f78; --usage-teal:#357f86; }
+.usage-dashboard .usage-filters { display:flex; flex-wrap:wrap; align-items:end; gap:12px; margin:4px 0 28px; }
+.usage-dashboard .usage-filters label { flex:1 1 150px; max-width:260px; display:grid; gap:5px; }
+.usage-dashboard .usage-filters .usage-auto { display:flex; align-items:center; gap:7px; flex:0 0 auto; padding:8px 0; }
+.usage-dashboard .usage-filters button { flex:0 0 auto; }
+.usage-dashboard .usage-metrics { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:24px; padding:20px 0 24px; border-block:1px solid var(--line,#e3eaf3); }
+.usage-dashboard .usage-metric { display:flex; flex-direction:column; gap:5px; min-width:0; }
+.usage-dashboard .usage-metric strong { font-size:28px; font-weight:550; line-height:1.35; letter-spacing:-.5px; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
+.usage-dashboard .usage-metric small { color:var(--muted,#617085); font-size:12px; }
+.usage-dashboard .usage-metric span { font-size:13px; color:var(--muted,#617085); }
+.usage-dashboard .usage-cost-value { color:var(--usage-blue); }
+.usage-dashboard .usage-submetrics { display:flex; flex-wrap:wrap; gap:8px 24px; margin:18px 0; font-size:13px; }
+.usage-dashboard .usage-submetrics strong { font-weight:550; margin-left:6px; font-variant-numeric:tabular-nums; }
+.usage-dashboard .usage-chart { margin:30px 0; min-width:0; }
+.usage-dashboard .usage-chart h3 { margin:0 0 16px; }
+.usage-dashboard .usage-chart svg { display:block; width:100%; height:230px; overflow:visible; }
+.usage-dashboard .usage-legend { display:flex; flex-wrap:wrap; gap:18px; font-size:12px; color:var(--muted,#617085); margin:0 0 16px; }
+.usage-dashboard .usage-legend span { display:flex; align-items:center; gap:7px; }
+.usage-dashboard .usage-legend i { width:8px; height:8px; border-radius:50%; background:var(--series); }
+.usage-dashboard .usage-chart text { fill:var(--muted,#617085); font:11px "Noto Sans SC","Microsoft YaHei",sans-serif; }
+.usage-dashboard .usage-chart .usage-grid { stroke:var(--line,#e3eaf3); stroke-dasharray:3 5; }
+.usage-dashboard .usage-table-wrap { overflow-x:auto; margin:12px 0 28px; scrollbar-width:thin; }
+.usage-dashboard table { width:100%; border-collapse:collapse; font-size:13px; background:transparent; }
+.usage-dashboard th,.usage-dashboard td { text-align:left; vertical-align:top; border-bottom:1px solid var(--line,#e3eaf3); padding:12px 14px 12px 0; font-variant-numeric:tabular-nums; }
+.usage-dashboard th { font-weight:500; color:var(--muted,#617085); white-space:nowrap; }
+.usage-dashboard td { min-width:70px; }
+.usage-dashboard td:first-child { min-width:150px; overflow-wrap:anywhere; }
+.usage-dashboard .usage-status { font-size:12px; color:var(--muted,#617085); margin:14px 0; }
+.usage-dashboard .usage-error { color:var(--danger,#a0473f); }
+.usage-dashboard .usage-empty { padding:36px 0; color:var(--muted,#617085); text-align:center; }
+.usage-dashboard .usage-notes { font-size:12px; color:var(--muted,#617085); line-height:1.9; }
+.usage-dashboard .usage-operation { display:grid; grid-template-columns:minmax(100px,1fr) minmax(100px,3fr) auto; align-items:center; gap:14px; padding:9px 0; font-size:13px; }
+.usage-dashboard .usage-operation-track { height:5px; background:#e9eff7; border-radius:3px; overflow:hidden; }
+.usage-dashboard .usage-operation-track i { display:block; height:100%; background:#779bce; }
+@media(max-width:650px) {
+  .usage-dashboard .usage-metrics { grid-template-columns:repeat(2,minmax(0,1fr)); gap:20px 14px; }
+  .usage-dashboard .usage-metric strong { font-size:23px; }
+  .usage-dashboard .usage-filters label { max-width:none; flex-basis:40%; }
+  .usage-dashboard .usage-chart svg { height:210px; }
+}

@@ -60,6 +60,24 @@ class PartialDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.get(event['key'])['state'],'failed')
         self.assertEqual(self.runtime.safety.state('account')['consecutive_failures'],2)
 
+    async def test_unsubmitted_sticker_failure_is_skipped_without_pausing_and_later_text_is_sent(self):
+        event=self.event();self.queue(event)
+        async def failed(*a):
+            return Receipt(False,error='Requested favorite is outside the currently exposed native page',
+                definite_failure=True,attempts=2,
+                details={'kind':'sticker','submit_state':'failed_before_send'})
+        self.gateway.send_sticker=failed
+        await self.answer([{'type':'text','text':'先说的话'}, {'type':'sticker','id':'a'*32},
+                           {'type':'text','text':'再补一句'}])
+        self.assertEqual(self.gateway.sent,[('text','先说的话'),('text','再补一句')])
+        self.assertEqual([a['state'] for a in self.store.actions(event['key'])],['sent','failed','sent'])
+        self.assertEqual(self.store.get(event['key'])['state'],'partial')
+        self.assertFalse(self.runtime.safety.held('account'))
+        self.assertEqual(self.runtime.safety.state('account').get('consecutive_failures',0),0)
+        codes=[r['code'] for r in self.store.db.execute(
+            "SELECT code FROM safety_events WHERE account='account' ORDER BY id DESC LIMIT 5")]
+        self.assertIn('sticker_pre_send_failed',codes)
+
 
 class GatewayDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_sticker_preflight_read_retries_without_submitting_a_duplicate(self):
@@ -103,6 +121,43 @@ class GatewayDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(receipt.confirmed)
         self.assertEqual(receipt.attempts,2)
         self.assertEqual(calls,2)
+
+    async def test_virtualized_picker_failure_is_not_retried(self):
+        from pathlib import Path
+        from whalegirl_linux.gateway import UIJobError
+        gateway=AgentGateway('http://127.0.0.1:6175','test');gateway.ui_jobs_directory=Path('.')
+        calls=[]
+        async def job(*args,**kwargs):
+            calls.append(args)
+            raise UIJobError('Requested favorite is outside the currently exposed native page',
+                              'failed_before_send')
+        async def messages(*args,**kwargs):return []
+        gateway.messages=messages;gateway.ui_job=job
+        try:
+            receipt=await gateway.send_sticker('chat','a'*32)
+            self.assertFalse(receipt.confirmed)
+            self.assertTrue(receipt.definite_failure)
+            self.assertFalse(receipt.retryable)
+            self.assertEqual((receipt.attempts,len(calls)),(1,1))
+        finally:await gateway.close()
+
+    async def test_duplicate_sticker_button_failure_is_not_retried(self):
+        from pathlib import Path
+        from whalegirl_linux.gateway import UIJobError
+        gateway=AgentGateway('http://127.0.0.1:6175','test');gateway.ui_jobs_directory=Path('.')
+        calls=[]
+        async def job(*args,**kwargs):
+            calls.append(args)
+            raise UIJobError('Sticker button is not unique','failed_before_send')
+        async def messages(*args,**kwargs):return []
+        gateway.messages=messages;gateway.ui_job=job
+        try:
+            receipt=await gateway.send_sticker('chat','a'*32)
+            self.assertFalse(receipt.confirmed)
+            self.assertTrue(receipt.definite_failure)
+            self.assertFalse(receipt.retryable)
+            self.assertEqual((receipt.attempts,len(calls)),(1,1))
+        finally:await gateway.close()
 
     async def test_uncertain_sticker_result_is_never_retried(self):
         from pathlib import Path

@@ -11,6 +11,7 @@ import time
 
 from .memory import own_text
 from .image_references import same_author, reference_request
+from .settings import UNRESTRICTED_IMAGE_MAX_PER_DAY
 
 CHARACTER = 'whalegirl'
 
@@ -57,6 +58,22 @@ def requested_library_source(text):
     if re.search(r'生成(?:的)?图库|已生成(?:的)?(?:图片|照片|图)|以前生成(?:的)?(?:图片|照片|图)|之前生成(?:的)?(?:图片|照片|图)', text):
         return 'generated'
     return ''
+
+
+def unrestricted_image_requested(text):
+    """Return True only when the requester's own text explicitly asks for 无限制生图."""
+    text = str(text or '').strip()
+    if not text:
+        return False
+    for match in re.finditer(r'无限制\s*生图', text):
+        before = text[max(0, match.start() - 12):match.start()]
+        after = text[match.end():match.end() + 8]
+        if re.search(r'(?:不要|不用|不需要|别|不开启|不使用|无需|禁止|取消|关掉|关闭|停止|非|没让你|不是让你)\s*(?:使用|用|开|开启|走|调)?\s*$', before):
+            continue
+        if re.search(r'^\s*(?:不用|不要|别用|算了|取消|免了)', after):
+            continue
+        return True
+    return False
 
 
 class ImageTools:
@@ -106,7 +123,7 @@ class ImageTools:
             (first['account'], first['chat'], requester)).fetchall()
         return [{'id': r['id'], 'tool': 'generate_image' if r['kind'] == 'generate' else 'send_library_image',
                  'state': r['state'], 'prompt': r['prompt'][:500], 'submitted': bool(r['api_started']),
-                 'asset_id': r['asset_id'],
+                 'asset_id': r['asset_id'], 'unrestricted': bool(r['unrestricted']),
                  'subject_type': json.loads(r['tool_json'] or '{}').get('subject_type', 'other'),
                  'created': r['created']} for r in rows]
 
@@ -149,6 +166,11 @@ class ImageTools:
             '用户在催“发啊/直接发/换一张/再来张”时，承接这个人的最近索图要求执行，不反复确认或介绍功能。'
             '\n两个独立工具：send_library_image选下方上传图库、生成图库或贴吧素材中的确切asset_id（或用asset_ids一次选1～3个候选ID连发多张），已有生成图可反复发送，发送次数不限且不占生图额度；'
             'generate_image创建或编辑新图，只有它计入每日生图额度。希望复用旧图时优先选图库，不重复生成。'
+            '无限制生图独立开关：image_request中的"unrestricted"默认必须为false；'
+            f'只有当请求者本轮消息明确提到使用“无限制生图”（且下方unrestricted_enabled=true）时才设为true（每日按unrestricted_per_day独立计额，最高不超过{UNRESTRICTED_IMAGE_MAX_PER_DAY}张），'
+            '其余所有普通生图和修图需求一律保持unrestricted=false并走现有普通生图，严禁擅自猜测或自动切换。'
+            '若对方明确要求使用“无限制生图”但unrestricted_enabled=false、未配置或unrestricted_remaining=0，切勿改用普通生图凑数，'
+            '按实际情况简短说明原因（或由工具返回对应错误码后再自然说明）。'
             '上传图库、生成图库、贴吧素材是三个独立来源。对方点名其中一个来源时，只能从该来源选图；禁止拿其他图库替代，禁止把“发贴吧图片”等索图要求改成生图。'
             '模糊索图没有指定主体或内容时，直接选符合来源范围内created最大（最新入库）的图片；指定了内容时先精确匹配可见内容，再在匹配结果中优先选最新入库。'
             '默认在内容符合要求的前提下，优先最新加入图片库的图，按created从新到旧选；即使以前发过，也优先于更老但从未发过的图。'
@@ -163,11 +185,21 @@ class ImageTools:
             '若文字回复中答应发图或说“给你看这张/这几张”，必须同时填写image_request；若图库无匹配且不生图，文字必须如实说图库里没有，严禁空口说“这张凑合看”却让image_request为null。'
             '画自己时subject_type=self，服务端绑定角色参考图。问长相用外观设定自然回答；不要把海报或别的角色当成自己。'
             '那你画一张需结合当前请求者相关上下文补完整主体，subject_resolved=false时只问画什么。'
-            'scene_prompt必须是独立完整画面描述，不能仅填那你画一张，也不要把整段聊天当提示词。'
+            '【全部生图请求·精细画面描述】只要调用 generate_image（包含全部普通生图和无限制生图请求），scene_prompt 必须写出足够精细、具体的独立完整视觉描述，禁止只用一句空洞概括；应完整写明：'
+            '①主体外貌与神态细节（五官情绪、眼神视线、脸颊红晕或水光等细微状态）；'
+            '②服饰穿搭与面料材质（衣领袖口设计、面料褶皱纹理、配色与配饰状态）；'
+            '③具体肢体动作与朝向（头部与躯干角度、手指握持或触碰位置）；'
+            '④镜头景别与视角构图（特写/近景/中景/全身、仰拍/俯拍/平视、主体位置与景深虚实）；'
+            '⑤环境背景与道具陈设（地点时间、周边物件、气氛元素）；'
+            '⑥光影方向、冷暖色温与整体画风质感。'
+            '【去掉生图文字与字数限制】scene_prompt 不限字数、不限制长度，可以放心写细写全（只不要把整段无关闲聊原样复制进去）；'
+            '若画面本身需要牌匾、招牌、纸条、对话气泡、书名、衣物图案或屏幕文字，直接把完整文本写进 scene_prompt 即可，不限制图内文字的字数或语种。'
+            '描写自己玩手机、喝饮品或拿小物件时，优先写单手轻托侧边或将手机靠在抱枕/桌面、另一只手自然垂放或盖毯子，避免双手捧着手机凑近看或近景手指特写（每只手只画自然五指）。'
+            '居家、看手机、外出逛街等日常画面除非明确要求女仆装，否则主动换成蓝白居家卫衣、针织开衫、T恤等日常便服，不必每张都穿女仆裙。'
             '生成时自主选择aspect_ratio：1:1、4:3、3:4、16:9、9:16、3:2、2:3、4:5、5:4、2:1或1:2，按内容选横竖构图，用户明确指定时遵从。'
             '\nimage_request格式：{"tool":"send_library_image或generate_image","asset_id":"候选ID","asset_ids":["多张时可选1至3个候选ID"],'
-            '"subject_type":"self或other","subject_resolved":true,"search_query":"本次要找的画面内容，结合上下文消解那张/再来一张","scene_prompt":"完整画面要求",'
-            '"operation":"create/amend/cancel","reuse_previous":false,"aspect_ratio":"1:1","cast_ids":["可选已配置角色id"],'
+            '"subject_type":"self或other","subject_resolved":true,"search_query":"本次要找的画面内容，结合上下文消解那张/再来一张","scene_prompt":"精细完整的画面描述（外貌神态、服饰材质、动作姿态、构图视角、环境光影与画风质感，不限字数）",'
+            '"operation":"create/amend/cancel","reuse_previous":false,"unrestricted":false,"aspect_ratio":"1:1","cast_ids":["可选已配置角色id"],'
             '"task_id":"修改或取消已有任务的确切ID","reference_keys":[],"mode":"auto/edit/remix"}。'
             'reference_keys可选参考图片目录中的key；引用原图优先，修改原图时用edit。参数里的角色类型、素材ID和参考key必须与真实资料一致。'
             '\n查询画好了吗只根据任务状态聊天，不再提交。连续补充在尚未submitted时用amend更新同一单完整提示词；'
@@ -257,8 +289,14 @@ class ImageTools:
                 palette.append({k:asset[k] for k in ('id','source','name','description','scenes','character_id','character_variant')})
         references = self.images.references.chat_candidates(self.store,first,batch) if enabled else []
         quantity = re.search(r'(?:发|给|来|挑|选|要).{0,5}([123一二两三])张', original_query)
+        unrestricted_limit = self.images.unrestricted_daily_limit(s)
+        unrestricted_used = self.images.generation_count(unrestricted=True)
         context = {'candidates': palette, 'search_query':query[:500], 'tasks': tasks, 'reference_candidates':references, 'enabled': enabled,
                    'generation_per_day':s.image_per_day, 'generation_remaining':max(0,s.image_per_day-self.images.generation_count()),
+                   'unrestricted_enabled': bool(s.image_unrestricted_enabled),
+                   'unrestricted_per_day': unrestricted_limit,
+                   'unrestricted_remaining': max(0, unrestricted_limit - unrestricted_used),
+                   'unrestricted_requested': unrestricted_image_requested(original_query),
                    'library_send_limit':None,
                    'requested_source':source,
                    'explicit_lookup':explicit_lookup,
@@ -306,7 +344,7 @@ class ImageTools:
 
     def trace(self, first, result):
         safe = {k: result[k] for k in ('decision', 'ok', 'code', 'job_id', 'subject_type', 'variant',
-                                     'reference_count', 'operation', 'selected_asset_ids', 'rotated_count') if k in result}
+                                     'reference_count', 'operation', 'selected_asset_ids', 'rotated_count', 'unrestricted') if k in result}
         with self.store.lock:
             self.store.db.execute('INSERT OR REPLACE INTO picture_decisions VALUES(?,?,?,?,?,?)',
                 (first['key'], first['account'], first['chat'], first.get('sender_id') or first.get('sender', ''), time.time(), json.dumps(safe, ensure_ascii=False)))
@@ -441,9 +479,17 @@ class ImageTools:
             else:
                 if operation not in ('create', 'amend'):
                     raise ValueError('invalid_operation')
+                explicit_unrestricted = unrestricted_image_requested(text)
+                explicit_disable_unrestricted = bool(re.search(
+                    r'(?:不要|不用|不需要|别|不开启|不使用|取消|关掉|关闭|改回普通).{0,6}无限制\s*生图',
+                    text,
+                ))
+                use_unrestricted = bool(explicit_unrestricted)
+                if operation == 'create' and use_unrestricted and not self.config.settings.image_unrestricted_enabled:
+                    raise ValueError('无限制生图开关尚未开启，请先在后台图片设置打开开关')
                 plan = self.images.references.chat_plan(self.store, first, own, text, reference_keys=request.get('reference_keys') or [])
                 prompt = str(request.get('scene_prompt') or '').strip()
-                if not prompt or len(prompt) > 3000:
+                if not prompt:
                     raise ValueError('scene_unclear')
                 if operation == 'amend' and not task:
                     raise ValueError('unknown_task')
@@ -457,6 +503,17 @@ class ImageTools:
                     old = json.loads(job['reference_json'] or '{}')
                     if job['kind'] != 'generate' or job['state'] not in ('queued','generating') or job['api_started']:
                         raise ValueError('already_submitted')
+                    old_unrestricted = bool(job.get('unrestricted') or old.get('unrestricted'))
+                    if explicit_unrestricted:
+                        use_unrestricted = True
+                    elif explicit_disable_unrestricted:
+                        use_unrestricted = False
+                    else:
+                        use_unrestricted = old_unrestricted
+                    if use_unrestricted != old_unrestricted:
+                        _, _, _, limit = self.images._generation_route(self.config.settings, unrestricted=use_unrestricted)
+                        if self.images.generation_count(unrestricted=use_unrestricted) >= limit:
+                            raise ValueError(f'今日无限制生图任务已达上限（当前每日上限 {limit} 张）' if use_unrestricted else '今日生图任务已达上限')
                     if not request.get('cast_ids') and bool(old.get('character')) != (subject == 'self'):
                         raise ValueError('amend_subject_changed')
                     if request.get('cast_ids'):
@@ -468,9 +525,13 @@ class ImageTools:
                     if request.get('aspect_ratio'):
                         from .image_canvas import canvas
                         old['canvas'] = canvas((old.get('canvas') or {}).get('base_size', self.config.settings.image_size), request['aspect_ratio'])
+                    if use_unrestricted:
+                        old['unrestricted'] = True
+                    else:
+                        old.pop('unrestricted', None)
                     with self.store.lock:
-                        changed = self.store.db.execute("UPDATE picture_jobs SET prompt=?,reference_json=?,updated=? WHERE id=? AND state IN ('queued','generating') AND api_started=0",
-                            (prompt, json.dumps(old, ensure_ascii=False), time.time(), job['id'])).rowcount
+                        changed = self.store.db.execute("UPDATE picture_jobs SET prompt=?,reference_json=?,unrestricted=?,updated=? WHERE id=? AND state IN ('queued','generating') AND api_started=0",
+                            (prompt, json.dumps(old, ensure_ascii=False), int(use_unrestricted), time.time(), job['id'])).rowcount
                         self.store.db.commit()
                     if not changed:
                         raise ValueError('already_submitted')
@@ -480,9 +541,13 @@ class ImageTools:
                         raise ValueError('reference_not_available')
                     job_id = self.images.enqueue(kind='generate', prompt=prompt, chat=first['chat'], destination='chat',
                         source_key=first['key'], character=subject == 'self', mode=request.get('mode', 'auto'), chat_reference_plan=plan,
-                        aspect_ratio=request.get('aspect_ratio') or 'auto', cast_ids=request.get('cast_ids'))
+                        aspect_ratio=request.get('aspect_ratio') or 'auto', cast_ids=request.get('cast_ids'),
+                        unrestricted=use_unrestricted)
                 job_ids = [job_id]
+                result['unrestricted'] = bool(use_unrestricted)
             tool_data = {'subject_type': subject, 'operation': operation, 'tool': tool}
+            if tool == 'generate_image':
+                tool_data['unrestricted'] = bool(result.get('unrestricted'))
             if len(job_ids) > 1:
                 tool_data['job_ids'] = job_ids
             with self.store.lock:
@@ -500,7 +565,10 @@ class ImageTools:
             code = str(exc)
             # Do not copy user text, vendor errors or full prompts into decisions.
             if not re.fullmatch('[a-z_]+', code):
-                code = next((v for k,v in [('上限','daily_limit'),('参考图尚未配置','character_references_missing'),
+                code = next((v for k,v in [('无限制生图任务已达上限','unrestricted_daily_limit'),
+                    ('无限制生图开关尚未开启','unrestricted_disabled'),
+                    ('无限制生图接口','unrestricted_not_configured'),
+                    ('上限','daily_limit'),('参考图尚未配置','character_references_missing'),
                     ('参考图功能已关闭','references_disabled'),('生图接口尚未配置','generation_disabled'),
                     ('没找到','reference_not_found'),('引用没有原图','reference_not_found'),('数量对不上','reference_count_mismatch')]
                     if k in code), 'tool_unavailable')

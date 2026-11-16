@@ -21,16 +21,16 @@ class CompleteContextTests(unittest.IsolatedAsyncioTestCase):
     image=upgrade.UpgradeTests.image
 
     async def test_short_pronoun_question_keeps_all_recent_people_and_topics(self):
-        for i in range(1,45):
+        for i in range(1,145):
             self.message(i,person='alice' if i%2 else 'bob',content=f'背景{i:02} 在聊不同事情')
-        current=self.message(45,content='你说是不是');current['trigger']='direct'
+        current=self.message(145,content='你说是不是');current['trigger']='direct'
         messages,_,counts=await build_context(self.store,None,Settings(vision_enabled=False),current,[current],{})
         prompt=messages[0]['content']
-        self.assertEqual(counts['current_messages'],40)
-        self.assertEqual(counts['selected_history_messages'],39)
+        self.assertEqual(counts['current_messages'],100)
+        self.assertEqual(counts['selected_history_messages'],99)
         self.assertEqual(counts['context_mode'],'complete_recent')
-        for i in range(6,45):self.assertIn(f'背景{i:02}',prompt)
-        self.assertNotIn('背景05',prompt)
+        for i in range(46,145):self.assertIn(f'背景{i:02}',prompt)
+        self.assertNotIn('背景45',prompt)
         self.assertIn('账号ID=alice',prompt);self.assertIn('账号ID=bob',prompt)
 
     async def test_aliases_do_not_consume_limit_but_real_repeats_are_kept(self):
@@ -45,13 +45,33 @@ class CompleteContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(r['content']=='复读' for r in recent),5)
 
     async def test_long_record_cannot_evict_short_messages(self):
-        self.message(1,kind=49,content='长转发'*6000)
+        self.message(1,kind=1,content='长消息'*6000)
         for i in range(2,20):self.message(i,content=f'短消息{i:02}')
         current=self.message(20,content='这几个人刚刚聊什么')
         messages,_,counts=await build_context(self.store,None,Settings(vision_enabled=False,context_char_budget=4000),current,[current],{})
         self.assertEqual(counts['selected_history_messages'],19)
-        self.assertGreater(counts['context_truncated_messages'],0)
+        self.assertEqual(counts['context_truncated_messages'],0)
+        self.assertTrue(counts['context_over_character_threshold'])
+        self.assertTrue('长消息'*6000 in messages[0]['content'])
         for i in range(2,20):self.assertIn(f'短消息{i:02}',messages[0]['content'])
+
+    async def test_short_followup_does_not_load_an_old_digest_or_old_matching_message(self):
+        old=self.message(1,content='旧电脑驱动又蓝屏了',timestamp=time.time()-8*86400)
+        self.store.save_digest('account','a@chatroom','当时一直在聊旧电脑驱动和蓝屏。',old)
+        self.message(2,content='今天在做草莓蛋糕')
+        current=self.message(3,content='然后呢')
+        messages,_,counts=await build_context(self.store,None,Settings(vision_enabled=False,context_messages=10),current,[current],{})
+        self.assertFalse(counts['digest_included'])
+        self.assertEqual(counts['recalled_messages'],0)
+        self.assertIn('草莓蛋糕',messages[0]['content'])
+
+    async def test_explicit_old_topic_request_can_still_load_the_correct_digest(self):
+        old=self.message(1,content='旧电脑驱动又蓝屏了',timestamp=time.time()-8*86400)
+        self.store.save_digest('account','a@chatroom','当时一直在聊旧电脑驱动和蓝屏。',old)
+        current=self.message(2,content='还记得上次说的电脑驱动蓝屏吗')
+        _,_,counts=await build_context(self.store,None,Settings(vision_enabled=False),current,[current],{})
+        self.assertTrue(counts['digest_included'])
+        self.assertTrue(counts['history_recall_requested'])
 
     async def test_separate_image_caption_and_short_question_keep_same_person_image(self):
         photo=self.message(70,kind=3);self.image(photo)

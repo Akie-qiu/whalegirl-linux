@@ -168,6 +168,20 @@ class CorpusTests(unittest.TestCase):
         self.assertIn('角色卡', self.service.static_prompt())
         self.assertNotIn('压过', self.service.static_prompt())
 
+    def test_current_distress_selects_a_real_reply_pair_instead_of_old_game_examples(self):
+        self.human_rows()
+        self.store.observe([self.row(11,'今天考砸了，有点难过',person='alice'),
+                            self.row(12,'那先歇一会儿嘛',person='bob')])
+        self.service.rebuild('a@chatroom')
+        current=self.row(20,'面试没过，有点难过',person='alice')
+        diagnostics={}
+        prompt=self.service.dynamic_prompt(current,[current],diagnostics)
+        self.assertIn('那先歇一会儿嘛',prompt)
+        self.assertNotIn('再打两把',prompt)
+        self.assertIn('account/a@chatroom/12',diagnostics['sample_keys'])
+        self.assertLessEqual(diagnostics['sample_count'],2)
+        self.assertEqual(diagnostics['extra_model_requests'],0)
+
     def test_block_source_immediately_rebuilds_and_removes_context_quotes(self):
         rows = self.human_rows();self.service.rebuild('a@chatroom')
         blocked = rows[0]

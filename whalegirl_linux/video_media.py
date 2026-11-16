@@ -36,6 +36,16 @@ async def run_process(args,timeout):
         if process.returncode is None:process.kill();await process.wait()
 
 
+def clear_frame_files(work):
+    if work.is_symlink() or not work.is_dir():
+        return
+    resolved_work = work.resolve()
+    for path in work.iterdir():
+        if path.is_file() and not path.is_symlink() and re.fullmatch(r'frame-\d{6}\.jpg', path.name):
+            if path.resolve().parent == resolved_work:
+                path.unlink()
+
+
 def clear_workspace(root,work):
     # Only files created by this job. Unknown files/symlinks are never followed.
     if root.is_symlink() or work.is_symlink() or not re.fullmatch('[a-f0-9]{32}',work.name) or work.resolve().parent!=root.resolve():return
@@ -43,6 +53,17 @@ def clear_workspace(root,work):
         if path.is_file() and not path.is_symlink() and (path.name=='media.mp4' or re.fullmatch(r'frame-\d{6}\.jpg',path.name)):
             if path.resolve().parent==work.resolve():path.unlink()
     if not any(work.iterdir()):work.rmdir()
+
+
+def cleanup_media_cache(part_cache):
+    if not isinstance(part_cache, dict):
+        return
+    root = part_cache.pop('media_root', None)
+    work = part_cache.pop('media_work', None)
+    part_cache.pop('media_path', None)
+    part_cache.pop('media_key', None)
+    if isinstance(root, Path) and isinstance(work, Path) and root.exists() and work.exists():
+        clear_workspace(root, work)
 
 
 async def extract_frames(path,start,end,*,ffmpeg=None,ffprobe=None):
@@ -57,50 +78,77 @@ async def extract_frames(path,start,end,*,ffmpeg=None,ffprobe=None):
     except (ValueError,KeyError,IndexError,TypeError):raise BiliError('media_unavailable','媒体尺寸超出轻量解码范围') from None
     duration=max(.1,end-start);fps=min(2,120/duration)
     pattern=path.parent/'frame-%06d.jpg'
-    code,_=await run_process([ffmpeg,'-hide_banner','-loglevel','error','-nostdin','-threads','1','-filter_threads','1',
-        '-protocol_whitelist','file,pipe','-ss',str(start),'-i',str(path),'-t',str(duration),'-an',
-        '-vf','fps='+str(fps)+',scale=320:-2:flags=area','-frames:v','120','-q:v','5','-start_number','0',str(pattern)],25)
-    frames=[]
-    for file in sorted(path.parent.glob('frame-*.jpg'))[:120]:
-        if file.is_symlink() or not re.fullmatch(r'frame-\d{6}\.jpg',file.name) or file.stat().st_size>512*1024:continue
-        stamp=start+int(file.stem.split('-')[1])/fps
-        if stamp>=end:continue
-        raw=file.read_bytes()
-        if raw.startswith(b'\xff\xd8'):frames.append({'time':round(stamp,3),'jpeg':raw,'time_tolerance':round(1/fps,3)})
-    if not frames:raise BiliError('media_unavailable','本次未取得有效解码帧，使用快照模式')
-    return frames,{'media_mode':'ffmpeg_local','decoder_completed':code==0,'decoder_exit_code':code,'sample_fps':fps,
-        'timestamp_precision':'resampled_seek_relative','timestamp_tolerance_seconds':round(1/fps,3),
-        'decoded_sample_start':frames[0]['time'],'decoded_sample_end':frames[-1]['time'],
-        'decoder_threads':1,'decoder_timeout_seconds':25}
-
-
-async def media_frames(client,config,bvid,cid,start,end,budget):
-    if not config.settings.bilibili_media_enabled or not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
-        raise BiliError('media_unavailable','未启用或缺少FFmpeg，使用官方快照降级')
-    if os.name=='posix':
-        available=next((int(line.split()[1]) for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:')),0)
-        if available<192*1024:raise BiliError('media_unavailable','空闲内存不足，保留快照模式，不启动视频解码')
-    data=await client.api('/x/player/wbi/playurl',{'bvid':bvid,'cid':cid,'qn':16,'fnval':1,'fourk':0,'platform':'html5'},wbi=True,budget=budget)
-    candidates=[row for row in (data.get('durl') or []) if isinstance(row,dict)]
+    clear_frame_files(path.parent)
     try:
-        if not candidates:
-            candidates=[row for row in (data.get('dash') or {}).get('video',[]) if isinstance(row,dict) and 0<int(row.get('height') or 0)<=480]
-            candidates.sort(key=lambda row:int(row.get('bandwidth') or 0))
-    except (TypeError,ValueError):raise BiliError('media_unavailable','低清媒体参数未确认，使用快照模式') from None
-    if not candidates:raise BiliError('media_unavailable','没有取得普通账号可读取的低清媒体，不尝试解锁或更换提取器')
-    row=candidates[0];url=row.get('url') or row.get('baseUrl') or row.get('base_url')
-    if not isinstance(url,str) or not client.permitted(url,'media'):raise BiliError('media_unavailable','未提供获准的官方媒体地址，使用快照模式')
-    if len(data.get('durl') or [])>1:raise BiliError('media_unavailable','分段媒体需要额外拼接，保留快照降级')
-    cap=config.settings.bilibili_media_max_mb*1024**2
-    try:oversize=bool(row.get('size') and int(row['size'])>cap)
-    except (TypeError,ValueError):raise BiliError('media_unavailable','媒体体积未确认，使用快照模式') from None
-    if oversize:raise BiliError('media_unavailable','媒体体积超过本次轻量处理范围')
-    raw=await client.get(url,kind='media',budget=budget,cap=cap,json_body=False)
+        code,_=await run_process([ffmpeg,'-hide_banner','-loglevel','error','-nostdin','-threads','1','-filter_threads','1',
+            '-protocol_whitelist','file,pipe','-ss',str(start),'-i',str(path),'-t',str(duration),'-an',
+            '-vf','fps='+str(fps)+',scale=320:-2:flags=area','-frames:v','120','-q:v','5','-start_number','0',str(pattern)],25)
+        frames=[]
+        for file in sorted(path.parent.glob('frame-*.jpg'))[:120]:
+            if file.is_symlink() or not re.fullmatch(r'frame-\d{6}\.jpg',file.name) or file.stat().st_size>512*1024:continue
+            stamp=start+int(file.stem.split('-')[1])/fps
+            if stamp>=end:continue
+            raw=file.read_bytes()
+            if raw.startswith(b'\xff\xd8'):frames.append({'time':round(stamp,3),'jpeg':raw,'time_tolerance':round(1/fps,3)})
+        if not frames:raise BiliError('media_unavailable','本次未取得有效解码帧，使用快照模式')
+        return frames,{'media_mode':'ffmpeg_local','decoder_completed':code==0,'decoder_exit_code':code,'sample_fps':fps,
+            'timestamp_precision':'resampled_seek_relative','timestamp_tolerance_seconds':round(1/fps,3),
+            'decoded_sample_start':frames[0]['time'],'decoded_sample_end':frames[-1]['time'],
+            'decoder_threads':1,'decoder_timeout_seconds':25}
+    finally:
+        clear_frame_files(path.parent)
+
+
+async def media_frames(client,config,bvid,cid,start,end,budget,*,part_cache=None):
+    cache_key = (bvid, cid)
+    if isinstance(part_cache, dict):
+        if part_cache.get('media_key') == cache_key and part_cache.get('media_unavailable'):
+            raise BiliError('media_unavailable', part_cache['media_unavailable'])
+        cached_path = part_cache.get('media_path')
+        if part_cache.get('media_key') == cache_key and isinstance(cached_path, Path) and cached_path.is_file():
+            return await extract_frames(cached_path, start, end)
+    try:
+        if not config.settings.bilibili_media_enabled or not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
+            raise BiliError('media_unavailable','未启用或缺少FFmpeg，使用官方快照降级')
+        if os.name=='posix':
+            available=next((int(line.split()[1]) for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:')),0)
+            if available<192*1024:raise BiliError('media_unavailable','空闲内存不足，保留快照模式，不启动视频解码')
+        data=await client.api('/x/player/wbi/playurl',{'bvid':bvid,'cid':cid,'qn':16,'fnval':1,'fourk':0,'platform':'html5'},wbi=True,budget=budget)
+        candidates=[row for row in (data.get('durl') or []) if isinstance(row,dict)]
+        try:
+            if not candidates:
+                candidates=[row for row in (data.get('dash') or {}).get('video',[]) if isinstance(row,dict) and 0<int(row.get('height') or 0)<=480]
+                candidates.sort(key=lambda row:int(row.get('bandwidth') or 0))
+        except (TypeError,ValueError):raise BiliError('media_unavailable','低清媒体参数未确认，使用快照模式') from None
+        if not candidates:raise BiliError('media_unavailable','没有取得普通账号可读取的低清媒体，不尝试解锁或更换提取器')
+        row=candidates[0];url=row.get('url') or row.get('baseUrl') or row.get('base_url')
+        if not isinstance(url,str) or not client.permitted(url,'media'):raise BiliError('media_unavailable','未提供获准的官方媒体地址，使用快照模式')
+        if len(data.get('durl') or [])>1:raise BiliError('media_unavailable','分段媒体需要额外拼接，保留快照降级')
+        cap=config.settings.bilibili_media_max_mb*1024**2
+        try:oversize=bool(row.get('size') and int(row['size'])>cap)
+        except (TypeError,ValueError):raise BiliError('media_unavailable','媒体体积未确认，使用快照模式') from None
+        if oversize:raise BiliError('media_unavailable','媒体体积超过本次轻量处理范围')
+        raw=await client.get(url,kind='media',budget=budget,cap=cap,json_body=False)
+    except BiliError as err:
+        if isinstance(part_cache, dict) and err.code == 'media_unavailable':
+            part_cache['media_key'] = cache_key
+            part_cache['media_unavailable'] = str(err)
+        raise
     root=config.directory/'bilibili-work'
     if root.is_symlink():raise BiliError('cache_path','视频工作目录异常')
     root.mkdir(mode=0o700,exist_ok=True);work=root/uuid.uuid4().hex;work.mkdir(mode=0o700)
+    keep_for_cache = False
     try:
         target=work/'media.mp4';fd=os.open(target,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
         with os.fdopen(fd,'wb') as stream:stream.write(raw)
-        return await extract_frames(target,start,end)
-    finally:clear_workspace(root,work)
+        result = await extract_frames(target,start,end)
+        if isinstance(part_cache, dict):
+            part_cache['media_key'] = cache_key
+            part_cache['media_root'] = root
+            part_cache['media_work'] = work
+            part_cache['media_path'] = target
+            keep_for_cache = True
+        return result
+    finally:
+        if not keep_for_cache:
+            clear_workspace(root,work)

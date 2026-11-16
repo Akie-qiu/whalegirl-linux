@@ -30,6 +30,29 @@ def event(n=1,chat='a@chatroom',person='wxid_alice',text='我喜欢猫',**extra)
 
 
 class MemoryHubTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_or_unknown_tier_does_not_crash_recall_or_rewrite_source(self):
+        for tier in ('long_term', 'unexpected_legacy_value'):
+            with self.subTest(tier=tier):
+                row = self.remember(content='喜欢猫咪', tier='stable')
+                with self.store.lock, self.store.db:
+                    self.store.db.execute('UPDATE memories SET tier=? WHERE id=?', (tier, row['id']))
+                self.assertIn(row['id'], [r['id'] for r in self.recall('猫咪')])
+                saved = self.store.db.execute('SELECT tier FROM memories WHERE id=?', (row['id'],)).fetchone()[0]
+                self.assertEqual(saved, tier)
+
+    async def test_legacy_tier_is_normalized_on_revision_and_bad_explicit_tier_rejected(self):
+        row = self.remember(tier='long_term')
+        self.assertEqual(row['tier'], 'stable')
+        with self.store.lock, self.store.db:
+            self.store.db.execute("UPDATE memories SET tier='long_term' WHERE id=?", (row['id'],))
+        revised = self.book.change('account', self.config.settings.allowed_chat_ids,
+            {'op': 'update', 'id': row['id'], 'version': row['version'], 'content': '喜欢可爱的猫'})
+        self.assertEqual(revised['tier'], 'stable')
+        history = self.store.db.execute('SELECT count(*) FROM memory_revisions WHERE memory_id=?', (row['id'],)).fetchone()[0]
+        self.assertGreaterEqual(history, 2)
+        with self.assertRaisesRegex(ValueError, '等级无效'):
+            self.remember(tier='made_up')
+
     async def asyncSetUp(self):
         self.config=Config(directory())
         self.config.save(Settings(enabled=True,account_id='account',allowed_chat_ids=['a@chatroom','b@chatroom','wxid_alice'],
@@ -211,6 +234,63 @@ class MemoryHubTests(unittest.IsolatedAsyncioTestCase):
         self.learn(sources[0]);self.assertTrue(self.book.get('account',row['id'],self.config.settings.allowed_chat_ids)['locked'])
         diagnostics={};memory_parts(self.book,self.config.settings,sources[0],sources,diagnostics=diagnostics)
         self.assertLessEqual(diagnostics['estimated_tokens'],400)
+
+    async def test_owner_private_and_single_group_rules_do_not_leak_cross_chat(self):
+        self.config.save(self.config.settings.model_copy(update={
+            'owner_ids': ['wxid_owner'],
+            'allowed_chat_ids': ['wxid_owner', 'a@chatroom', 'b@chatroom'],
+            'learning_auto_accept': True,
+        }))
+        priv_src = event(10, 'wxid_owner', 'wxid_owner', '私聊时只娇不傲，平时说话也要软萌可爱')
+        grp_a_src = event(11, 'a@chatroom', 'wxid_owner', '在A群可以喊我老板')
+        b_other_src = event(12, 'b@chatroom', 'wxid_other', '今天吃什么呀')
+        self.store.observe([priv_src, grp_a_src, b_other_src])
+        self.book.change('account', self.config.settings.allowed_chat_ids, {
+            'chat': 'wxid_owner', 'subject': 'wxid_owner', 'kind': 'interaction_rule',
+            'scope': 'profile', 'content': '私聊完全敞开只娇不傲', 'venue': 'private',
+            'source_key': priv_src['key'],
+        }, actor='model', allowed_sources={priv_src['key']})
+        prop = self.runtime.learning.book.propose(
+            grp_a_src, [grp_a_src],
+            {'type': 'chat_style', 'scope': 'chat', 'subject': 'self',
+             'source_key': grp_a_src['key'], 'evidence': '在A群可以喊我老板',
+             'content': '在A群按主人玩笑喊老板', 'confidence': 0.95},
+            self.config.settings,
+        )
+        self.assertEqual(prop['state'], 'accepted')
+        dm_priv = self.runtime.learning.book.propose(
+            priv_src, [priv_src],
+            {'type': 'chat_style', 'scope': 'chat', 'subject': 'self',
+             'source_key': priv_src['key'], 'evidence': '私聊时只娇不傲',
+             'content': '单独私聊时完全黏人只娇不傲', 'confidence': 0.95},
+            self.config.settings,
+        )
+        self.assertEqual(dm_priv['state'], 'accepted')
+        dm_safe = self.runtime.learning.book.propose(
+            priv_src, [priv_src],
+            {'type': 'persona', 'scope': 'chat', 'subject': 'self',
+             'source_key': priv_src['key'], 'evidence': '平时说话也要软萌可爱',
+             'content': '保持18岁少女软萌自然口吻', 'confidence': 0.95},
+            self.config.settings,
+        )
+        self.assertEqual(dm_safe['state'], 'accepted')
+        b_recalled = self.hub.recall(
+            'account', self.config.settings.allowed_chat_ids, 'wxid_other', '今天吃什么呀',
+            chat='b@chatroom', subjects=['wxid_other'], shared=True, owner_ids=['wxid_owner'],
+        )
+        b_contents = [r['content'] for r in b_recalled]
+        self.assertNotIn('私聊完全敞开只娇不傲', b_contents)
+        self.assertNotIn('单独私聊时完全黏人只娇不傲', b_contents)
+        self.assertNotIn('在A群按主人玩笑喊老板', b_contents)
+        self.assertIn('保持18岁少女软萌自然口吻', b_contents)
+        owner_in_b = self.hub.recall(
+            'account', self.config.settings.allowed_chat_ids, 'wxid_owner', '在吗',
+            chat='b@chatroom', subjects=['wxid_owner'], shared=True, owner_ids=['wxid_owner'],
+        )
+        owner_in_b_contents = [r['content'] for r in owner_in_b]
+        self.assertNotIn('私聊完全敞开只娇不傲', owner_in_b_contents)
+        self.assertNotIn('单独私聊时完全黏人只娇不傲', owner_in_b_contents)
+        self.assertNotIn('在A群按主人玩笑喊老板', owner_in_b_contents)
 
 
 class MemoryHubApiTests(unittest.TestCase):

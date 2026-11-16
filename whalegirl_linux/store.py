@@ -340,6 +340,10 @@ class Store:
         with self.lock:
             self.db.execute("UPDATE inbox SET state=?,reply=?,receipt=?,error=?,updated=? WHERE key=?",
                             (state, reply, receipt, error[:300], time.time(), key))
+            if '/bili-result:' in str(key) and self.db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bilibili_completion_notices'").fetchone():
+                self.db.execute('UPDATE bilibili_completion_notices SET state=?,updated=? WHERE inbox_key=?',
+                                (state,time.time(),key))
             self.db.commit()
 
     def baseline_exists(self, account, chat):
@@ -407,6 +411,24 @@ class Store:
                              (account,chat)).fetchone()[0] or 0
         return max(row[0] or 0,sent)
 
+    def recent_pat_targets(self, account, chat, seconds=45):
+        cutoff = time.time() - max(1, int(seconds or 45))
+        rows = self.db.execute(
+            "SELECT details_json FROM outbound_actions WHERE account=? AND chat=? "
+            "AND kind='pat' AND sent_at>=? AND state IN ('sent','sending','uncertain')",
+            (account, chat, cutoff),
+        ).fetchall()
+        targets = set()
+        for row in rows:
+            try:
+                details = json.loads(row['details_json'] or '{}')
+            except (TypeError, ValueError):
+                details = {}
+            tid = str(details.get('target_id') or '').strip()
+            if tid:
+                targets.add(tid)
+        return targets
+
     def context(self, account, chat, pairs):
         if not pairs:
             return []
@@ -416,7 +438,7 @@ class Store:
 
     def remember(self, event, reply):
         with self.lock:
-            turns = [("assistant", reply)] if event.get('trigger') in ('proactive', 'tieba_context') else [("user", event["content"]), ("assistant", reply)]
+            turns = [("assistant", reply)] if event.get('trigger') in ('proactive', 'tieba_context', 'bilibili_result', 'bilibili_watch') else [("user", event["content"]), ("assistant", reply)]
             for role, content in turns:
                 self.db.execute("INSERT INTO history(account,chat,role,content) VALUES(?,?,?,?)",
                                 (event["account"], event["chat"], role, content))

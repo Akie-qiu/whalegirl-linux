@@ -66,6 +66,13 @@ def topic_terms(text):
 
 
 def related_topic(query, candidate, *, min_hits=None):
+    # Short concrete concepts are often doubled in casual Chinese (猫猫、饭饭).
+    # Do not turn repeated pronouns, family addresses or particles into topics.
+    plain=unicodedata.normalize('NFKC',str(query or ''))
+    glue=set('我你他她它这那的了一是在不没好大小多少很太真对说看想来去妈爸姐妹哥弟宝哈呵嗯啊哦呀啦呢吧')
+    concepts={match[1] for match in re.finditer(r'([\u3400-\u9fff])\1',plain)}
+    if len(plain.strip())==1:concepts.add(plain.strip())
+    if any(concept not in glue and concept in str(candidate or '') for concept in concepts):return True
     query_terms = topic_terms(query)
     if not query_terms:
         return False
@@ -96,6 +103,58 @@ def has_explicit_reference(text, batch=()):
         if isinstance(payload.get('reply'), dict) and payload['reply'].get('serverId'):
             return True
     return False
+
+
+_MEMORY_REQUEST = re.compile(
+    r'还记得|记不记得|能记起|回忆|回想|查(?:一下|下)?(?:历史|记录|记忆)|'
+    r'(?:以前|之前|上次|上回|那次|去年|上个月|上周).{0,24}(?:说|聊|提|答应|约|发生|喜欢|做过)|'
+    r'(?:说|聊|提|答应|约|发生).{0,18}(?:以前|之前|上次|上回|去年|上周)'
+)
+
+
+def memory_requested(text):
+    """Long-term recall is different from a short reply to the preceding turn."""
+    return bool(_MEMORY_REQUEST.search(str(text or '')))
+
+
+def retrieval_focus(store, first, batch=()):
+    """Build optional reference queries, without filtering the recent dialogue.
+
+    The newest authored message/quote anchors retrieval. Elliptical follow-ups
+    can borrow a nearby human turn, never an old bot answer or an old digest.
+    This object stays local to the request; diagnostics must contain IDs only.
+    """
+    messages=sorted(batch or [first],key=lambda row:(float(row.get('timestamp') or 0),int(row.get('local_id') or 0)))
+    latest=messages[-1]
+    current=current_query([latest])
+    explicit=memory_requested(current)
+    try:quoted=bool((json.loads(latest.get('payload_json') or '{}').get('reply') or {}).get('content'))
+    except (TypeError,ValueError,AttributeError):quoted=False
+    continuation=is_followup(current) or bool(re.match(r'^(?:其实|这次|补充一下|没退)',current))
+    query=current;keys=[]
+    topic_reset=bool(re.search(r'换个?话题|不聊这个|不聊了|先不说.{0,6}(?:事|了)|另说一件',current))
+    if continuation and not quoted and not topic_reset and len(current)<=48:
+        stamp=float(latest.get('timestamp') or first.get('timestamp') or 0)
+        candidates=store.conversation(first['account'],first['chat'],8)
+        hub=getattr(store,'memory_hub',None)
+        suppressed=set(hub.suppressed_sources(first['account'],[first['chat']])) if hub else set()
+        before=[]
+        for row in reversed(candidates):
+            if row.get('key')==latest.get('key') or row.get('is_self'):continue
+            if set(row.get('alias_keys',[row.get('key')])) & suppressed:continue
+            age=stamp-float(row.get('timestamp') or 0)
+            if age<0:continue
+            if age>180:break
+            try:payload=json.loads(row.get('payload_json') or '{}')
+            except (TypeError,ValueError):payload={}
+            if payload.get('forwarded'):continue
+            value=str(row.get('content') or '').removeprefix('[当前发言] ').split('\n[引用原话｜',1)[0]
+            if value and row.get('kind',1)==1:
+                before.append(value[:350]);keys.append(row.get('key',''))
+                break  # The closest real utterance, not every previous topic.
+        if before:query=current+'\n'+before[0]
+    return {'query':query,'current':current,'explicit_recall':explicit,
+            'continuation':continuation,'quoted':quoted,'nearby_keys':keys}
 
 
 def select_topic_history(rows, batch, trigger='', *, now=None, limit=8, wake_words=()):

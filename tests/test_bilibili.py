@@ -193,6 +193,11 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReaderTests(unittest.TestCase):
+    def test_subtitle_precheck_requires_a_real_caption_url(self):
+        self.assertTrue(VideoReader.has_subtitle_track({'subtitle':{'subtitles':[{'subtitle_url':'https://caption.example/x'}]}}))
+        self.assertFalse(VideoReader.has_subtitle_track({'subtitle':{'subtitles':[{'subtitle_url':''}]}}))
+        self.assertFalse(VideoReader.has_subtitle_track(None))
+
     def test_timing_coverage_is_union_and_does_not_imply_full_understanding(self):
         segments = subtitle_segments([{'from': 0, 'to': 4, 'content': '一句合成内容'},
             {'from': 2, 'to': 6, 'content': '另一句合成内容'}], 10)
@@ -279,9 +284,12 @@ class GrowthIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_title_and_comments_alone_never_become_watched_experience(self):
         self.empty=True
         growth=self.runtime.growth;growth.request('bilibili');await growth.run_once()
-        self.assertEqual(self.bili.readings()[0]['state'],'unconfirmed')
+        run=growth.snapshot()['runs'][0]
+        self.assertEqual(run['state'],'done')
+        self.assertTrue(any(event['stage']=='candidate_skipped' and event['details'].get('reason_code')=='subtitle_unavailable'
+            for event in run['events']))
         self.assertEqual(self.bili.interests(),[])
-        self.assertEqual(len(self.calls),2)
+        self.assertEqual(len(self.calls),1)
 
     async def test_empty_model_understanding_is_not_shown_as_understood(self):
         original=self.runtime.growth.reflect_sources
@@ -298,7 +306,7 @@ class GrowthIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.mismatch=True
         growth=self.runtime.growth;growth.request('bilibili');await growth.run_once()
         self.assertEqual(growth.snapshot()['runs'][0]['state'],'failed')
-        self.assertEqual(len(self.calls),2)
+        self.assertEqual(len(self.calls),1)
         self.assertFalse(any(request.url.host=='aisubtitle.hdslb.com' for request in self.requests))
         self.assertEqual(self.bili.interests(),[])
 
@@ -344,7 +352,7 @@ class GrowthIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(self.gateway.sent),1)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM bilibili_shares').fetchone()[0],0)
 
-    async def test_new_evidence_can_reduce_interest_and_supersede_old_opinion(self):
+    async def test_new_evidence_challenges_old_interest_without_replacing_its_history(self):
         growth=self.runtime.growth;growth.request('bilibili');await growth.run_once()
         old=self.bili.interests()[0]['memory_id']
         self.bvid='BV1234567891';self.interest_delta=-2
@@ -352,7 +360,10 @@ class GrowthIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(growth.snapshot()['runs'][0]['state'],'done')
         self.assertLess(self.bili.interests()[0]['strength'],0)
         previous=self.runtime.memory_book.get('account',old,[INTERNET])
-        self.assertEqual(previous['status'],'superseded')
+        self.assertEqual(previous['status'],'active')
+        state=growth.policy.personality_state('interest','街头音乐')
+        self.assertEqual(state['status'],'challenged')
+        self.assertEqual((state['support_count'],state['challenge_count']),(1,1))
         self.assertTrue(self.bili.schedule()['curiosity'])
 
     async def test_bilibili_memory_tools_and_daily_growth_are_bidirectionally_isolated(self):
@@ -453,6 +464,138 @@ class GrowthIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await self.bili.feed('favorites','',ReadBudget(),choose_folder=AsyncMock(return_value='999'))
         self.assertEqual(invalid.await_count,1)
 
+    async def test_comment_mention_monitor_baselines_latest_page_and_deduplicates_exact_video(self):
+        self.config.save(self.config.settings.model_copy(update={
+            'enabled':True,'bilibili_enabled':True,'bilibili_comment_mentions_enabled':True,
+            'growth_internet_model_profile':'current'}))
+        self.bili.client.save_cookies({'SESSDATA':'fixture-session-only','DedeUserID':'12345'})
+        self.bili.client.set_meta(session_state='logged_in')
+        old={'id':10,'business_id':1,
+            'item':{'uri':'https://www.bilibili.com/video/'+BV+'/?p=1','business_id':1,'subject_id':98765}}
+        unrelated={'id':11,'business_id':2,
+            'item':{'uri':'https://www.bilibili.com/video/'+BV+'/?p=1','business_id':2,'subject_id':98765}}
+        new={'id':12,'business_id':1,
+            'item':{'uri':'https://www.bilibili.com/video/'+BV+'/?p=2','business_id':1,'subject_id':98765}}
+        pages=AsyncMock(side_effect=[
+            {'items':[old]},
+            {'items':[new,unrelated,old],'cursor':{'id':10,'time':100,'is_end':False}},
+            {'items':[new,unrelated,old]},
+            {'items':[old],'cursor':{'id':10,'time':100,'is_end':True}},
+        ])
+        with patch.object(self.bili.client,'api',pages):
+            self.assertTrue(await self.bili.poll_mentions(force=True))
+            self.assertEqual(self.store.db.execute('SELECT state FROM bilibili_at_events WHERE event_id="10"').fetchone()[0],'baseline')
+            self.assertTrue(await self.bili.poll_mentions(force=True))
+            self.assertTrue(await self.bili.poll_mentions(force=True))
+        calls=pages.await_args_list
+        self.assertEqual(calls[0].args[0],'/x/msgfeed/at')
+        self.assertEqual(calls[0].args[1],{'id':0,'like_time':0,'platform':'web','build':0,'mobi_app':'web'})
+        self.assertEqual(calls[2].args[1],calls[0].args[1])
+        self.assertEqual(calls[3].args[1],{'id':'10','like_time':100,'platform':'web','build':0,'mobi_app':'web'})
+        event=self.store.db.execute('SELECT state,bvid,run_id FROM bilibili_at_events WHERE event_id="12"').fetchone()
+        self.assertEqual(event['state'],'queued')
+        self.assertEqual(event['bvid'],BV)
+        run=self.store.db.execute('SELECT result FROM growth_runs WHERE id=?',(event['run_id'],)).fetchone()
+        request=json.loads(run['result'])['request']
+        self.assertEqual(request['target'],{'bvid':BV,'page':2})
+        self.assertEqual(request['origin'],'bilibili_comment_mention')
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM growth_runs WHERE target_key!=\'\'').fetchone()[0],1)
+        self.assertEqual(self.store.db.execute('SELECT state FROM bilibili_at_events WHERE event_id="11"').fetchone()[0],'ignored')
+
+    def test_comment_at_feed_uses_video_subject_and_trusted_url_without_echo_fields(self):
+        self.assertEqual(self.bili._at_video_ref({'item':{'uri':'https://bilibili.com.evil.example/video/'+BV+'/'}}),None)
+        self.assertEqual(self.bili._at_video_ref({'item':{'uri':'http://www.bilibili.com/video/'+BV+'/'}}),None)
+        self.assertEqual(self.bili._at_video_ref({'item':{'uri':'https://www.bilibili.com/video/'+BV+'/?p=3'}}),
+            {'bvid':BV,'page':3})
+        self.assertEqual(self.bili._at_video_target({'business_id':1,'item':{'subject_id':98765}}),{'aid':'98765'})
+        self.assertIsNone(self.bili._at_video_target({'business_id':2,'item':{'subject_id':98765}}))
+        self.assertIsNone(self.bili._at_video_target({'business_id':1,'item':{'subject_id':'not-an-id'}}))
+
+    def test_explicit_same_video_requests_from_distinct_wechat_sources_do_not_merge(self):
+        self.config.save(self.config.settings.model_copy(update={'enabled':True,'allowed_chat_ids':['group-a','group-b'],
+            'bilibili_enabled':True,'bilibili_wechat_video_enabled':True}))
+        first=self.runtime.growth.request('bilibili',target={'bvid':BV},origin='wechat_video',
+            requester={'account':'account','chat':'group-a','sender_id':'person-a','source_key':'source-a'})
+        repeated=self.runtime.growth.request('bilibili',target={'bvid':BV},origin='wechat_video',
+            requester={'account':'account','chat':'group-a','sender_id':'person-a','source_key':'source-a'})
+        second=self.runtime.growth.request('bilibili',target={'bvid':BV},origin='wechat_video',
+            requester={'account':'account','chat':'group-b','sender_id':'person-b','source_key':'source-b'})
+        self.assertEqual(repeated['id'],first['id'])
+        self.assertNotEqual(second['id'],first['id'])
+
+    def test_wechat_result_notice_is_not_queued_after_quiet_or_permission_revocation(self):
+        self.config.save(self.config.settings.model_copy(update={'enabled':True,'allowed_chat_ids':['group@chatroom'],
+            'bilibili_enabled':True,'bilibili_wechat_video_enabled':True}))
+        requester={'account':'account','chat':'group@chatroom','sender_id':'person-1','source_key':'source-key'}
+        self.runtime.chat_control.apply('group@chatroom','quiet',0)
+        self.store.observe([{'key':'source-key','account':'account','chat':'group@chatroom','sender_id':'person-1',
+            'sender':'小甲','kind':1,'is_self':0,'local_id':101,'content':'@鲸鱼娘看看视频',
+            'timestamp':time.time()+1,'payload_json':json.dumps({'image_address':{'mentioned_me':True}})}])
+        self.assertFalse(self.bili.queue_completion('1'*32,requester,{'journal_id':'journal'}))
+        self.config.save(self.config.settings.model_copy(update={'allowed_chat_ids':['another-chat']}))
+        self.assertFalse(self.bili.queue_completion('2'*32,requester,{'journal_id':'journal'}))
+
+    def test_explicit_wechat_video_tool_uses_current_mention_and_link_or_quoted_link(self):
+        self.config.save(self.config.settings.model_copy(update={'bilibili_wechat_video_enabled':True}))
+        first={'account':'account','chat':'group@chatroom','key':'source-key'}
+        message={'trigger_text':'@鲸鱼娘 https://www.bilibili.com/video/'+BV+'/?p=2','payload_json':json.dumps({
+            'image_address':{'mentioned_me':True}})}
+        result=self.bili.tools.explicit_video_request(first,[message])
+        self.assertEqual(result['origin'],'wechat_video')
+        self.assertEqual(result['reference']['url'],'https://www.bilibili.com/video/'+BV+'/?p=2')
+        message={'trigger_text':'@鲸鱼娘','payload_json':json.dumps({
+            'image_address':{'mentioned_me':True},'reply':{'content':'https://www.bilibili.com/video/'+BV+'/?p=2'}})}
+        result=self.bili.tools.explicit_video_request(first,[message])
+        self.assertEqual(result['reference']['url'],'https://www.bilibili.com/video/'+BV+'/?p=2')
+        message['payload_json']=json.dumps({'image_address':{'mentioned_me':False},'reply':{'content':'https://www.bilibili.com/video/'+BV+'/'}})
+        self.assertIsNone(self.bili.tools.explicit_video_request(first,[message]))
+
+    async def test_wechat_result_notice_is_verified_and_not_saved_as_a_user_turn(self):
+        self.config.save(self.config.settings.model_copy(update={'enabled':True,'allowed_chat_ids':['group@chatroom'],
+            'bilibili_enabled':True,'bilibili_wechat_video_enabled':True,'growth_internet_model_profile':'current'}))
+        source_key='account/group@chatroom/101'
+        source={'key':source_key,'account':'account','chat':'group@chatroom','sender_id':'person-1','sender':'小甲',
+            'kind':1,'is_self':0,'local_id':101,'content':'@鲸鱼娘看看这个视频','timestamp':time.time()-40,
+            'payload_json':json.dumps({'image_address':{'mentioned_me':True}})}
+        self.store.observe([source])
+        requester={'account':'account','chat':'group@chatroom','sender_id':'person-1','source_key':source_key}
+        queued=self.runtime.growth.request('bilibili',target={'bvid':BV},origin='wechat_video',requester=requester)
+        role=self.runtime.memory_hub.role();run_id=queued['id'];journal_id='fixture-journal';reading_id='fixture-reading'
+        body={'encounter':'读到一段街头演奏的字幕材料。','facts':'画面和字幕显示有人停下来听。',
+            'author_view':'作者认为音乐能改变普通下午的气氛。','missing':'没有覆盖视频后半部分。'}
+        coverage={'segment_start':0,'segment_end':30,'subtitle_segments':8,'visual_understood':True}
+        with self.store.db:
+            self.store.db.execute("UPDATE growth_runs SET state='done',result=? WHERE id=?",
+                (json.dumps({'request':{'origin':'wechat_video','requester':requester,'target':{'bvid':BV}}},ensure_ascii=False),run_id))
+            self.store.db.execute('INSERT INTO growth_journals VALUES(?,?,?,?,?,?,?,?)',
+                (journal_id,run_id,'account',role,'音乐','[]',json.dumps(body,ensure_ascii=False),time.time()))
+            self.store.db.execute('INSERT INTO bilibili_readings(id,account,role,bvid,created,state,metadata,coverage,journal_id) VALUES(?,?,?,?,?,?,?,?,?)',
+                (reading_id,'account',role,BV,time.time(),'done',json.dumps({'title':'街头演奏','bvid':BV}),
+                    json.dumps(coverage),journal_id))
+        self.assertTrue(self.bili.queue_completion(run_id,requester,{'journal_id':journal_id,'reading_id':reading_id}))
+        first=self.store.queue()
+        material=self.bili.completion_payload(first)
+        self.assertEqual(material['title'],'街头演奏')
+        self.assertIn('没有覆盖视频后半部分',material['missing'])
+        calls=[]
+        class ReplyEngine:
+            api_style='test';stream_enabled=False;last_error='';last_response_meta={}
+            async def chat(self,messages,**options):
+                calls.append((messages,options))
+                return json.dumps({'should_reply':True,'actions':[{'type':'text','text':'这段街头演奏还挺有意思的。'}]},ensure_ascii=False)
+            async def close(self):pass
+        with patch.object(self.runtime,'model',new=AsyncMock(return_value=ReplyEngine())):
+            self.assertTrue(await self.runtime.process_next())
+        self.assertEqual(len(calls),1)
+        self.assertIn('你先前受托读取的视频结果',calls[0][1]['system_prompt'])
+        self.assertIn('没有覆盖视频后半部分',calls[0][1]['system_prompt'])
+        self.assertEqual(self.gateway.sent,[('text','这段街头演奏还挺有意思的')])
+        history=self.store.db.execute('SELECT role,content FROM history WHERE account=? AND chat=? ORDER BY id',
+            ('account','group@chatroom')).fetchall()
+        self.assertEqual([row['role'] for row in history],['assistant'])
+        self.assertIsNone(self.store.db.execute('SELECT 1 FROM message_log WHERE key=?',(first['key'],)).fetchone())
+        self.assertEqual(self.store.db.execute('SELECT state FROM bilibili_completion_notices WHERE run_id=?',(run_id,)).fetchone()[0],'sent')
+
 
 class ConsoleAPITests(unittest.TestCase):
     def setUp(self):
@@ -485,6 +628,51 @@ class ConsoleAPITests(unittest.TestCase):
         self.assertEqual(self.client.post('/api/bilibili/account',headers=self.headers,
             json={'action':'resume','acknowledge':True}).status_code,200)
         self.assertFalse(self.app.state.runtime.bilibili.client.status()['paused'])
+
+
+class WbiBuvidTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wbi_api_auto_ensures_buvid_when_cookie_lacks_it(self):
+        directory = ROOT / 'test-runs'
+        directory.mkdir(exist_ok=True)
+        tmp = tempfile.TemporaryDirectory(dir=directory)
+        self.addCleanup(tmp.cleanup)
+        config = Config(Path(tmp.name))
+        config.save(Settings(account_id='account', bilibili_enabled=True))
+        store = Store(Path(tmp.name) / 'state.sqlite3')
+        self.addCleanup(store.db.close)
+
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            path = request.url.path
+            if path == '/x/web-interface/nav':
+                return httpx.Response(200, json={'code': 0, 'data': {'isLogin': True, 'uname': '肥肥鲸', 'wbi_img': WBI}})
+            if path == '/x/frontend/finger/spi':
+                return httpx.Response(200, json={'code': 0, 'data': {'b_3': 'AUTO-BUVID3', 'b_4': 'AUTO-BUVID4'}})
+            if path == '/x/web-interface/wbi/index/top/feed/rcmd':
+                return httpx.Response(200, json={'code': 0, 'data': {'item': [{'bvid': BV, 'title': '测试推荐'}]}})
+            return httpx.Response(200, json={'code': 0, 'data': {}})
+
+        client = BilibiliClient(config, store, transport=httpx.MockTransport(handler))
+        with patch('whalegirl_linux.bilibili_client.asyncio.sleep', new=AsyncMock()):
+            try:
+                client.save_cookies({'SESSDATA': 'sess', 'bili_jct': 'jct', 'DedeUserID': '1234'})
+                client.set_meta(session_state='logged_in')
+                data = await client.api('/x/web-interface/wbi/index/top/feed/rcmd', {'fresh_type': 3}, wbi=True)
+                self.assertEqual(data['item'][0]['bvid'], BV)
+                rcmd_reqs = [r for r in requests if r.url.path == '/x/web-interface/wbi/index/top/feed/rcmd']
+                self.assertEqual(len(rcmd_reqs), 1)
+                self.assertIn('SESSDATA=sess', rcmd_reqs[0].headers.get('Cookie', ''))
+                self.assertIn('buvid3=AUTO-BUVID3', rcmd_reqs[0].headers.get('Cookie', ''))
+                self.assertIn('buvid4=AUTO-BUVID4', rcmd_reqs[0].headers.get('Cookie', ''))
+                self.assertIn('w_rid', rcmd_reqs[0].url.params)
+                # Second WBI call reuses cached _anon_buvid without hitting /spi again
+                await client.api('/x/web-interface/wbi/index/top/feed/rcmd', {'fresh_type': 3}, wbi=True)
+                spi_reqs = [r for r in requests if r.url.path == '/x/frontend/finger/spi']
+                self.assertEqual(len(spi_reqs), 1)
+            finally:
+                await client.close()
 
 
 if __name__=='__main__':unittest.main()

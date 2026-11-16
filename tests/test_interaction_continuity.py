@@ -107,12 +107,20 @@ class InteractionTests(unittest.IsolatedAsyncioTestCase):
     async def test_event_context_does_not_renew_it_and_presents_at_most_two(self):
         for i in range(1,5):
             self.remember(self.event(i,content=f'今晚第{i}场游戏还没确定时间'),phase='open',summary=f'第{i}场游戏的时间仍未确定')
-        source=self.event(8,content='刚来，大家在聊什么')
+        source=self.event(8,content='今晚的游戏时间确定了吗')
         rows=self.experience.current_events(source)
         before={r['id']:r['version'] for r in rows}
         self.assertEqual(len(rows),2)
         self.assertIn('不是待办',self.service.dynamic_prompt(source,[source]))
         self.assertEqual({r['id']:r['version'] for r in self.experience.current_events(source)},before)
+
+    async def test_topic_switch_does_not_offer_old_open_events(self):
+        self.opening()
+        current=self.event(9,content='早上好呀，我做了草莓蛋糕')
+        self.store.observe([current])
+        prompt=self.service.dynamic_prompt(current,[current])
+        self.assertNotIn('群友说暂时不玩',prompt)
+        self.assertEqual(current['_interaction_versions'],{})
 
     async def test_new_frame_preserves_all_people_own_messages_quotes_and_current_time_boundary(self):
         first=self.event(content='我今晚不想继续打了',sender='friend-a')

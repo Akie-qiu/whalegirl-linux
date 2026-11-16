@@ -15,6 +15,7 @@ import time
 
 
 TIERS = {'core', 'stable', 'ordinary', 'cold'}
+LEGACY_TIERS = {'long_term': 'stable', 'short_term': 'ordinary'}
 KINDS = {'fact', 'preference', 'impression', 'relationship', 'event', 'joke',
          'self_stance', 'shared_moment', 'chat_style', 'meme_usage', 'tool_learning',
          'expression', 'persona', 'bot_alias', 'slang', 'nickname', 'interaction_rule'}
@@ -24,6 +25,29 @@ LEARNING_STATES = {'accepted': 'active', 'pending': 'pending', 'revoked': 'forgo
 ROLE_KINDS = {'self_stance', 'shared_moment', 'persona', 'expression', 'tool_learning',
               'interaction_rule', 'impression', 'chat_style', 'nickname'}
 FACT_KINDS = {'fact', 'preference'}
+
+
+PRIVATE_ONLY_STYLE_RE = re.compile(
+    r'私聊|独处|单独相处|毫无保留|只娇不傲|色气|调情|亲密接触|'
+    r'做爱|性交|交配|抽插|内射|高潮|胸脯|奶子|乳头|阴蒂|蜜穴|小穴|肉棒|自慰'
+)
+OWNER_DM_SITUATIONAL_STYLE_RE = re.compile(
+    r'自拍|照片|拍照|看图|发图|午睡|叫醒|哄睡|几点|熬夜|打游戏|开黑|过剧情|抽卡|晚安|抱抱|亲亲|'
+    r'贴贴|羞耻样子|画.{0,4}样子|高潮|临界点|求她|撒娇给|妈妈面前|专属私聊|'
+    r'别用[“"\'‘]?(?:呜|唔)[”"\'’]?开头|别用[“"\'‘]?自己[”"\'’]?|别复述'
+)
+GENERAL_VOICE_STYLE_RE = re.compile(r'软糯|娇憨|少女|软萌|口吻|语气|尾音|傲娇|大叔|贴吧|人设|端着')
+
+
+def is_owner_dm_group_leak(row, owners):
+    """Identify owner-DM situational persona/style memories that must not enter group chats."""
+    chat_id = str(row.get('chat') or '')
+    if not owners or chat_id not in owners:
+        return False
+    if row.get('kind') not in ('persona', 'chat_style', 'interaction_rule'):
+        return False
+    combined = f"{row.get('content', '')} {row.get('evidence', '')}"
+    return bool(PRIVATE_ONLY_STYLE_RE.search(combined) or OWNER_DM_SITUATIONAL_STYLE_RE.search(combined))
 
 
 def normalized(text):
@@ -38,6 +62,12 @@ def token_estimate(text):
 
 def default_tier(kind):
     return 'stable' if kind in FACT_KINDS | {'nickname', 'interaction_rule', 'chat_style', 'bot_alias'} else 'ordinary'
+
+
+def readable_tier(value):
+    """Legacy rows remain intact; unknown tiers cannot crash or become core."""
+    value = LEGACY_TIERS.get(value, value)
+    return value if value in TIERS else 'ordinary'
 
 
 class DurableMemoryQueue:
@@ -165,7 +195,8 @@ class MemoryHub:
     def prepare(self, value, old, data, actor):
         if actor != 'admin' and self.forgotten_source(value['account'], data.get('source_key', '')):
             raise ValueError('该来源位于管理员已清除的记忆范围，不能自动重新学习')
-        tier = data.get('tier', (old or {}).get('tier') or default_tier(value['kind']))
+        tier = (LEGACY_TIERS.get(data['tier'], data['tier']) if 'tier' in data else
+                readable_tier(old['tier']) if old and old.get('tier') else default_tier(value['kind']))
         if tier not in TIERS:
             raise ValueError('记忆等级无效')
         if actor != 'admin' and (tier == 'core' or (old or {}).get('locked') or data.get('locked')):
@@ -306,6 +337,8 @@ class MemoryHub:
                     'SELECT key FROM message_log WHERE account=? AND chat=? AND timestamp<=?', (account, chat, cutoff)))
         return list(set(sources))
 
+    _PRIVATE_ONLY_STYLE_RE = PRIVATE_ONLY_STYLE_RE
+
     def sync_learning(self, row, old=None, operation='import', actor='migration'):
         """Called inside the legacy writer's transaction, never a second brain."""
         origin = self.db.execute("SELECT * FROM memory_origins WHERE account=? AND source='learning' AND origin_id=?",
@@ -338,13 +371,30 @@ class MemoryHub:
                 version=version+1,updated=? WHERE id=?''', (row['content'], state, int(state == 'forgotten'),
                 row['expires_at'], row['confidence'], row['updated'], identity))
         else:
+            owner_ids = tuple(getattr(self.settings, 'owner_ids', None) or ()) if self.settings else ()
+            chat_id = str(row.get('chat') or '')
+            if chat_id.endswith('@chatroom'):
+                venue = 'group'
+            elif chat_id in ('@world-learning', '@internet-learning'):
+                venue = 'any'
+            elif (
+                row['subject'] in owner_ids
+                and row['kind'] in ('persona', 'chat_style')
+                and not is_owner_dm_group_leak(row, owner_ids)
+                and GENERAL_VOICE_STYLE_RE.search(str(row.get('content', '')))
+            ):
+                venue = 'any'
+            elif row['kind'] in ROLE_KINDS:
+                venue = 'private'
+            else:
+                venue = 'any'
             cur = self.db.execute('''INSERT INTO memories(account,chat,subject,kind,scope,content,source_key,
                 actor,version,archived,created,updated,expires_at,triggers,salience,tier,status,confidence,
                 role_id,valid_from,source_class,venue) VALUES(?,?,?,?,?,?,?,'model',1,?,?,?,?,?,3,?,?,?,?,?,'learning',?)''',
                 (row['account'], row['chat'], row['subject'], row['kind'], row['scope'], row['content'], row['source_key'],
                  int(state == 'forgotten'), row['created'], row['updated'], row['expires_at'], row.get('alias_target', ''),
                  default_tier(row['kind']), state, row['confidence'], self.role() if row['kind'] in ROLE_KINDS else '',
-                 row['created'], 'private' if row['kind'] in ROLE_KINDS and not row['chat'].endswith('@chatroom') else 'any'))
+                 row['created'], venue))
             identity = cur.lastrowid
         value = dict(self.db.execute('SELECT * FROM memories WHERE id=?', (identity,)).fetchone())
         self.db.execute('''INSERT INTO memory_origins(account,source,origin_id,memory_id,origin_version)
@@ -561,20 +611,28 @@ class MemoryHub:
 
     def recall(self, account, allowed, subject, question, *, chat=None, subjects=(), shared=True,
                limit=8, diagnostics=None, include_cold=False, at_time=None, personal_priority=0,
-               include_jokes=True, half_life_days=21):
+               include_jokes=True, half_life_days=21, automatic=False, owner_ids=()):
         if not allowed or limit <= 0 or not self.enabled():
             if diagnostics is not None:
                 diagnostics.update(available_in_scope=0)
             return []
         from .memory import recall_terms
         people = sorted({p for p in (*subjects, subject) if p})
+        cfg_owners = getattr(self.settings, 'owner_ids', None) or () if self.settings else ()
+        owners = sorted({o for o in (*owner_ids, *cfg_owners) if o})
         marks = ','.join('?' for _ in allowed)
         where = f'account=? AND chat IN ({marks})'
         args = [account, *allowed]
         if chat is not None:
             person_marks = ','.join('?' for _ in people) or "''"
-            where += f" AND ((chat=? AND scope='chat') OR (scope='profile' AND kind IN ('fact','preference','nickname','interaction_rule','impression') AND subject IN ({person_marks}) AND (? OR chat=?)))"
-            args += [chat, *people, int(shared), chat]
+            owner_clause = ''
+            owner_args = []
+            if shared and owners:
+                owner_marks = ','.join('?' for _ in owners)
+                owner_clause = f" OR (subject IN ({owner_marks}) AND kind IN ('persona','chat_style') AND (chat IN ({owner_marks}) OR scope='profile'))"
+                owner_args = [*owners, *owners]
+            where += f" AND ((chat=? AND scope='chat') OR (scope='profile' AND kind IN ('fact','preference','nickname','interaction_rule','impression') AND subject IN ({person_marks}) AND (? OR chat=?)){owner_clause})"
+            args += [chat, *people, int(shared), chat, *owner_args]
         now = time.time()
         if at_time is None:
             where += " AND status='active' AND archived=0 AND (expires_at=0 OR expires_at>?)"
@@ -598,19 +656,57 @@ class MemoryHub:
             diagnostics.update(available_in_scope=len(rows))
         words = recall_terms(question)
         lowered = str(question).casefold()
+        owner_set = set(owners)
+        is_group = bool(chat and chat.endswith('@chatroom'))
         def score(row):
             if (row['source_class'] == 'experience' and self.settings
                     and not getattr(self.settings, 'experience_growth_enabled', True)):
                 return 0
+            if is_group and is_owner_dm_group_leak(row, owner_set):
+                return 0
             related = sum(w in row['content'].casefold() for w in words)
             tags = [t.strip() for t in re.split(r'[,，、\s/#]+', row['triggers']) if len(t.strip()) >= 2]
             related += 2 * sum(t.casefold() in lowered for t in tags)
+            if (is_group and row['chat'] in owner_set
+                    and row['kind'] in ('persona', 'chat_style', 'interaction_rule')
+                    and not related
+                    and not GENERAL_VOICE_STYLE_RE.search(str(row.get('content') or ''))):
+                return 0
             personal = row['subject'] in people and row['scope'] == 'profile'
+            owner_global_style = bool(
+                shared and owners and row['subject'] in owners
+                and row['kind'] in ('persona', 'chat_style')
+                and (row['chat'] in owners or row['scope'] == 'profile')
+            )
             style = row['kind'] in ('chat_style','interaction_rule','nickname','persona','expression') and (
-                row['subject'] in people or row['subject'] in ('self','',account))
+                row['subject'] in people or row['subject'] in ('self','',account)
+                or owner_global_style
+                or (row['scope'] == 'chat' and row['kind'] in ('chat_style', 'persona')))
             # Preserve legacy room-scoped administrator corrections without
             # turning an unresolved old nickname into a shared wxid profile.
             room_correction = row['actor']=='admin' and row['kind'] in FACT_KINDS and row['scope']=='chat' and row['chat']==chat
+            active_profile = (
+                row['scope'] == 'profile'
+                and row['subject'] in people
+                and row['kind'] in ('fact', 'preference', 'impression', 'nickname', 'interaction_rule')
+                and row.get('source_class') != 'internet_learning'
+                and (row['actor'] == 'admin' or float(row.get('confidence') or 0) >= 0.7)
+            )
+            if automatic:
+                from .topic_relevance import related_topic
+                # A live episode can share a short, specific noun with its next
+                # turn. Older entries need the normal stronger topic match.
+                live_episode=row['kind']=='shared_moment' and 0<=now-row['created']<=180
+                topic_hit=related_topic(question,row['content']+' '+row.get('triggers',''),min_hits=1 if live_episode else None)
+                # Identity, general interaction preferences, and verified personal
+                # profile facts/preferences for active speakers stay available
+                # across casual turns and cross-chat encounters.
+                guidance = (
+                    row['kind'] in ('nickname', 'chat_style', 'interaction_rule', 'persona', 'expression')
+                    and (style or personal)
+                    and row.get('source_class') != 'internet_learning'
+                )
+                if not topic_hit and not guidance and not active_profile:return 0
             if not related and not personal and not style and not room_correction:
                 return 0
             if row['kind'] == 'joke' and self.settings and self.settings.callback_frequency == 'off':
@@ -619,14 +715,30 @@ class MemoryHub:
                 return 0
             growing=bool(self.settings and self.settings.growth_enabled)
             age = max(0, (now - (max(row['updated'],row.get('last_used',0)) if growing else row['updated'])) / 86400)
-            strength = {'core': 12, 'stable': 6, 'ordinary': 1, 'cold': 0}[row['tier']]
-            decay = max(.2, .5 ** (age / max(3,half_life_days))) if row['tier'] == 'ordinary' else 1
+            tier = readable_tier(row['tier'])
+            strength = {'core': 12, 'stable': 6, 'ordinary': 1, 'cold': 0}[tier]
+            decay = max(.2, .5 ** (age / max(3,half_life_days))) if tier == 'ordinary' else 1
             affinity = 2*min(2,max(0,personal_priority)) if related and personal else 0
             from .memory_layers import usage_boost
             return (min(related, 12) * 8 + 10 * personal + strength + affinity + (2 if row['actor'] == 'admin' else 0)
                     + (usage_boost(row) if growing else 0)) * decay
-        ranked = sorted(((score(r), r) for r in rows), key=lambda p: (p[0], p[1]['updated'], p[1]['id']), reverse=True)
-        return [r for score_value, r in ranked if score_value > 0][:min(50, limit)]
+        scored = [(score(r), r) for r in rows]
+        scored = [item for item in scored if item[0] > 0]
+        if automatic and people:
+            profile_hits = sorted(
+                [item for item in scored if item[1]['scope'] == 'profile' and item[1]['subject'] in people],
+                key=lambda p: (p[1]['subject'] == subject, p[0], p[1]['updated'], p[1]['id']),
+                reverse=True,
+            )[:min(3, limit)]
+            reserved_ids = {p[1]['id'] for p in profile_hits}
+            others = sorted(
+                [item for item in scored if item[1]['id'] not in reserved_ids],
+                key=lambda p: (p[0], p[1]['updated'], p[1]['id']),
+                reverse=True,
+            )
+            return [r for _, r in (profile_hits + others)][:min(50, limit)]
+        ranked = sorted(scored, key=lambda p: (p[0], p[1]['updated'], p[1]['id']), reverse=True)
+        return [r for _, r in ranked][:min(50, limit)]
 
     def mark_loaded(self, account, identities):
         with self.store.lock, self.db:

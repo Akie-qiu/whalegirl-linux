@@ -133,7 +133,7 @@
   saveStyleBtn.id='save-style-settings';
   styleBox.append(saveStyleBtn);
   $('save-habits').parentElement.before(styleBox);
-  const contextLabel=element('label','','上下文字符预算');const budget=element('input');budget.type='number';budget.id='context-char-budget';budget.min=4000;budget.max=40000;contextLabel.append(budget);
+  const contextLabel=element('label','','上下文字数提醒阈值（不裁剪）');const budget=element('input');budget.type='number';budget.id='context-char-budget';budget.min=4000;budget.max=40000;contextLabel.append(budget);
   const summaryLabel=element('label','check-label');const summary=element('input');summary.type='checkbox';summary.id='digest-enabled';summaryLabel.append(summary,document.createTextNode('后台增量整理话题摘要'));
   const saveContextBtn=button('保存上下文策略',async()=>{await saveSubset({context_char_budget:Number(budget.value),background_digest_enabled:summary.checked});notice('上下文策略已保存');});
   saveContextBtn.id='save-context-strategy';

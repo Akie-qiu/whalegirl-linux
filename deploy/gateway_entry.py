@@ -8,6 +8,29 @@ import signal
 import subprocess
 import time
 
+
+def reap_children(children):
+    """Reap PID-1 adoptees and preserve tracked Popen exit codes.
+
+    Polling in the main thread avoids a SIGCHLD handler stealing waitpid
+    results from subprocess.run/Popen.wait during session initialization.
+    """
+    tracked = {process.pid: process for process in children}
+    reaped = []
+    while True:
+        try:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return reaped
+        except InterruptedError:
+            continue
+        if not pid:
+            return reaped
+        if pid in tracked:
+            tracked[pid].returncode = os.waitstatus_to_exitcode(status)
+        reaped.append(pid)
+
+
 VERSION = "4.1.0.16"
 version = subprocess.check_output(["dpkg-query", "-W", "-f=${Version}", "wechat"], text=True).strip()
 if version != VERSION:
@@ -65,4 +88,9 @@ spawn(["/usr/bin/wechat"], as_wechat=True)
 (data / "runtime-version.json").write_text(json.dumps({"wechat_version": version, "binary_hash_verified": True, "started_at": time.time()}))
 os.chmod(data / "runtime-version.json", 0o644)
 server = spawn(["/opt/agent-server/agent-server"])
-raise SystemExit(server.wait())
+while True:
+    reap_children(children)
+    result = server.poll()
+    if result is not None:
+        raise SystemExit(result)
+    time.sleep(.2)

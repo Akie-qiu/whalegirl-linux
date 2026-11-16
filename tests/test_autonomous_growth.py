@@ -8,7 +8,8 @@ from whalegirl_linux.memory import memory_parts
 from whalegirl_linux.memory_layers import INTERNET
 
 
-BODY='海洋动物的协作行为体现出不同个体之间的沟通。理解一个行为需要结合环境和具体处境。' * 12
+BODY=('海洋动物的协作行为体现出不同个体之间的沟通。理解一个行为需要结合环境和具体处境。' * 12+
+      '甲：朋友闹了误会，我不知道他为什么生气。乙：先让我听听嘛，怎么闹成这样的。')
 
 
 class Engine:
@@ -52,10 +53,11 @@ class GrowthTests(unittest.IsolatedAsyncioTestCase):
         self.calls=[]
         def default(data,n):
             return {'encounter':'读到协作行为','facts':'材料说明环境会影响行为','revision':'先理解处境',
-                'insights':[{'category':'expression','text':'遇到人际矛盾时先理解具体处境，不急着替人下结论',
+                'reaction_events':[{'text':'遇到人际矛盾时先理解具体处境，不急着替人下结论',
                     'scene':'朋友轻松吐槽人际误会时','emotion':'好奇又体贴','intent':'先接话再了解',
                     'examples':['先让我听听嘛，怎么闹成这样的'],
-                    'source_id':data['sources'][0]['id'],'evidence':BODY[:28],
+                    'source_id':data['sources'][0]['id'],'context_evidence':'朋友闹了误会，我不知道他为什么生气',
+                    'reaction_evidence':'先让我听听嘛，怎么闹成这样的',
                     'conditions':'讨论他人的行为时','counterexamples':'对方只想分享开心的事时不说教'}]}
         self.runtime.engine_factory=lambda **kwargs:Engine(answer or default,self.calls)
         async def read(engine,generation,role):
@@ -101,7 +103,7 @@ class GrowthTests(unittest.IsolatedAsyncioTestCase):
         snapshot=g.snapshot();self.assertEqual(snapshot['runs'][0]['state'],'done')
         self.assertEqual(len(self.calls),1);self.assertEqual(snapshot['usage']['tokens'],180)
         row=snapshot['insights'][0];self.assertEqual(row['chat'],INTERNET);self.assertEqual(row['source_class'],'internet_learning')
-        prompt=g.prompt(self.event(),[self.event(content='你觉得大家为什么会吵架')])
+        prompt=g.prompt(self.event(),[self.event(content='她在吐槽同事误会自己，怎么接话')])
         self.assertIn(row['content'],prompt)
         details=self.runtime.memory_book.model_ops('account',self.config.settings.allowed_chat_ids,
             [{'op':'get','id':row['id']}],[],True,chat='group@chatroom',subjects=['person'])
@@ -137,10 +139,11 @@ class GrowthTests(unittest.IsolatedAsyncioTestCase):
         g=self.fake();self.configure(growth_auto_apply=False)
         g.request('world');await g.run_once()
         row=g.memories(include_inactive=True)[0];self.assertEqual(row['status'],'pending')
-        self.assertFalse(g.prompt(self.event(),[self.event()]))
+        current=self.event(content='朋友吐槽我误会他了，该怎么接话')
+        self.assertFalse(g.prompt(current,[current]))
         g.edit(row['id'],{'op':'update','version':row['version'],'status':'active'})
-        self.assertTrue(g.prompt(self.event(),[self.event()]))
-        self.configure(active_persona_id='another-role');self.assertFalse(g.prompt(self.event(),[self.event()]))
+        self.assertTrue(g.prompt(current,[current]))
+        self.configure(active_persona_id='another-role');self.assertFalse(g.prompt(current,[current]))
 
     async def test_repeated_read_does_not_add_a_second_journal_or_insight(self):
         g=self.fake();g.request('world');await g.run_once();g.request('world');await g.run_once()

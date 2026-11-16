@@ -48,6 +48,9 @@ def parse_post(row, own_ids=()):
                 'target': item.findtext('ref_username') or item.findtext('to_username') or '',
                 'own': (item.findtext('username') or '') in set(own_ids),
                 'local': bool(number(item.findtext('is_local_added'))),
+                # Only structural counts leave the native cache. Attachment
+                # URLs, tokens and decryption keys must stay in the client.
+                'image_count': len(item.findall('./imagelist/imageinfo')),
             })
     return {
         'id': identity, 'author': author,

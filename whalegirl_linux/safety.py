@@ -55,25 +55,47 @@ class SafetyGuard:
                                   (account,now,level,code,reason[:400],chat))
             self.store.db.commit()
 
+    @staticmethod
+    def _hold_scope(code, reason):
+        """Keep a recoverable Moments UI problem from becoming a chat hold."""
+        if code == 'ui_recovery_failed' and any(marker in str(reason or '').casefold()
+                for marker in ('朋友圈编辑器', 'moments editor', 'moments 窗口')):
+            return 'moments'
+        return ''
+
     def hold(self, account, code, reason):
         with self.store.lock:
             state = self.state(account)
-            if not state.get('hold_reason'):
-                state.update(hold_reason=reason,hold_code=code,hold_since=time.time())
+            current_reason = state.get('hold_reason','')
+            current_scope = state.get('hold_scope','') or self._hold_scope(
+                state.get('hold_code',''), current_reason)
+            new_scope = self._hold_scope(code, reason)
+            if not current_reason or (current_scope == 'moments' and new_scope != 'moments'):
+                state.update(hold_reason=reason,hold_code=code,hold_since=time.time(),
+                             hold_scope=new_scope)
                 self._save(account,state)
             self.record(account,code,reason,level='danger')
 
-    def held(self, account):
+    def held(self, account, scope=None, *, include_recovery=True):
         state = self.state(account)
-        return state.get('hold_reason','') or (
+        hold_reason = state.get('hold_reason','')
+        hold_scope = state.get('hold_scope','') or self._hold_scope(state.get('hold_code',''), hold_reason)
+        if hold_reason and hold_scope == 'moments' and scope != 'moments':
+            hold_reason = ''
+        return hold_reason or (
             '正在恢复微信界面，完成后继续回复'
-            if state.get('recovery_status') in ('pending', 'recovering') else '')
+            if include_recovery and state.get('recovery_status') in ('pending', 'recovering') else '')
+
+    def held_for(self, account, scope):
+        """Compatibility wrapper for scoped callers and older test doubles."""
+        return self.held(account, scope=scope)
 
     def resume(self, account):
         with self.store.lock:
             state = self.state(account)
             state.update(consecutive_failures=0, recovery_used=False,
-                         recovery_status='idle', hold_reason='', hold_code='', hold_since=None)
+                         recovery_status='idle', hold_reason='', hold_code='', hold_scope='',
+                         hold_since=None)
             self._save(account,state)
             self.record(account,'manual_resume','已人工确认恢复发送',level='info')
 
@@ -96,10 +118,12 @@ class SafetyGuard:
                 COALESCE(json_extract(payload,'$.post.id'),'timeline') AS chat,text AS reply,
                 'text' AS kind,updated AS sent_at,state FROM moments_actions WHERE account=?
                 AND state IN ('sent','sending','uncertain') AND updated>=?''',(account,since)).fetchall()
-        counts = {'minute':0,'hour':0,'day':0,'chat_hour':0,'text_hour':0,'text_day':0,'sticker_hour':0,'sticker_day':0,'image_hour':0,'image_day':0}
+        counts = {'minute':0,'hour':0,'day':0,'chat_hour':0,'text_hour':0,'text_day':0,
+                  'sticker_hour':0,'sticker_day':0,'image_hour':0,'image_day':0,'audio_hour':0,'audio_day':0,
+                  'pat_hour':0,'pat_day':0}
         for row in rows:
             when = row['sent_at']
-            if row['kind'] != 'image':
+            if row['kind'] not in ('image', 'pat'):
                 counts['minute'] += when > now-60
                 counts['hour'] += when > now-3600
                 counts['day'] += when >= day_start
@@ -110,12 +134,13 @@ class SafetyGuard:
 
     def check(self, account, chat, settings, *, reply=None, now=None, kind=None):
         now = time.time() if now is None else now
-        held = self.held(account)
+        scope = 'moments' if str(chat or '').startswith('moments:') else None
+        held = self.held(account, scope=scope)
         if held:
             return {'allowed':False,'code':'safety_hold','reason':held,'retry_at':None}
-        # Uploaded and previously generated images have no send-count or
-        # duplicate-content cap. Login/permission checks and receipts remain.
-        if kind == 'image':
+        # Uploaded images and optional playful pats skip message-spam counters.
+        # Login/permission/safety-hold checks above still apply.
+        if kind in ('image', 'pat'):
             return {'allowed':True}
         if not settings.safety_enabled:
             return {'allowed':True}
@@ -172,6 +197,27 @@ class SafetyGuard:
                             self.record(account, 'ui_recovery_confirmed', '界面恢复后的新消息已确认发送，失败计数已清零', level='info')
                     self._save(account,state)
                 return
+            if getattr(receipt, 'sticker_pre_send_failure', False):
+                # A sticker is an optional UI action. If its picker could not
+                # identify a tile and no click was submitted, do not pause the
+                # whole account or trigger a UI reset; retain the failure event.
+                self.record(account, 'sticker_pre_send_failed',
+                            str(receipt.error or '表情定位失败，未提交发送')[:240],
+                            chat=chat, level='warning')
+                return
+            if getattr(receipt, 'sticker_misdelivered', False):
+                # The UI and the connection work; only the favorite position was
+                # stale. Keep the evidence without pausing the account.
+                self.record(account, 'sticker_misdelivered',
+                            str(receipt.error or '发错表情')[:240], chat=chat, level='warning')
+                return
+            details = getattr(receipt, 'details', None) or {}
+            if details.get('pat_skipped') or details.get('kind') == 'pat':
+                # Optional playful pat-back never freezes the account or triggers UI reset.
+                self.record(account, 'pat_skipped',
+                            str(receipt.error or '拍一拍目标不在可见区域，已安全跳过')[:240],
+                            chat=chat, level='info')
+                return
             if not receipt.definite_failure or (not settings.safety_enabled
                     and not getattr(settings, 'send_auto_recovery_enabled', True)):
                 return
@@ -226,8 +272,11 @@ class SafetyGuard:
         state = self.state(account)
         events = [dict(row) for row in self.store.db.execute('''SELECT created,level,code,reason,chat
             FROM safety_events WHERE account=? ORDER BY id DESC LIMIT 20''', (account,))]
-        return {'enabled':settings.safety_enabled,'hold_reason':state.get('hold_reason',''),
+        hold_reason = state.get('hold_reason','')
+        hold_scope = state.get('hold_scope','') or self._hold_scope(state.get('hold_code',''), hold_reason)
+        return {'enabled':settings.safety_enabled,'hold_reason':hold_reason,
                 'hold_code':state.get('hold_code',''),'hold_since':state.get('hold_since'),
+                'hold_scope':hold_scope,
                 'counts':counts,'last_check':self.last_check,'check_error':self.check_error,
                 'limited_chats':limited_chats,'rate_limited':rate_limited,
                 'limits_enabled':limits_enabled,

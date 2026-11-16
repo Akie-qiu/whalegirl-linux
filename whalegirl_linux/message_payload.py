@@ -174,6 +174,8 @@ def render_app(value):
 
 def incoming_content(raw):
     payload={k:raw[k] for k in ('appType','reply','forwarded') if raw.get(k)}
+    if not payload and raw.get('type') in (1,'1'):
+        return str(raw.get('content') or '').replace('\x00','').strip(),{}
     main=clip(raw.get('content'),4000)
     if not payload:return main,{}
     return render_app({**payload,'content':main}),payload

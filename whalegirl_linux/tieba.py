@@ -317,6 +317,11 @@ class TiebaService:
                 CREATE TABLE IF NOT EXISTS tieba_post_quotes(account TEXT NOT NULL,tid TEXT NOT NULL,
                     excerpts TEXT NOT NULL,PRIMARY KEY(account,tid));
             ''')
+            columns={row[1] for row in self.store.db.execute('PRAGMA table_info(tieba_runs)')}
+            if 'origin' not in columns:
+                self.store.db.execute("ALTER TABLE tieba_runs ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'")
+            if 'scheduled_due_at' not in columns:
+                self.store.db.execute('ALTER TABLE tieba_runs ADD COLUMN scheduled_due_at REAL NOT NULL DEFAULT 0')
             self.store.db.execute('INSERT OR IGNORE INTO tieba_meme_sources SELECT id,phrase FROM tieba_memes')
             self.store.db.execute("UPDATE tieba_shares SET state='uncertain',error='发送时服务重启，请人工核对，不自动重发' WHERE state='sending'")
             self.store.db.execute("UPDATE tieba_shares SET state='cancelled',error='回复计划未发送，服务重启后不补发' WHERE state='planned'")
@@ -382,16 +387,18 @@ class TiebaService:
         return self.store.db.execute("""SELECT count(*) FROM tieba_shares WHERE account=?
             AND state IN ('sent','sending','uncertain') AND sent_at>=?""", (account, day_start(now))).fetchone()[0]
 
-    async def scan(self):
+    async def scan(self,*,scheduled=False,scheduled_due_at=None):
         async with self.scan_lock:
             s = self.config.settings
             if not s.tieba_enabled or not s.account_id or not self.config.api_key() or native_pressure(self.config):
                 return False
             account, identity = s.account_id, uuid.uuid4().hex
+            schedule_before=self.next_at()
             signature = interest_signature(s)
             self.busy = True
-            self.execute('INSERT INTO tieba_runs(id,account,started,state) VALUES(?,?,?,?)',
-                         (identity, account, time.time(), 'running'))
+            self.execute('INSERT INTO tieba_runs(id,account,started,state,origin,scheduled_due_at) VALUES(?,?,?,?,?,?)',
+                         (identity, account, time.time(), 'running','scheduler' if scheduled else 'manual',
+                          float(scheduled_due_at or 0)))
             read, picked, image_count = 0, 0, 0
             try:
                 candidates = []
@@ -536,8 +543,18 @@ class TiebaService:
                 self.busy = False
                 self.execute("UPDATE tieba_runs SET state='interrupted',finished=?,error='浏览期间配置变化，停止本轮' WHERE id=? AND state='running'",
                              (time.time(), identity))
-                self.execute('INSERT OR REPLACE INTO tieba_state VALUES(?,?)',
-                             (account, time.time() + self.config.settings.tieba_interval_minutes * 60))
+                with self.config.lock,self.store.lock,self.store.db:
+                    if self.config.settings.account_id==account:
+                        deadline=time.time()+self.config.settings.tieba_interval_minutes*60
+                        self.store.db.execute('INSERT OR IGNORE INTO tieba_state VALUES(?,?)',(account,deadline))
+                        self.store.db.execute('UPDATE tieba_state SET next_at=? WHERE account=? AND next_at=?',
+                            (deadline,account,schedule_before))
+                completed=self.store.db.execute('SELECT state,read_count FROM tieba_runs WHERE id=?',(identity,)).fetchone()
+                if scheduled and completed and completed['state']=='done' and completed['read_count']>0:
+                    self.runtime.life_autonomy.record_behavior('tieba_interval_minutes',
+                        s.tieba_interval_minutes,
+                        {'origin':'scheduler','run_id':identity,'read_count':completed['read_count'],
+                         'scheduled_due_at':scheduled_due_at})
             return True
 
     def learn(self, account, thread, value):
@@ -1014,10 +1031,12 @@ class TiebaService:
                     self.retention.cleanup_once()
                 if not self.runtime.processing and not self.store.queue() and not self.busy and not native_pressure(self.config):
                     await self.archives.resume_once()
-                if (s.tieba_enabled and s.account_id and (self.requested or time.time() >= self.next_at())
+                scheduled_due_at=self.next_at()
+                scheduled_due=bool(s.tieba_enabled and s.account_id and not self.requested and time.time() >= scheduled_due_at)
+                if (s.tieba_enabled and s.account_id and (self.requested or scheduled_due)
                         and not self.runtime.processing and not self.store.queue() and not native_pressure(self.config)):
                     self.requested = False
-                    await self.scan()
+                    await self.scan(scheduled=scheduled_due,scheduled_due_at=scheduled_due_at)
                 if (s.tieba_enabled and not self.runtime.processing and not self.store.queue() and not self.busy
                         and not native_pressure(self.config) and time.time()-self.last_enrich >= 60):
                     self.last_enrich = time.time()

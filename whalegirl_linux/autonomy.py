@@ -22,11 +22,12 @@ def enabled(settings):
 
 
 STATIC_PROMPT = '''
-【自主参与】保持真实少女活人感。看清语境自由选择旁观、文字、原生表情或穿插发送，不凑格式或字数；普通任务及时做。
+【自主参与】保持真实少女活人感。看清语境自由选择旁观、文字、原生表情或穿插发送，不凑格式或字数；普通任务及时做。不当“居委会调解员”或“端水大师”，别人斗嘴互损时可顺着好感度偏心护短、起哄看戏或发表情包，不必两边劝和。
 可选JSON扩展字段（无变动留空）：
-1. participation_reason：简短行动依据（供管理员查看）。
+1. inner_thought：15字内少女真实心理嘀咕（如看戏、吐槽、小骄傲、偏心，仅后台记录不外发）。
+1b. participation_reason：简短行动依据（供管理员查看）。
 2. intent_ops：最多2项后续跟进，基于真实来由：
-   - 规划：{"op":"plan","topic":"以后想接续的具体事情","source_key":"本会话真实消息key","after_minutes":60,"expires_minutes":1440}（到期须大于等待，最长10080分）
+   - 规划：{"op":"plan","kind":"followup","topic":"以后想接续的具体事情","source_key":"本会话真实消息key","after_minutes":60,"expires_minutes":1440}（仅在对方明确提到1～6小时内将发生的具体事件如考试、答辩、开黑、赶车、做饭等时记录，after_minutes设60～360、expires_minutes设720～1440；普通寒暄绝不建）
    - 结束：{"op":"complete|cancel","id":"确切意图ID"}。普通寒暄不建，不承诺一定到点联系。
 3. mood_update：真实互动引起的情绪微澜：
    {"mood":"normal|proud|flustered|grumpy|jealous|hyped|sleepy","energy_delta":2,"source_key":"真实消息key","reason":"具体互动依据"}。无新情绪事件留空自然平复。
@@ -174,9 +175,9 @@ class AutonomyService:
             return ''
         batch = batch if batch is not None else [first]
         text = self.experience.social_prompt(first, batch)
-        text += self.experience.emotional_context(first)
-        text += self.experience.interaction_prompt(first)
-        if proactive:
+        text += self.experience.emotional_context(first,batch=batch)
+        text += self.experience.interaction_prompt(first,batch)
+        if proactive or any(k in current_query(batch) for k in ('无聊', '在干嘛', '干嘛呢', '聊点什么', '看什么', '刷到什么')):
             text += self.experience.reading_prompt(first)
         query = current_query(batch)
         rows = self.pending(first['account'], first['chat'])
@@ -299,7 +300,7 @@ class AutonomyService:
         self.experience.capture(first, batch, decision.get('experience_update'))
         if decision.get('should_reply') is False:
             self.experience.settle(first, 'silent')
-        if proactive:
+        if proactive or any(k in current_query(batch) for k in ('无聊', '在干嘛', '干嘛呢', '聊点什么', '看什么', '刷到什么')):
             self.experience.consume_reading(first)
         kind = 'speak' if decision.get('should_reply') else 'silent'
         self.log(first, kind, decision.get('participation_reason') or decision.get('reason') or 'AI 根据当前会话选择行动',

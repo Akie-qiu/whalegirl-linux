@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .gateway import AgentGateway
 from .runtime import Runtime
 from .settings import Config, ModelProfile, Settings
+from .model_management import ModelCreateRequest, ModelDraftRequest, ModelListRequest, fetch_models, request_key, catalog_endpoint
 from .store import Store
 from .stability import read_stability
 from .personas import PersonaLibrary, PersonaSpec, PersonaSaveRequest, PersonaActionRequest, compile_persona
@@ -61,6 +62,47 @@ class BilibiliReadingRequest(BaseModel):
     enabled: bool
 
 
+class BilibiliReplyActionRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    action: Literal['send', 'ignore', 'requeue']
+    text: str | None = Field(default=None, max_length=500)
+
+
+class BilibiliReplyResumeRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    acknowledge: bool = False
+
+
+class BilibiliWatchConfigRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    bilibili_watch_enabled: bool | None = None
+    bilibili_watch_chat_ids: list[str] | None = Field(default=None, max_length=20)
+    bilibili_watch_push_cooldown_minutes: int | None = Field(default=None, ge=0, le=720)
+    bilibili_watch_spoiler_lock_minutes: int | None = Field(default=None, ge=15, le=1440)
+    bilibili_watch_targets: list[dict] | None = Field(default=None, max_length=30)
+    bilibili_watch_calendars: dict | None = None
+
+
+class BilibiliWatchProbeRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    force: bool = True
+    digest: bool = False
+
+
+class BilibiliWatchItemActionRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    action: Literal['mark_story', 'unmark_story', 'disable', 'enable', 'requeue', 'redeliver']
+
+
+class BilibiliWatchSpoilerLockRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    chat: str = Field(min_length=1, max_length=200)
+    game: Literal['genshin', 'starrail', 'zzz', 'all'] = 'all'
+    action: Literal['lock', 'unlock'] = 'unlock'
+    minutes: int | None = Field(default=None, ge=15, le=1440)
+    reason: str = Field(default='管理员手动防剧透设置', max_length=160)
+
+
 class ConfigRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     settings: Settings
@@ -78,7 +120,7 @@ class ConfigRequest(BaseModel):
 
 class ModelProfileRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    profile_id: Literal['flash', 'pro', 'responses', 'custom']
+    profile_id: str = Field(pattern=r'^[a-z][a-z0-9_-]{0,63}$')
     profile: ModelProfile
     api_key: str = Field(default='', max_length=1024, repr=False)
     activate: bool = True
@@ -262,12 +304,13 @@ class ImageConfigRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
     values: dict = Field(default_factory=dict)
     api_key: str = Field(default='', max_length=1024)
+    unrestricted_api_key: str = Field(default='', max_length=1024, repr=False)
 
 
 class ImageTaskRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
     kind: str = Field(default='generate', pattern='^(generate|send)$')
-    prompt: str = Field(default='', max_length=3000)
+    prompt: str = ''
     asset_id: str = Field(default='', max_length=64)
     destination: str = Field(default='library', pattern='^(library|chat|moments)$')
     chat: str = Field(default='', max_length=200)
@@ -277,16 +320,17 @@ class ImageTaskRequest(BaseModel):
     character_variant: str = Field(default='', pattern='^(|chibi|girl|mature)$')
     mode: str = Field(default='auto', pattern='^(auto|edit|remix)$')
     aspect_ratio: str = Field(default='auto', pattern='^(auto|1:1|4:3|3:4|16:9|9:16|3:2|2:3|4:5|5:4|2:1|1:2)$')
+    unrestricted: bool = False
 
 
 class ReferenceUploadRequest(MomentsAssetRequest):
-    variant: str = Field(pattern='^(chibi|girl|mature|temporary)$')
+    variant: str = Field(pattern='^(chibi|girl|mature|comic_example|temporary)$')
     role: str = Field(default='', max_length=400)
 
 
 class ReferenceEditRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    variant: str = Field(pattern='^(chibi|girl|mature)$')
+    variant: str = Field(pattern='^(chibi|girl|mature|comic_example)$')
     name: str = Field(min_length=1, max_length=80)
     role: str = Field(default='', max_length=400)
     enabled: bool = True
@@ -336,6 +380,8 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     app.state.runtime = runtime
     app.state.config = config
     app.state.personas = personas
+    from .audio_api import install_audio_api
+    install_audio_api(app, runtime)
     auth_attempts = {}
     public_host = os.environ.get('WHALEGIRL_PUBLIC_HOST', '').strip().lower()
     public_origins = {value.strip().rstrip('/') for value in
@@ -417,14 +463,44 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     async def console_style():
         return FileResponse(root / "whalegirl_linux" / "console.css", media_type="text/css")
 
+    @app.get("/studio.js")
+    async def studio_script():
+        return FileResponse(root / "whalegirl_linux" / "studio.js", media_type="text/javascript")
+
+    @app.get("/studio.css")
+    async def studio_style():
+        return FileResponse(root / "whalegirl_linux" / "studio.css", media_type="text/css")
+
+    @app.get("/studio-background.jpg")
+    async def studio_background():
+        return FileResponse(root / "whalegirl_linux" / "assets" / "studio-background.jpg",
+                            media_type="image/jpeg")
+
     @app.get('/token-usage.js')
     async def token_usage_script():
-        return FileResponse(root/'whalegirl_linux'/'token-usage.js',media_type='text/javascript')
+        return FileResponse(root/'whalegirl_linux'/'usage-dashboard.js',media_type='text/javascript')
+
+    @app.get('/usage-dashboard.css')
+    async def usage_dashboard_style():
+        return FileResponse(root/'whalegirl_linux'/'usage-dashboard.css',media_type='text/css')
 
     @app.get('/api/token-usage')
     async def token_usage(period: str='today'):
         if period not in ('today','7d','30d','all'):raise HTTPException(400,'统计范围无效')
         return runtime.token_ledger.snapshot(config.settings.account_id,period)
+
+    @app.get('/api/usage-dashboard/options')
+    async def usage_dashboard_options():
+        from starlette.concurrency import run_in_threadpool
+        return await run_in_threadpool(runtime.statistics.options)
+
+    @app.get('/api/usage-dashboard')
+    async def usage_dashboard(period: str='today',chat: str='',model: str='',view: str='both'):
+        from starlette.concurrency import run_in_threadpool
+        try:
+            return await run_in_threadpool(runtime.statistics.snapshot,period,chat=chat,model=model,view=view)
+        except ValueError as exc:
+            raise HTTPException(400,str(exc)) from exc
 
     @app.get('/personas.js')
     async def personas_script():
@@ -526,9 +602,41 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     @app.get('/api/growth')
     def growth_state():return runtime.growth.snapshot()
 
+    @app.get('/api/life-autonomy')
+    def life_autonomy_state():return runtime.life_autonomy.catalog()
+
+    @app.get('/api/life-autonomy/{identity}/events')
+    def life_autonomy_events(identity:str,before:int=0,limit:int=40):
+        try:return runtime.life_autonomy.event_page(identity,max(0,before),limit)
+        except ValueError as exc:raise HTTPException(404,str(exc)) from None
+
+    @app.post('/api/life-autonomy/preview')
+    def life_autonomy_preview(body:dict):
+        try:return runtime.life_autonomy.preview(body.get('parameter'),body.get('value'),body.get('reason'))
+        except (TypeError,ValueError) as exc:raise HTTPException(400,str(exc)) from None
+
+    @app.post('/api/life-autonomy/apply')
+    def life_autonomy_apply(body:dict):
+        try:return runtime.life_autonomy.apply(str(body.get('id') or ''),actor='admin')
+        except (TypeError,ValueError) as exc:raise HTTPException(409,str(exc)) from None
+
+    @app.post('/api/life-autonomy/{identity}/observe')
+    def life_autonomy_observe(identity:str):
+        try:return runtime.life_autonomy.observe(identity)
+        except ValueError as exc:raise HTTPException(404,str(exc)) from None
+
+    @app.post('/api/life-autonomy/{identity}/rollback')
+    def life_autonomy_rollback(identity:str,body:dict):
+        try:return runtime.life_autonomy.rollback(identity,body.get('reason') or '',actor='admin')
+        except ValueError as exc:raise HTTPException(409,str(exc)) from None
+
     @app.get('/api/growth/insights')
     def growth_insights(before:int=0,limit:int=80,source:str=''):
         return runtime.growth.memory_page(max(0,before),limit,source)
+
+    @app.get('/api/growth/personality/revisions')
+    def growth_personality_revisions(trait_key:str='',before:int=0,limit:int=40):
+        return runtime.growth.personality_history(trait_key,max(0,before),limit)
 
     @app.get('/bilibili.js')
     async def bilibili_script():
@@ -557,7 +665,7 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
 
     @app.post('/api/bilibili/explore')
     def bilibili_explore():
-        try:return runtime.growth.request('bilibili')
+        try:return runtime.growth.request('bilibili',origin='admin')
         except ValueError as exc:raise HTTPException(400,str(exc)) from None
 
     @app.post('/api/bilibili/readings/{identity}')
@@ -577,9 +685,136 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
         try:return FileResponse(runtime.bilibili.board_path(identity,index),media_type='image/jpeg',headers={'Cache-Control':'no-store'})
         except ValueError as exc:raise HTTPException(404,str(exc)) from None
 
+    @app.post('/api/bilibili/replies/{identity}')
+    async def bilibili_reply_action(identity:str,body:BilibiliReplyActionRequest):
+        try:
+            if body.action=='send':
+                return await runtime.bilibili.reply_service.send_reply(identity,manual=True,override_text=body.text)
+            if body.action=='requeue':
+                return runtime.bilibili.reply_service.requeue_reply(identity)
+            return runtime.bilibili.reply_service.ignore_reply(identity)
+        except ValueError as exc:raise HTTPException(400,str(exc)) from None
+
+    @app.post('/api/bilibili/reply-resume')
+    def bilibili_reply_resume(body:BilibiliReplyResumeRequest):
+        if not body.acknowledge:raise HTTPException(400,'请先核对评论风控状态，再明确确认恢复评论发送')
+        runtime.bilibili.client.resume_reply()
+        return runtime.bilibili.reply_service.status()
+
+    @app.get('/api/bilibili/reply-directory')
+    async def bilibili_reply_directory(refresh:bool=False):
+        try:return await runtime.bilibili.reply_service.directory(refresh=refresh)
+        except ValueError as exc:raise HTTPException(400,str(exc)) from None
+
+    @app.post('/api/bilibili/reply-lookup')
+    async def bilibili_reply_lookup(body:dict):
+        try:return await runtime.bilibili.reply_service.lookup_user(str(body.get('query') or ''))
+        except ValueError as exc:raise HTTPException(400,str(exc)) from None
+
+    @app.post('/api/bilibili/poll-mentions')
+    async def bilibili_poll_mentions():
+        try:
+            await runtime.bilibili.poll_mentions(force=True)
+            await runtime.bilibili.reply_service.poll_reply_notifications(force=True)
+            promoted=runtime.bilibili.reply_service.promote_newly_whitelisted()
+            if not runtime.bilibili.reply_service.busy and any(
+                r['state']=='queued' for r in runtime.bilibili.reply_service.list_replies(limit=5)
+            ):
+                asyncio.create_task(runtime.bilibili.reply_service.process_next())
+            return {
+                'ok':True,
+                'promoted':promoted,
+                'mention_monitor':runtime.bilibili.mention_monitor(),
+                'reply_monitor':runtime.bilibili.reply_service.status(),
+                'comment_replies':runtime.bilibili.reply_service.list_replies(),
+            }
+        except ValueError as exc:
+            raise HTTPException(400,str(exc)) from None
+
+    @app.post('/api/bilibili/replies-prune')
+    def bilibili_replies_prune():
+        stats=runtime.bilibili.reply_service.prune(manual=True)
+        return {
+            'ok':True,
+            **stats,
+            'reply_monitor':runtime.bilibili.reply_service.status(),
+            'comment_replies':runtime.bilibili.reply_service.list_replies(),
+        }
+
+    @app.get('/api/bilibili/watch')
+    def bilibili_watch_state():
+        return runtime.bilibili.watch.snapshot()
+
+    @app.post('/api/bilibili/watch/config')
+    def bilibili_watch_config(body: BilibiliWatchConfigRequest):
+        updates = body.model_dump(exclude_none=True)
+        try:
+            merged = Settings.model_validate({**config.settings.model_dump(), **updates})
+            if set(merged.bilibili_watch_chat_ids) - set(merged.allowed_chat_ids):
+                raise ValueError('只能选择已授权允许回复的微信群/会话作为追更推送群')
+            config.save(merged)
+            return runtime.bilibili.watch.snapshot()
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)[:200]) from None
+
+    @app.post('/api/bilibili/watch/probe')
+    async def bilibili_watch_probe(body: BilibiliWatchProbeRequest):
+        result = await runtime.bilibili.watch.probe_once(force=body.force)
+        if body.digest and runtime.bilibili.watch.has_pending() and not runtime.growth.busy:
+            try:
+                await runtime.growth.run_once()
+            except Exception:
+                pass
+        return {**result, 'snapshot': runtime.bilibili.watch.snapshot()}
+
+    @app.post('/api/bilibili/watch/items/{identity}')
+    def bilibili_watch_item_action(identity: str, body: BilibiliWatchItemActionRequest):
+        if not re.fullmatch(r'[0-9a-f]{32}', identity):
+            raise HTTPException(400, '追更条目编号无效')
+        try:
+            item = runtime.bilibili.watch.item_action(identity, body.action)
+            return {'ok': True, 'item': item, 'snapshot': runtime.bilibili.watch.snapshot()}
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from None
+
+    @app.get('/api/bilibili/watch/items/{identity}/images/{index}')
+    def bilibili_watch_item_image(identity: str, index: int):
+        if not re.fullmatch(r'[0-9a-f]{32}', identity) or not 0 <= index < 3:
+            raise HTTPException(400, '追更图片参数无效')
+        row = store.db.execute(
+            'SELECT image_paths_json FROM bilibili_watch_items WHERE id=? AND account=?',
+            (identity, config.settings.account_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, '追更条目不存在')
+        paths = json.loads(row['image_paths_json'] or '[]')
+        if index >= len(paths):
+            raise HTTPException(404, '图片不存在')
+        base = runtime.bilibili.watch.watch_cache_dir.resolve()
+        target = Path(paths[index]).resolve()
+        if target != base and base not in target.parents or not target.is_file():
+            raise HTTPException(404, '图片缓存已清理')
+        media = 'image/png' if target.suffix.lower() == '.png' else 'image/jpeg'
+        return Response(target.read_bytes(), media_type=media)
+
+    @app.post('/api/bilibili/watch/spoiler-locks')
+    def bilibili_watch_spoiler_locks(body: BilibiliWatchSpoilerLockRequest):
+        account = config.settings.account_id
+        if not account:
+            raise HTTPException(409, '请先登录并绑定微信账号')
+        if body.chat not in config.settings.allowed_chat_ids:
+            raise HTTPException(400, '会话不在允许列表中')
+        if body.action == 'lock':
+            runtime.bilibili.watch.set_spoiler_lock(
+                account, body.chat, body.game, reason=body.reason, sender='admin', minutes=body.minutes,
+            )
+        else:
+            runtime.bilibili.watch.clear_spoiler_lock(account, body.chat, body.game)
+        return {'ok': True, 'snapshot': runtime.bilibili.watch.snapshot()}
+
     @app.post('/api/growth/run')
     def growth_run(body:dict):
-        try:return runtime.growth.request(body.get('kind','world'))
+        try:return runtime.growth.request(body.get('kind','world'),origin='admin')
         except ValueError as exc:raise HTTPException(400,str(exc)) from exc
 
     @app.get('/api/growth/journals/{identity}')
@@ -658,7 +893,7 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     async def proactive_config(body: ProactiveConfigRequest):
         allowed = {name for name in Settings.model_fields if name.startswith('proactive_')}
         allowed.update({'autonomy_enabled', 'experience_growth_enabled', 'participation','stickers_enabled','sticker_aggressiveness',
-                        'sticker_cooldown_seconds','reply_max_parts','reply_part_interval','quiet_default_minutes'})
+                        'sticker_cooldown_seconds','pat_cooldown_seconds','reply_max_parts','reply_part_interval','quiet_default_minutes'})
         allowed.update({'sticker_text_pair_eagerness','sticker_only_eagerness','sticker_reaction_eagerness',
                         'sticker_max_per_reply','sticker_style_note','sticker_usage_target','fast_reply_enabled'})
         if set(body.values) - allowed:
@@ -810,8 +1045,15 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
             raise HTTPException(400, '图片设置包含未知参数')
         try:
             settings = Settings.model_validate({**config.settings.model_dump(), **body.values})
+            if settings.image_unrestricted_enabled and (
+                not settings.image_unrestricted_api_url
+                or not settings.image_unrestricted_model
+                or not (body.unrestricted_api_key.strip() or config.unrestricted_image_api_key())
+            ):
+                raise ValueError('开启无限制生图开关前，请先填写无限制生图接口地址、模型名和密钥')
             config.save(settings)
             config.save_image_key(body.api_key)
+            config.save_unrestricted_image_key(body.unrestricted_api_key)
             runtime.images.retention.next_scan = 0
             return config.public()
         except ValueError as exc:
@@ -900,6 +1142,8 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     async def image_task(body: ImageTaskRequest):
         try:
             if body.destination == 'moments':
+                if body.unrestricted:
+                    raise ValueError('朋友圈配图不使用无限制生图')
                 row = runtime.moments.book.get(config.settings.account_id, body.moment_id)
                 if not row or row['state'] != 'draft' or row['kind'] != 'publish':
                     raise ValueError('请先选择一条待审的朋友圈发布草稿')
@@ -1104,6 +1348,14 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
     async def get_config():
         return config.public()
 
+    @app.get('/model-manager.js')
+    async def model_manager_script():
+        return FileResponse(root/'whalegirl_linux'/'model-manager.js',media_type='text/javascript')
+
+    @app.get('/model-manager.css')
+    async def model_manager_style():
+        return FileResponse(root/'whalegirl_linux'/'model-manager.css',media_type='text/css')
+
     @app.get('/api/model-profiles')
     async def get_model_profiles():
         return {'active_model_profile': config.active_model_profile,
@@ -1120,6 +1372,50 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
             return result
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+
+    @app.post('/api/model-profiles/create')
+    async def create_model_profile(body: ModelCreateRequest):
+        try:
+            key=body.api_key.strip()
+            if body.copy_key:
+                if not body.copy_from:raise ValueError('复制密钥需要明确指定来源配置')
+                source=config.model_profile(body.copy_from)
+                if catalog_endpoint(source.api_url,source.api_style)!=catalog_endpoint(body.profile.api_url,body.profile.api_style):
+                    raise ValueError('复制配置的密钥仅用于原接口地址')
+                key=key or config.api_key(body.copy_from)
+            identity,result=config.create_model_profile(body.profile,key,activate=body.activate)
+            if body.activate:runtime.poll_wake.set()
+            return {'profile_id':identity,'config':result}
+        except ValueError as exc:raise HTTPException(400,str(exc)) from exc
+
+    @app.post('/api/model-profiles/models')
+    async def list_profile_models(body: ModelListRequest):
+        try:
+            key=request_key(config,body.profile_id,body.api_url,body.api_style,body.api_key)
+            return await fetch_models(body.api_url,body.api_style,key)
+        except ValueError as exc:raise HTTPException(400,str(exc)) from exc
+
+    @app.post('/api/model-profiles/test')
+    async def test_profile_model(body: ModelDraftRequest):
+        profile=body.profile
+        try:key=request_key(config,body.profile_id,profile.api_url,profile.api_style,body.api_key)
+        except ValueError as exc:raise HTTPException(400,str(exc)) from exc
+        if not key:raise HTTPException(400,'先填写此配置的API Key')
+        values=profile.connection_settings()
+        temperature=values.pop('model_temperature')
+        stream=values.pop('model_stream_enabled')
+        engine=runtime.engine_factory(**values,api_key=key,temperature=temperature if temperature is not None else .55,
+            stream_enabled=stream,timeout=20,max_retries=1)
+        engine.pricing_snapshot={'profile_id':body.profile_id or 'unsaved','name':profile.name or profile.model,
+                                  'pricing':profile.pricing.model_dump()}
+        engine.usage_callback=lambda event:runtime.token_ledger.record(config.settings.account_id,event)
+        started=time.monotonic()
+        try:
+            text=await engine.chat([{'role':'user','content':'只回复：连接正常'}],
+                max_tokens=min(profile.max_tokens,512),operation='connection_test')
+            return {'ok':bool(text),'message':text[:100] if text else engine.last_error or '模型未返回可用内容',
+                'api_style':engine.api_style,'elapsed_ms':round((time.monotonic()-started)*1000)}
+        finally:await engine.close()
 
     @app.post("/api/config")
     async def save_config(body: ConfigRequest):
@@ -1152,6 +1448,8 @@ def create_app(directory=None, *, gateway=None, engine_factory=None, run_backgro
                 settings.active_persona_id = ''
                 settings.active_persona_revision = 0
             config.save(settings, body.api_key)
+            runtime.bilibili.reply_service.promote_newly_whitelisted()
+            runtime.bilibili.reply_service.prune(manual=False)
             runtime.poll_wake.set()
             config.save_search_key(body.search_api_key)
             runtime.moments.settings_changed(previous_settings, settings)

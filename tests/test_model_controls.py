@@ -85,7 +85,9 @@ class StreamedChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await engine.chat([]), "")
         self.assertIn("Token", engine.last_error)
         self.assertEqual(self.events[0]["output_tokens"], 20)
-        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(self.events[1]["output_tokens"], 20)
+        self.assertTrue(all(row['status'] == 'error' for row in self.events))
 
     async def test_anthropic_stream_hides_thinking_and_combines_cache_usage(self):
         engine = self.engine("anthropic", sse(
@@ -119,7 +121,7 @@ class StreamedChatTests(unittest.IsolatedAsyncioTestCase):
                 engine = self.engine(style, body)
                 self.assertEqual(await engine.chat([]), "")
                 self.assertEqual(self.events[-1]["status"], "error")
-        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(len(self.requests), 4)
 
     async def test_rejected_parameter_does_not_trigger_fallback_or_retry(self):
         engine = self.engine("responses", '{"error":"unsupported reasoning"}', status=400)

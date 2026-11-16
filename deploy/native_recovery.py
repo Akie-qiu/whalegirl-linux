@@ -52,7 +52,7 @@ def resolve_modal(ui):
 
 def chat_navigation(ui, root):
     buttons = [n for n in ui.walk(root) if n.get('role') == 'push-button']
-    exact = [n for n in buttons if n.get('name') in ('Chats', 'Chat', '聊天')]
+    exact = [n for n in buttons if n.get('name') in ('Chats', 'Chat', '聊天', 'Weixin')]
     if len(exact) == 1:
         return exact[0]
     # 4.1.1.8 exposes the chat icon without a name, directly above Contacts.
@@ -70,19 +70,45 @@ def chat_navigation(ui, root):
     return candidates[0] if len(candidates) == 1 else None
 
 
+def minimize_moments_editor(ui, frame):
+    """Hide an open Moments draft so chat recovery never types into it."""
+    from moments_ui import editors
+    windows = ui.run_process(['xdotool', 'search', '--onlyvisible', '--name', '^Moments$'],
+                             capture_output=True, text=True, timeout=3)
+    ids = [value for value in windows.stdout.split() if value.isdigit()]
+    if windows.returncode not in (0, 1) or len(ids) != 1:
+        raise ValueError('无法唯一定位朋友圈窗口，保留草稿并暂停恢复')
+    ui.run_process(['xdotool', 'windowminimize', ids[0]], check=True, timeout=3)
+    time.sleep(.15)
+    refreshed = ui.tree()
+    remaining = [n for n in ui.walk(refreshed)
+                 if n.get('role') == 'frame' and n.get('name') == 'Moments']
+    if any(editors(n) for n in remaining):
+        raise ValueError('朋友圈编辑器未能最小化，保留草稿并暂停恢复')
+
+
 def reset_surface(ui):
+    version_file = Path('/data/runtime-version.json')
+    modern = version_file.is_file() and json.loads(version_file.read_text()).get('wechat_version') == '4.1.13.26'
+    if modern:
+        from native_voice_compat import restore_main
+        restore_main(ui)
     storage_dismissed=resolve_modal(ui)
     root = ui.tree()
     moments = [n for n in ui.walk(root) if n.get('role') == 'frame' and n.get('name') == 'Moments']
     if moments:
         from moments_ui import editors, button
-        if len(moments) != 1 or editors(moments[0]):
-            raise ValueError('朋友圈编辑器仍打开，保留草稿，请先完成或关闭编辑')
-        ui.click_node(button(moments[0], 'Close'))
+        if len(moments) != 1:
+            raise ValueError('无法唯一定位朋友圈窗口，保留草稿并暂停恢复')
+        if editors(moments[0]):
+            minimize_moments_editor(ui, moments[0])
+        else:
+            ui.click_node(button(moments[0], 'Close'))
     ui.close_previews(ui.preview_windows())
     # No typing, Return, clipboard edits, process restart or login operation.
-    for _ in range(2):
-        ui.run_process(['xdotool', 'key', '--clearmodifiers', 'Escape'], check=True, timeout=3)
+    if not modern:
+        for _ in range(2):
+            ui.run_process(['xdotool', 'key', '--clearmodifiers', 'Escape'], check=True, timeout=3)
     root = ui.tree()
     navigation = chat_navigation(ui, root)
     if navigation:

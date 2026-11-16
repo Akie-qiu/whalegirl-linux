@@ -62,7 +62,7 @@ function populateSettings() {
   $('group-mentions-enabled').checked = cfg.group_mentions_enabled ?? true;
   $('global-memory').checked = cfg.global_memory;
   $('vision-enabled').checked = cfg.vision_enabled;
-  $('context-count').value = Math.max(10, Math.min(100, Number(cfg.context_messages) || 40));
+  $('context-count').value = Math.max(10, Math.min(100, Number(cfg.context_messages) || 100));
   populateModelProfiles(cfg);
   $('cooldown').value = cfg.chat_cooldown; $('send-interval').value = cfg.min_send_interval;
   $('quick-enabled').checked = cfg.enabled;
@@ -72,7 +72,7 @@ function populateSettings() {
       safety_chat_per_hour:40,safety_per_day:500,safety_duplicate_seconds:180})) {
     $(name.replaceAll('_','-')).value = cfg[name] ?? fallback;
   }
-  text('key-status', cfg.api_key_configured ? '服务器已保存 API Key；留空不会覆盖。' : '尚未配置 API Key。');
+  // Each selected model's secret status is rendered by model-manager.js.
   text('wechat-version', '微信固定版本 ' + cfg.expected_wechat_version);
   renderChats();
   if (window.habits) window.habits.populate();
@@ -89,79 +89,10 @@ function populateSettings() {
   window.proactiveChat?.populate();
   window.tokenUsage?.refresh();
 }
-const MODEL_PRESETS = {
-  flash: { url: 'https://api.deepseek.com/chat/completions', model: 'deepseek-flash', style: 'openai' },
-  pro: { url: 'https://api.deepseek.com/chat/completions', model: 'deepseek-v4-pro', style: 'openai' },
-  responses: { url: 'https://api.deepseek.com/responses', model: 'deepseek-chat', style: 'responses' },
-  custom: { url: 'https://api.deepseek.com/chat/completions', model: 'deepseek-chat', style: 'auto' }
-};
-const MODEL_PROFILE_IDS = Object.keys(MODEL_PRESETS);
-function normalizeModelUrl(value) { return String(value || '').trim().replace(/\/$/, ''); }
-function modelProfileDefaults(id) {
-  const preset = MODEL_PRESETS[id] || MODEL_PRESETS.custom;
-  return { api_url: preset.url, api_style: preset.style, model: preset.model, max_tokens: 220, model_temperature:null,
-    reasoning_effort: 'default', model_stream_enabled: false, api_key_configured: false };
-}
-function normalizedModelProfile(id, value = {}) {
-  return { ...modelProfileDefaults(id), ...(value || {}), api_url: normalizeModelUrl(value?.api_url ?? modelProfileDefaults(id).api_url),
-    api_style: value?.api_style || modelProfileDefaults(id).api_style, model: String(value?.model ?? modelProfileDefaults(id).model),
-    max_tokens: Number(value?.max_tokens || 220), reasoning_effort: value?.reasoning_effort || 'default',
-    model_temperature:value?.model_temperature==null?null:Number(value.model_temperature),
-    model_stream_enabled: value?.model_stream_enabled ?? false, api_key_configured: !!value?.api_key_configured };
-}
-function currentModelDraft() {
-  return { api_url: normalizeModelUrl($('api-url').value), api_style: $('api-style').value || 'auto', model: $('model').value.trim(),
-    max_tokens: Number($('max-tokens').value || 220), reasoning_effort: $('reasoning-effort').value || 'default',
-    model_temperature:$('model-temperature').value.trim()===''?null:Number($('model-temperature').value),
-    model_stream_enabled: $('model-stream-enabled').checked, api_key_configured: !!modelProfiles[activeModelProfile]?.api_key_configured };
-}
-function rememberCurrentModelDraft() {
-  if (!$('api-url')) return;
-  modelProfiles[activeModelProfile] = normalizedModelProfile(activeModelProfile, currentModelDraft());
-  draftModelKeys[activeModelProfile] = $('api-key').value;
-}
-function loadModelProfile(id) {
-  activeModelProfile = MODEL_PROFILE_IDS.includes(id) ? id : 'custom';
-  const profile = modelProfiles[activeModelProfile] = normalizedModelProfile(activeModelProfile, modelProfiles[activeModelProfile]);
-  $('api-url').value = profile.api_url; $('api-style').value = profile.api_style; $('model').value = profile.model;
-  $('max-tokens').value = profile.max_tokens; $('reasoning-effort').value = profile.reasoning_effort;
-  $('model-temperature').value = profile.model_temperature ?? '';
-  $('model-stream-enabled').checked = !!profile.model_stream_enabled;
-  $('api-key').value = Object.prototype.hasOwnProperty.call(draftModelKeys, activeModelProfile) ? draftModelKeys[activeModelProfile] : '';
-  text('key-status', profile.api_key_configured ? '服务器已保存此模型卡片的 API Key；留空不会覆盖。' : '此模型卡片尚未配置 API Key。');
-  syncModelPreset();
-}
-function populateModelProfiles(config) {
-  modelProfiles = {};
-  draftModelKeys = {};
-  const raw = config.model_profiles || {};
-  for (const id of MODEL_PROFILE_IDS) modelProfiles[id] = normalizedModelProfile(id, raw[id]);
-  activeModelProfile = MODEL_PROFILE_IDS.includes(config.active_model_profile) ? config.active_model_profile : 'custom';
-  loadModelProfile(activeModelProfile);
-}
-function syncModelPreset() {
-  for (const button of document.querySelectorAll('[data-model-preset]'))
-    button.setAttribute('aria-pressed', String(button.dataset.modelPreset === activeModelProfile));
-  const responses = $('api-style').value === 'responses' || /\/responses$/i.test(normalizeModelUrl($('api-url').value));
-  text('api-style-hint', responses ?
-    '使用 Responses 协议；此卡片单独保存自己的地址、密钥和模型名。':
-    '支持 HTTP / HTTPS 中转，可填 /v1 基础地址或完整接口地址；每张模型卡片分别保存。');
-  const anthropic=$('api-style').value==='anthropic' || ($('api-style').value==='auto' && /anthropic|\/messages\/?$/i.test(normalizeModelUrl($('api-url').value)));
-  $('model-temperature').max=anthropic?'1':'2';
-  text('model-temperature-hint',responses?'当前 Responses 接口不发送温度参数；此值可保存，但不会在该协议下生效。':
-    '普通回复与主动聊天共用此值；'+(anthropic?'此接口支持0～1。':'范围0～2，较高时表达通常更多样。')+'留空沿用原默认：普通0.55、主动0.65。');
-}
-for (const button of document.querySelectorAll('[data-model-preset]')) {
-  button.addEventListener('click', () => {
-    rememberCurrentModelDraft();
-    loadModelProfile(button.dataset.modelPreset);
-    text('test-result', '已切换到独立模型卡片；保存后启用该卡片的地址、Key 和模型名。');
-  });
-}
-for (const id of ['api-url','model','api-style','max-tokens','model-temperature','reasoning-effort','model-stream-enabled']) {
-  const markModelDraft = () => { rememberCurrentModelDraft(); syncModelPreset(); text('test-result','有未保存的模型修改，点击“保存模型”后生效'); };
-  $(id).addEventListener('input', markModelDraft); $(id).addEventListener('change', markModelDraft);
-}
+function rememberCurrentModelDraft() { window.modelManager?.capture(); }
+function loadModelProfile(id) { window.modelManager?.select(id); }
+function populateModelProfiles(config) { window.modelManager?.populate(config); }
+function syncModelPreset() { window.modelManager?.sync(); }
 function chatName(id) { const c = chats.find(c => c.id === id); return c ? c.remark || c.name || id : id; }
 function renderChats() {
   const query = $('chat-search').value.trim().toLocaleLowerCase();
@@ -212,7 +143,7 @@ async function refreshChats(silent = false) {
   } catch (error) { renderChats(); if (!silent) throw error; }
 }
 async function saveSubset(values, apiKey = '', searchKey = '') {
-  const current = await api('config'); delete current.api_key_configured; delete current.image_api_key_configured; delete current.search_api_key_configured; delete current.model_profiles; delete current.active_model_profile;
+  const current = await api('config'); delete current.api_key_configured; delete current.image_api_key_configured; delete current.image_unrestricted_api_key_configured; delete current.search_api_key_configured; delete current.model_profiles; delete current.active_model_profile;
   cfg = await api('config', 'POST', { settings: { ...current, ...values }, api_key: apiKey, search_api_key: searchKey });
   await update();
   return cfg;
@@ -288,6 +219,7 @@ function renderState(s) {
   const memoryNote = memoryRecall ? ' · 分级记忆 ' + memoryRecall.count + ' 条' + (memoryRecall.ids.length ? '（#' + memoryRecall.ids.join('、#') + '）' : '') + (memoryRecall.estimated_tokens != null ? ' · 记忆输入约 ' + memoryRecall.estimated_tokens + '/' + memoryRecall.budget + ' Token' : '') + (memoryRecall.skipped_for_budget ? ' · 预算未载入 ' + memoryRecall.skipped_for_budget + ' 条' : '') : '';
   text('timing-detail', timing.total_seconds == null ? '等待下一次实际回复，文字和表情的耗时会分别统计。' : '发现 ' + (timing.detected_after_seconds || 0).toFixed(1) + 's · 上下文 ' + (timing.context_seconds || 0).toFixed(1) + 's · 模型 ' + (timing.model_seconds || 0).toFixed(1) + 's · 发送确认 ' + (timing.send_readback_seconds || 0).toFixed(1) + 's' + memoryNote);
   if(timing.first_reply_seconds!=null)$('timing-detail').append(document.createTextNode(' · 首条确认 '+timing.first_reply_seconds.toFixed(1)+'s'));
+  if(timing.reply_ready_to_submit_seconds!=null)$('timing-detail').append(document.createTextNode(' · 生成后到'+(timing.first_submit_kind==='text'?'文字发送':'提交')+' '+timing.reply_ready_to_submit_seconds.toFixed(2)+'s'));
   if(timing.total_seconds!=null)$('timing-detail').append(document.createTextNode(' · 整轮确认 '+timing.total_seconds.toFixed(1)+'s'+(timing.delivery_queue_seconds!=null?' · 待发 '+timing.delivery_queue_seconds.toFixed(1)+'s':'')+(timing.pre_model_seconds!=null?' · 准备 '+timing.pre_model_seconds.toFixed(1)+'s':'')));
   const stickers = s.stickers || {};
   if (timing.quoted) $('timing-detail').append(document.createTextNode(' · 原生引用回复'));
@@ -426,21 +358,7 @@ $('save-chats').onclick = () => action($('save-chats'), async () => {
     vision_enabled: $('vision-enabled').checked, context_messages: Number($('context-count').value) });
   text('chat-save-note', '会话设置已保存 · ' + new Date().toLocaleTimeString('zh-CN')); notice('会话与唤醒设置已保存。');
 });
-$('save-model').onclick = () => action($('save-model'), async () => {
-  if($('model-temperature').value!=='' && !$('model-temperature').checkValidity())throw new Error('请填写当前接口支持范围内的模型温度，或留空沿用默认');
-  rememberCurrentModelDraft();
-  const response = await api('model-profiles', 'POST', {
-    profile_id: activeModelProfile,
-    profile: { api_url: modelProfiles[activeModelProfile].api_url, api_style: modelProfiles[activeModelProfile].api_style,
-      model: modelProfiles[activeModelProfile].model, max_tokens: modelProfiles[activeModelProfile].max_tokens,
-      model_temperature:modelProfiles[activeModelProfile].model_temperature,
-      reasoning_effort: modelProfiles[activeModelProfile].reasoning_effort,
-      model_stream_enabled: modelProfiles[activeModelProfile].model_stream_enabled },
-    api_key: draftModelKeys[activeModelProfile] || '', activate: true
-  });
-  cfg = response; draftModelKeys[activeModelProfile] = '';
-  populateSettings(); text('test-result','模型卡片已保存并启用'); notice('当前模型卡片已保存；其他卡片的地址、Key 和模型名保持独立。');
-});
+/* Model actions are owned by model-manager.js. */
 $('save-timing').onclick = () => action($('save-timing'), async () => { await saveSubset({ chat_cooldown: Number($('cooldown').value), min_send_interval: Number($('send-interval').value) }); notice('回复节奏已保存。'); });
 $('save-safety').onclick = () => action($('save-safety'), async () => {
   const values={safety_enabled:$('safety-enabled').checked};
@@ -502,15 +420,7 @@ $('save-limits').onclick = () => action($('save-limits'), async () => {
 $('safety-check').onclick = () => action($('safety-check'), async () => { const result=await api('safety/check','POST');await update();notice(result.check_error || (result.hold_reason?'检测到需要人工处理的提示，已停止发送。':'客户端提示检查完成；结果不代表平台风控安全。'),!!result.check_error || !!result.hold_reason); });
 $('safety-resume').onclick = () => action($('safety-resume'), async () => { await api('safety/resume','POST');await update();notice('已恢复发送；历史跳过消息不会补发，现有发送限额继续生效。'); });
 $('quick-enabled').onchange = () => action($('quick-enabled'), async () => { try { await saveSubset({ enabled: $('quick-enabled').checked }); notice(cfg.enabled ? '自动回复已开启。' : '自动回复已关闭。'); } catch (error) { $('quick-enabled').checked = cfg.enabled; throw error; } });
-$('test-model').onclick = () => action($('test-model'), async () => {
-  text('test-result', '正在测试已保存的模型…');
-  const result = await api('model/test', 'POST');
-  const effort = {default:'服务商默认强度',low:'低强度',medium:'中强度',high:'高强度'}[result.reasoning_effort];
-  const detail = [result.stream_enabled == null ? '' : result.stream_enabled ? '流式' : '非流式', effort,
-    result.elapsed_ms == null ? '' : (result.elapsed_ms / 1000).toFixed(1) + ' 秒'].filter(Boolean).join(' · ');
-  text('test-result', result.message + (detail ? '（' + detail + '）' : ''));
-  if (!result.ok) throw new Error(result.message);
-});
+/* Model actions are owned by model-manager.js. */
 $('login').onclick = () => action($('login'), async () => { text('login-message', '正在请求微信二维码，请稍候…'); await api('gateway/login', 'POST'); await update(); notice('登录请求已提交，请按页面提示在手机确认。'); });
 for (const link of document.querySelectorAll('nav a')) link.onclick = () => { for (const item of document.querySelectorAll('nav a')) item.classList.toggle('active', item === link); };
 if (token) connect().catch(error => { text('auth-error', error.message); $('auth').hidden = false; $('dashboard').hidden = true; });
@@ -688,213 +598,5 @@ function buildUnifiedSendLimitsPanel() {
   }
 }
 
-// Run after the feature scripts have appended their navigation links. Move the
-// existing anchors so feature-specific click handlers and deep links survive.
-document.addEventListener('DOMContentLoaded', () => {
-  buildUnifiedSendLimitsPanel();
-  document.body.classList.add('tabbed-workspace');
-  const mainEl=document.querySelector('main'),contentGrid=document.querySelector('.content-grid');
-  const sidebar=document.querySelector('.sidebar'),nav=sidebar.querySelector('nav');
-  const groups=[
-    ['connection','连接与会话','🏠','概览连接',['#login-panel','#chats','#send-limits-panel']],
-    ['persona','角色与记忆','🐋','角色记忆',['#persona','#expression-panel','#habits-panel','#memory-panel','#affection-panel']],
-    ['interaction','互动与内容','✨','互动内容',['#proactive-panel','#sticker-library-panel','#sticker-profile-panel','#images-panel','#moments-panel','#tieba-panel']],
-    ['model','模型与用量','🧠','模型搜索',['#model-panel','#web-search-panel','#token-usage-panel']],
-    ['activity','日志与记录','📋','消息日志',['#records-panel','#inbox-panel','#stability-panel']]
-  ];
-  const compactBar=document.createElement('div');compactBar.id='compact-status-bar';compactBar.className='compact-status-bar';
-  compactBar.innerHTML=`
-    <div class="compact-status-items">
-      <span id="compact-conn-badge" class="ui-badge badge-success">🟢 微信状态读取中</span>
-      <span id="compact-reply-badge" class="ui-badge badge-teal">🤖 自动回复读取中</span>
-      <span id="compact-mood-badge" class="ui-badge badge-info">🌊 平静摸鱼</span>
-      <span id="compact-timing-badge" class="ui-badge badge-muted">⏱️ 耗时 —</span>
-    </div>
-    <div class="compact-status-actions">
-      <button type="button" class="secondary" id="compact-go-overview">🏠 返回概览</button>
-      <button type="button" class="secondary" id="compact-refresh">🔄 刷新</button>
-    </div>`;
-  mainEl.insertBefore(compactBar,mainEl.firstChild);
-  $('compact-go-overview').onclick=()=>{location.hash='#overview';};
-  $('compact-refresh').onclick=()=>action($('compact-refresh'),update);
-
-  const subtabsBar=document.createElement('div');subtabsBar.id='workspace-subtabs';subtabsBar.className='workspace-subtabs';
-  subtabsBar.setAttribute('role','tablist');subtabsBar.setAttribute('aria-label','当前工作区子页面');
-  mainEl.insertBefore(subtabsBar,contentGrid);
-
-  const stickyBar=document.createElement('div');stickyBar.id='sticky-save-bar';stickyBar.className='sticky-save-bar';stickyBar.hidden=true;
-  stickyBar.innerHTML=`<span id="sticky-save-text">当前页有未保存的设置修改</span><button type="button" class="primary" id="sticky-save-btn">💾 一键保存当前页修改</button>`;
-  $('dashboard').append(stickyBar);
-
-  const mobileNav=document.createElement('nav');mobileNav.id='mobile-bottom-nav';mobileNav.className='mobile-bottom-nav';
-  mobileNav.setAttribute('aria-label','底部主工作区导航');
-  $('dashboard').append(mobileNav);
-
-  const links=[...nav.querySelectorAll('a[href^="#"]')].filter(a=>!a.hidden),byHref=new Map(links.map(a=>[a.getAttribute('href'),a]));
-  const titleByHref=new Map([['#overview','运行概览']]);
-  for(const a of links){const label=a.querySelector('span');if(label)a.textContent=label.textContent.trim();a.classList.add('nav-page');titleByHref.set(a.getAttribute('href'),a.textContent.trim());}
-  nav.id='console-nav';nav.classList.add('console-nav');nav.setAttribute('aria-label','功能导航');
-  const overview=byHref.get('#overview');if(overview){overview.classList.add('nav-overview');nav.append(overview);}
-  const sections=[];let updating=false;
-  function group(key,title,hrefs){
-    const items=hrefs.map(h=>byHref.get(h)).filter(Boolean);if(!items.length)return;
-    const details=document.createElement('details');details.className='nav-group';details.dataset.navGroup=key;
-    const summary=document.createElement('summary'),name=document.createElement('span'),count=document.createElement('span');
-    name.textContent=title;count.className='nav-count';count.textContent=items.length;count.setAttribute('aria-hidden','true');
-    summary.append(name,count);const children=document.createElement('div');children.className='nav-submenu';
-    for(const a of items){children.append(a);byHref.delete(a.getAttribute('href'));}
-    details.append(summary,children);nav.append(details);sections.push(details);
-    details.addEventListener('toggle',()=>{
-      if(updating)return;
-      if(details.open)for(const other of sections)if(other!==details)other.open=false;
-      try{localStorage.setItem('whalegirl-nav-group',sections.find(d=>d.open)?.dataset.navGroup||'');}catch{}
-    });
-  }
-  if(overview)byHref.delete('#overview');
-  for(const [key,title,,,hrefs] of groups)group(key,title,hrefs);
-  if(byHref.size)group('more','更多功能',[...byHref.keys()]);
-
-  const groupDefaults=new Map([
-    ['connection','#overview'],
-    ['persona','#persona'],
-    ['interaction','#proactive-panel'],
-    ['model','#model-panel'],
-    ['activity','#records-panel']
-  ]);
-  const lastGroupHref=new Map(groupDefaults);
-  const mobileButtons=new Map();
-  for(const [key,,icon,shortLabel] of groups){
-    const btn=document.createElement('button');btn.type='button';btn.className='mobile-tab-btn';btn.dataset.groupKey=key;
-    btn.innerHTML=`<strong>${icon}</strong><span>${shortLabel}</span>`;
-    btn.onclick=()=>{
-      const targetHref=lastGroupHref.get(key)||groupDefaults.get(key)||'#overview';
-      if(location.hash===targetHref && key==='connection')location.hash='#overview';
-      else location.hash=targetHref;
-    };
-    mobileNav.append(btn);mobileButtons.set(key,btn);
-  }
-
-  function findGroupKey(href){
-    if(!href||href==='#overview')return 'connection';
-    for(const [key,,,,hrefs] of groups){if(hrefs.includes(href))return key;}
-    return 'connection';
-  }
-
-  function renderSubtabs(groupKey,activeHref){
-    subtabsBar.replaceChildren();
-    const grp=groups.find(g=>g[0]===groupKey)||groups[0];
-    const [key,title,icon,,hrefs]=grp;
-    const tag=document.createElement('span');tag.className='subtab-group-tag';tag.textContent=`${icon} ${title}`;
-    subtabsBar.append(tag);
-    const pillHrefs=key==='connection'?['#overview',...hrefs]:hrefs;
-    for(const h of pillHrefs){
-      const label=titleByHref.get(h);if(!label)continue;
-      const pill=document.createElement('button');pill.type='button';
-      pill.dataset.subtabHref=h;
-      pill.className='subtab-pill'+(h===activeHref?' active':'');
-      pill.textContent=h==='#overview'?'🏠 运行概览':label;
-      pill.onclick=()=>{location.hash=h;};
-      subtabsBar.append(pill);
-    }
-  }
-
-  const panelSaveMap={
-    'chats':['save-chats'],
-    'send-limits-panel':['save-limits'],
-    'safety-panel':['save-safety'],
-    'model-panel':['save-model'],
-    'timing-panel':['save-timing'],
-    'web-search-panel':['save-web-search'],
-    'expression-panel':['save-style-settings'],
-    'habits-panel':['save-context-strategy','save-habits'],
-    'proactive-panel':['save-proactive'],
-    'category-limits-panel':['save-category-limits'],
-    'learning-panel':['learning-save'],
-    'memory-panel':['hub-save-settings'],
-    'bilibili-console':['bili-save'],
-    'growth-console':['growth-save'],
-    'affection-panel':['save-affection-rules']
-  };
-  let dirtyPanelId='';
-  window.addEventListener('whalegirl-panel-saved', event => {
-    if (event.detail === dirtyPanelId) { stickyBar.hidden = true; dirtyPanelId = ''; }
-  });
-  const ignoreDirtyIds=new Set([
-    'chat-search','records-scope','learning-query','learning-filter-chat','learning-filter-kind','learning-filter-state',
-    'memory-search','memory-show-archived','memory-filter-chat','persona-live-chat','inbox-chat','inbox-query',
-    'quick-enabled','pc-search','autonomy-enabled','expression-view-mode'
-  ]);
-  contentGrid.addEventListener('input',markDirty);
-  contentGrid.addEventListener('change',markDirty);
-  function markDirty(e){
-    const el=e.target;if(!el||ignoreDirtyIds.has(el.id)||el.type==='search')return;
-    if(el.closest('dialog'))return;
-    const panel=el.closest('#bilibili-console')||el.closest('#growth-console')||el.closest('.panel');if(!panel||!panelSaveMap[panel.id])return;
-    dirtyPanelId=panel.id;
-    const h2=panel.querySelector('h2')?.textContent?.trim()||'当前面板';
-    text('sticky-save-text',`「${h2}」有未保存的设置修改`);
-    stickyBar.hidden=false;
-  }
-  $('sticky-save-btn').onclick=async()=>{
-    const ids=panelSaveMap[dirtyPanelId]||[];
-    for(const id of ids){const btn=$(id);if(btn&&!btn.disabled)btn.click();}
-    stickyBar.hidden=true;
-  };
-  contentGrid.addEventListener('click',e=>{
-    const btn=e.target.closest('button');
-    if(btn&&Object.values(panelSaveMap).flat().includes(btn.id))stickyBar.hidden=true;
-  });
-
-  const toggle=document.createElement('button');toggle.type='button';toggle.className='nav-toggle';
-  toggle.setAttribute('aria-controls',nav.id);toggle.setAttribute('aria-expanded','false');
-  const toggleTitle=document.createElement('span'),current=document.createElement('span');toggleTitle.textContent='功能导航';current.className='nav-current';toggle.append(toggleTitle,current);sidebar.insertBefore(toggle,nav);
-  const mobile=window.matchMedia('(max-width:680px)');
-  function closeMenu(){sidebar.classList.remove('nav-expanded');toggle.setAttribute('aria-expanded','false');toggle.setAttribute('aria-label','展开功能导航');}
-  toggle.onclick=()=>{const open=sidebar.classList.toggle('nav-expanded');toggle.setAttribute('aria-expanded',String(open));toggle.setAttribute('aria-label',open?'收起功能导航':'展开功能导航');};
-  function active(rawHref){
-    let href=rawHref||'#overview';
-    if(['#timing-panel','#safety-panel','#category-limits-panel'].includes(href))href='#send-limits-panel';
-    if(['#growth-console','#bilibili-console'].includes(href)){
-      for(let element=$(href.slice(1));element;element=element.parentElement)if(element.tagName==='DETAILS')element.open=true;
-      href='#memory-panel';
-    }
-    const target=links.find(a=>a.getAttribute('href')===href)||overview;
-    const resolvedHref=target?.getAttribute('href')||'#overview';
-    updating=true;
-    for(const a of links){a.classList.toggle('active',a===target);if(a===target)a.setAttribute('aria-current','location');else a.removeAttribute('aria-current');}
-    const selected=target?.closest('.nav-group');
-    for(const section of sections){section.classList.toggle('contains-active',section===selected);if(selected)section.open=section===selected;}
-    if(selected)try{localStorage.setItem('whalegirl-nav-group',selected.dataset.navGroup);}catch{}
-    current.textContent=target?.textContent.trim()||'运行概览';updating=false;
-
-    const allPanels=[...contentGrid.querySelectorAll(':scope > .panel')];
-    for(const p of allPanels)p.classList.remove('active-panel');
-    const isOverview=(resolvedHref==='#overview');
-    mainEl.classList.toggle('is-overview-view',isOverview);
-    mainEl.classList.toggle('is-subpage-view',!isOverview);
-    if(isOverview){
-      for(const id of ['login-panel','quick-controls-panel','records-panel']){const p=$(id);if(p)p.classList.add('active-panel');}
-    }else{
-      const panelEl=document.querySelector(resolvedHref);
-      if(panelEl){
-        panelEl.classList.add('active-panel');
-        if(resolvedHref==='#model-panel'&&$('timing-panel'))$('timing-panel').classList.add('active-panel');
-      }else{
-        for(const id of ['login-panel','quick-controls-panel','records-panel']){const p=$(id);if(p)p.classList.add('active-panel');}
-      }
-    }
-    const groupKey=findGroupKey(resolvedHref);
-    lastGroupHref.set(groupKey,resolvedHref);
-    for(const [k,btn] of mobileButtons.entries())btn.classList.toggle('active',k===groupKey);
-    renderSubtabs(groupKey,resolvedHref);
-    stickyBar.hidden=true;
-    window.scrollTo({top:0,behavior:'instant'});
-  }
-  let remembered=null;try{remembered=localStorage.getItem('whalegirl-nav-group');}catch{}
-  updating=true;for(const section of sections)section.open=section.dataset.navGroup===(remembered??'connection');updating=false;
-  nav.addEventListener('click',event=>{const link=event.target.closest('a[href^="#"]');if(!link)return;active(link.getAttribute('href'));if(mobile.matches)closeMenu();});
-  window.addEventListener('hashchange',()=>active(location.hash||'#overview'));
-  document.addEventListener('click',event=>{if(mobile.matches&&!sidebar.contains(event.target))closeMenu();});
-  document.addEventListener('keydown',event=>{if(event.key==='Escape'&&sidebar.classList.contains('nav-expanded')){closeMenu();toggle.focus();}});
-  mobile.addEventListener('change',closeMenu);sidebar.classList.add('navigation-ready');active(location.hash||'#overview');
-});
+// Consolidate existing controls before the studio shell registers all pages.
+document.addEventListener('DOMContentLoaded', buildUnifiedSendLimitsPanel);

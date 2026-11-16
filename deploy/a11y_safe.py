@@ -138,6 +138,9 @@ def dump_tree(bus, max_depth=30, *, skip_messages=False, deadline=None, root_ref
             if depth > 1 and bounds is None or role == 'label' and not name:
                 return None
             result = {'role': role, 'name': name}
+            if skip_messages:
+                # Live references support narrow revalidation during one UI lease.
+                result['native_ref'] = ref[0] + '|' + ref[1]
             if role == 'label' and name == 'Custom Stickers':
                 # Stable object identity lets the selector align overlapping
                 # virtual pages without guessing how far a wheel event moved.

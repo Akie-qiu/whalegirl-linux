@@ -2,6 +2,7 @@
 import asyncio
 import importlib.util
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -125,6 +126,44 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.runtime.process_next()
         self.assertEqual(self.gateway.sent,[('text','收到啦')])
 
+    async def test_moments_recovery_hold_does_not_pause_normal_chat(self):
+        self.ready()
+        reason = '朋友圈编辑器仍打开，保留草稿，请先完成或关闭编辑'
+        self.runtime.safety.hold('account', 'ui_recovery_failed', reason)
+        self.assertEqual(self.runtime.safety.state('account').get('hold_scope'), 'moments')
+        self.assertFalse(self.runtime.safety.held('account'))
+        self.assertEqual(self.runtime.safety.held('account', scope='moments'), reason)
+        self.assertTrue(self.runtime.safety.check('account', 'group@chatroom', self.config.settings)['allowed'])
+        self.assertFalse(self.runtime.safety.check(
+            'account', 'moments:publish:timeline', self.config.settings)['allowed'])
+
+    async def test_legacy_moments_hold_without_scope_is_classified_safely(self):
+        self.ready()
+        self.runtime.safety._save('account', {
+            'hold_reason': 'Moments editor is still open; do not type into the wrong window',
+            'hold_code': 'ui_recovery_failed', 'hold_since': time.time(),
+        })
+        self.assertFalse(self.runtime.safety.held('account'))
+        self.assertEqual(self.runtime.safety.snapshot(
+            'account', self.config.settings).get('hold_scope'), 'moments')
+
+    async def test_global_failure_hold_overrides_moments_scoped_hold(self):
+        self.ready()
+        self.runtime.safety.hold('account', 'ui_recovery_failed', 'Moments editor is still open')
+        self.runtime.safety.hold('account', 'failure_circuit', '普通聊天连续发送失败，已暂停')
+        self.assertEqual(self.runtime.safety.state('account').get('hold_code'), 'failure_circuit')
+        self.assertEqual(self.runtime.safety.held('account'), '普通聊天连续发送失败，已暂停')
+
+    async def test_moments_recovery_hold_still_queues_new_chat_messages(self):
+        self.ready()
+        self.runtime.safety.hold('account', 'ui_recovery_failed', 'Moments editor is still open')
+        self.store.baseline('account', 'group@chatroom')
+        self.gateway.messages = AsyncMock(return_value=[{'serverId': 1, 'localId': 1, 'type': 1,
+            'content': '鲸鱼娘 你好', 'sender': 'person', 'senderName': '测试用户',
+            'isSelf': False, 'isMentioned': True, 'timestamp': time.time()}])
+        await self.runtime.poll_once()
+        self.assertEqual(self.store.queue()['state'], 'queued')
+
 
 class RecoveryApiTests(unittest.TestCase):
     def test_controls_require_auth_and_do_not_enable_reply_or_resend_old_messages(self):
@@ -162,6 +201,29 @@ class NativeRecoveryTests(unittest.TestCase):
         self.assertIs(module.chat_navigation(ui,[contacts,chats]),chats)
         wrong={**chats,'bounds':{**chats['bounds'],'x':300}}
         self.assertIsNone(module.chat_navigation(ui,[contacts,wrong]))
+
+    def test_open_moments_editor_is_minimized_without_clicking_draft_controls(self):
+        path=Path(__file__).resolve().parents[1]/'deploy/native_recovery.py'
+        spec=importlib.util.spec_from_file_location('native_recovery_minimize',path)
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        import types
+        moments_ui=types.ModuleType('moments_ui')
+        moments_ui.editors=lambda node: False
+        calls=[]
+        def run_process(args, **kwargs):
+            calls.append(args)
+            if args[:4] == ['xdotool','search','--onlyvisible','--name']:
+                return SimpleNamespace(returncode=0, stdout='42\n')
+            return SimpleNamespace(returncode=0, stdout='')
+        ui=SimpleNamespace(
+            run_process=run_process,
+            tree=lambda: {'role':'frame','name':''},
+            walk=lambda root: [root],
+        )
+        with patch.dict(sys.modules, {'moments_ui': moments_ui}):
+            module.minimize_moments_editor(ui, {'role':'frame','name':'Moments'})
+        self.assertIn(['xdotool','windowminimize','42'], calls)
+        self.assertNotIn(['/opt/tools/click'], calls)
 
 
 if __name__=='__main__':unittest.main()

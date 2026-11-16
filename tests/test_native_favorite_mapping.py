@@ -22,6 +22,10 @@ class FavoriteMappingTests(unittest.TestCase):
         self.assertIsNone(favorite_tile(tiles,2,20,{}))
         self.assertIsNone(favorite_tile(tiles,2,20,{'a':1,'b':7}))
 
+    def test_conflicting_offsets_refuse_even_if_target_anchor_exists(self):
+        tiles=[{'native_ref':'a'},{'native_ref':'target'},{'native_ref':'c'}]
+        self.assertIsNone(favorite_tile(tiles,5,20,{'target':5,'a':1,'c':7}))
+
     def test_middle_favorite_can_be_reached_from_the_nearer_bottom_boundary(self):
         tiles=[{'native_ref':str(i)} for i in range(67)]
         known={str(i):i for i in range(45,67)}

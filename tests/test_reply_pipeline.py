@@ -27,7 +27,7 @@ class ReplyPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def prepare(self):
         self.config.save(self.config.settings.model_copy(update={
             'allowed_chat_ids':['group@chatroom','other@chatroom','third@chatroom'],
-            'reply_part_interval':0,'chat_cooldown':0,'min_send_interval':0}))
+            'reply_part_interval':0.3,'chat_cooldown':0,'min_send_interval':0}))
         engine=await self.runtime.model()
         engine.answers=[{'should_reply':True,'actions':[{'type':'text','text':'这一轮回复'+str(i)}]} for i in range(5)]
         return engine

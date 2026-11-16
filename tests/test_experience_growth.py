@@ -219,8 +219,11 @@ class ExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('friend-b',context)
         self.assertIn(event['content'],context)
         self.assertIn('得到具体的感谢',context)
-        self.assertIn(context,self.service.dynamic_prompt(next_event,[next_event]))
-        self.assertIn(context,self.service.dynamic_prompt(next_event,[next_event],proactive=True))
+        for prompt in (self.service.dynamic_prompt(next_event,[next_event]),
+                       self.service.dynamic_prompt(next_event,[next_event],proactive=True)):
+            self.assertNotIn(event['content'],prompt)
+            self.assertNotIn('得到具体的感谢',prompt)
+            self.assertIn('proud',prompt)
         self.assertEqual(self.gateway.sent,[])
 
     async def test_mood_cause_expires_without_neutral_messages_renewing_it(self):
@@ -384,6 +387,7 @@ class ExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.service.opportunity(event['chat'],anchor=event['key']))
         row=g.memories()[0]
         with self.store.db:self.store.db.execute("UPDATE growth_insights SET category='knowledge' WHERE memory_id=?",(row['id'],))
+        g.edit(row['id'],{'version':row['version'],'chat_enabled':True})
         self.assertTrue(self.service.opportunity(event['chat'],anchor=event['key']))
         first = {**event, 'key':'proactive:test', 'trigger':'proactive'}
         prompt = self.service.dynamic_prompt(first,[event],proactive=True)
@@ -427,7 +431,7 @@ class ExperienceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status_code,200)
             self.assertFalse(cfg.settings.experience_growth_enabled)
             self.assertTrue(cfg.settings.autonomy_enabled)
-            self.assertEqual(cfg.settings.context_messages,40)
+            self.assertEqual(cfg.settings.context_messages,100)
             self.assertIn('experiences',client.get('/api/autonomy',headers=headers).json())
             runtime = app.state.runtime
             cfg.save(cfg.settings.model_copy(update={'experience_growth_enabled':True}))

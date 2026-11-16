@@ -95,21 +95,63 @@ class VideoReader:
         if not isinstance(pages,list) or not pages:raise BiliError('video_unavailable','没有可读取的真实分P信息')
         return meta
 
-    async def frames(self,bvid,cid,duration,budget,*,start=0,end=None,limit=16):
+    async def metadata_by_aid(self,aid,budget):
+        if isinstance(aid,bool) or not str(aid).isdigit() or not 0<int(aid)<2**63:
+            raise BiliError('invalid_video','视频编号无效')
+        meta=await self.client.api('/x/web-interface/view',{'aid':int(aid)},budget=budget)
+        if not valid_bvid(meta.get('bvid')) or str(meta.get('aid'))!=str(int(aid)):
+            raise BiliError('source_mismatch','视频元信息与所选编号不符')
+        pages=meta.get('pages')
+        if not isinstance(pages,list) or not pages:raise BiliError('video_unavailable','没有可读取的真实分P信息')
+        return meta
+
+    async def subtitle_listing(self,bvid,cid,budget,notes):
+        return await self.optional(self.client.api('/x/player/wbi/v2',{'bvid':bvid,'cid':cid},wbi=True,budget=budget),
+            '字幕预检',notes)
+
+    @staticmethod
+    def has_subtitle_track(player):
+        if not isinstance(player,dict):return False
+        subtitle=player.get('subtitle') or {}
+        tracks=subtitle.get('subtitles',[]) if isinstance(subtitle,dict) else []
+        return any(isinstance(row,dict) and isinstance(row.get('subtitle_url'),str) and row['subtitle_url'].strip()
+                   for row in tracks)
+
+    async def frames(self,bvid,cid,duration,budget,*,start=0,end=None,limit=16,part_cache=None):
         end=duration if end is None else end
-        data=await self.client.api('/x/player/videoshot',{'bvid':bvid,'cid':cid,'index':1},budget=budget)
-        indices,images=data.get('index') or [],data.get('image') or []
-        if not indices and isinstance(data.get('pvdata'),str):
-            raw=await self.client.get(snapshot_url(data['pvdata']),kind='frame_index',budget=budget,cap=64*1024,json_body=False)
-            if len(raw)%2 or len(raw)>60000:raise BiliError('frames_unavailable','快照时间索引无法核对')
-            indices=[int.from_bytes(raw[offset:offset+2],'big') for offset in range(0,len(raw),2)]
-        try:
-            nx,ny=int(data['img_x_len']),int(data['img_y_len']);width,height=int(data['img_x_size']),int(data['img_y_size'])
-            if not (1<=nx<=20 and 1<=ny<=20 and 1<=width<=640 and 1<=height<=640):raise ValueError()
-            if not isinstance(indices,list) or not isinstance(images,list) or len(indices)>30000:raise ValueError()
-            stamps=[float(value) for value in indices]
-            if not stamps or stamps!=sorted(stamps) or any(not math.isfinite(value) or value<0 or value>duration+5 for value in stamps):raise ValueError()
-        except (ValueError,KeyError,TypeError):raise BiliError('frames_unavailable','快照索引无法核对') from None
+        cache_key = ('videoshot', bvid, cid)
+        cached = part_cache.get(cache_key) if isinstance(part_cache, dict) else None
+        if isinstance(cached, BiliError):
+            raise cached
+        if isinstance(cached, dict):
+            stamps, images, nx, ny, width, height, sheets_raw = (
+                cached['stamps'], cached['images'], cached['nx'], cached['ny'], cached['width'], cached['height'], cached['sheets_raw']
+            )
+        else:
+            try:
+                data=await self.client.api('/x/player/videoshot',{'bvid':bvid,'cid':cid,'index':1},budget=budget)
+                indices,images=data.get('index') or [],data.get('image') or []
+                if not indices and isinstance(data.get('pvdata'),str):
+                    raw=await self.client.get(snapshot_url(data['pvdata']),kind='frame_index',budget=budget,cap=64*1024,json_body=False)
+                    if len(raw)%2 or len(raw)>60000:raise BiliError('frames_unavailable','快照时间索引无法核对')
+                    indices=[int.from_bytes(raw[offset:offset+2],'big') for offset in range(0,len(raw),2)]
+                try:
+                    nx,ny=int(data['img_x_len']),int(data['img_y_len']);width,height=int(data['img_x_size']),int(data['img_y_size'])
+                    if not (1<=nx<=20 and 1<=ny<=20 and 1<=width<=640 and 1<=height<=640):raise ValueError()
+                    if not isinstance(indices,list) or not isinstance(images,list) or len(indices)>30000:raise ValueError()
+                    stamps=[float(value) for value in indices]
+                    if not stamps or stamps!=sorted(stamps) or any(not math.isfinite(value) or value<0 or value>duration+5 for value in stamps):raise ValueError()
+                except (ValueError,KeyError,TypeError):raise BiliError('frames_unavailable','快照索引无法核对') from None
+            except BiliError as err:
+                if isinstance(part_cache, dict) and err.code == 'frames_unavailable':
+                    part_cache[cache_key] = err
+                raise
+            sheets_raw = {}
+            if isinstance(part_cache, dict):
+                part_cache[cache_key] = {
+                    'stamps': stamps, 'images': images, 'nx': nx, 'ny': ny,
+                    'width': width, 'height': height, 'sheets_raw': sheets_raw,
+                }
         wanted=[index for index,stamp in enumerate(stamps) if start<=stamp<end]
         wanted=spaced(wanted,64)
         sheets={}
@@ -119,8 +161,12 @@ class VideoReader:
         # Spread bounded downloads across the whole window, not only its beginning.
         chosen_sheets=spaced(sorted(sheets),4);candidates=[]
         for index in chosen_sheets:
-            url=snapshot_url(images[index])
-            raw=await self.client.get(url,kind='frame',budget=budget,cap=2*1024**2,json_body=False)
+            raw = sheets_raw.get(index)
+            if raw is None:
+                url=snapshot_url(images[index])
+                raw=await self.client.get(url,kind='frame',budget=budget,cap=2*1024**2,json_body=False)
+                if isinstance(part_cache, dict) and len(sheets_raw) < 16:
+                    sheets_raw[index] = raw
             candidates.extend(await asyncio.to_thread(crop_frames,raw,sheets[index],nx,ny,width,height))
         selected,analysis=await asyncio.to_thread(select_frames,candidates,limit)
         return selected,{**analysis,'media_mode':'official_snapshot','snapshot_sheets_read':len(chosen_sheets),
@@ -137,16 +183,25 @@ class VideoReader:
 
     async def comments(self,aid,bvid,budget,settings,notes):
         maximum=settings.bilibili_comments_limit;reply_threads=settings.bilibili_reply_threads
-        root_limit=max(20,maximum-reply_threads*4);result=[];seen=set();signatures=set();cursor=0;raw_count=0;pages=0;replies_read=0;ended=False
+        # Reserve space for actual parent/reply exchanges even at the minimum
+        # configured comment limit. Otherwise collecting roots can fill the
+        # entire budget before the reply-thread endpoint is ever queried.
+        reply_slots=min(max(0,maximum-1),reply_threads*4)
+        root_limit=max(1,maximum-reply_slots);result=[];seen=set();signatures=set();cursor=0;raw_count=0;pages=0;replies_read=0;ended=False
         def add(row,parent=''):
             if not isinstance(row,dict):return
             identity=str(row.get('rpid') or row.get('rpid_str') or '')
             message=self.valid_comment((row.get('content') or {}).get('message'))
             key=re.sub(r'(.)\1{3,}',r'\1\1\1',re.sub(r'\s+','',message)).casefold()
-            if not identity or not identity.isdigit() or not message or identity in seen or key in signatures:return
+            if not identity or not identity.isdigit() or not message or identity in seen or key in signatures:return False
+            actual_parent=''
+            if parent:
+                candidate_parent=str(row.get('parent') or '')
+                actual_parent=candidate_parent if candidate_parent.isdigit() and candidate_parent!='0' else parent
             seen.add(identity);signatures.add(key)
-            result.append({'id':identity,'parent_id':parent,'text':message,'created':row.get('ctime',0),
+            result.append({'id':identity,'parent_id':actual_parent,'root_id':parent,'text':message,'created':row.get('ctime',0),
                 'source_url':'https://www.bilibili.com/video/'+bvid+'/?comment_on=1&comment_root_id='+(parent or identity)})
+            return True
         for _ in range(settings.bilibili_comment_pages):
             value=await self.optional(self.client.api('/x/v2/reply/main',{'type':1,'oid':aid,'mode':3,'next':cursor},budget=budget),'评论分页',notes)
             if not value:break
@@ -159,14 +214,19 @@ class VideoReader:
             if len(result)>=root_limit or nxt is None or str(nxt)==str(cursor):break
             cursor=nxt
         roots=list(result)
-        for root in roots[:reply_threads]:
+        thread_count=min(reply_threads,len(roots))
+        for index,root in enumerate(roots[:reply_threads]):
             if len(result)>=maximum:break
-            value=await self.optional(self.client.api('/x/v2/reply/reply',{'type':1,'oid':aid,'root':root['id'],'pn':1,'ps':min(10,maximum-len(result))},budget=budget),'楼中楼',notes)
+            remaining_threads=max(1,thread_count-index)
+            per_thread=max(1,(maximum-len(result))//remaining_threads)
+            value=await self.optional(self.client.api('/x/v2/reply/reply',{'type':1,'oid':aid,'root':root['id'],'pn':1,'ps':min(10,per_thread)},budget=budget),'楼中楼',notes)
             if not value:continue
             replies_read+=1;rows=value.get('replies') or [];raw_count+=len(rows)
+            accepted=0
             for row in rows:
                 if len(result)>=maximum:break
-                add(row,root['id'])
+                accepted+=bool(add(row,root['id']))
+                if accepted>=per_thread:break
         return result,{'pages_read':pages,'reply_threads_read':replies_read,'raw_items':raw_count,'effective_items':len(result),
             'limit':maximum,'target_min':20,'target_met':len(result)>=20,'end_confirmed':ended,
             'complete_comments':False,'consensus_inferred':False}
@@ -179,24 +239,42 @@ class VideoReader:
             if re.search(pattern,value):tags.append(label)
         return tags or ['其他表达']
 
-    async def danmaku(self,cid,duration,start,end,budget,settings,notes):
-        raw=await self.optional(self.client.get(API+'/x/v1/dm/list.so',params={'oid':cid},budget=budget,cap=512*1024,json_body=False),'弹幕',notes)
-        if not raw:return [],{'available':0,'selected':0,'complete':False}
-        if not raw.lstrip().startswith(b'<'):
-            for mode in (zlib.MAX_WBITS,-zlib.MAX_WBITS):
-                try:
-                    decoder=zlib.decompressobj(mode);decoded=decoder.decompress(raw,512*1024)
-                    if decoder.eof and not decoder.unconsumed_tail:raw=decoded;break
-                except zlib.error:continue
-        if b'<!DOCTYPE' in raw.upper() or b'<!ENTITY' in raw.upper():notes.append('弹幕含不允许的XML结构，未读取');return [],{'available':0,'selected':0,'complete':False}
-        try:root=ET.fromstring(raw)
-        except ET.ParseError:notes.append('弹幕格式未确认，未冒充完整弹幕');return [],{'available':0,'selected':0,'complete':False}
+    async def danmaku(self,cid,duration,start,end,budget,settings,notes,*,part_cache=None):
+        cache_key = ('danmaku_entries', cid)
+        entries = part_cache.get(cache_key) if isinstance(part_cache, dict) else None
+        if entries is None:
+            raw=await self.optional(self.client.get(API+'/x/v1/dm/list.so',params={'oid':cid},budget=budget,cap=512*1024,json_body=False),'弹幕',notes)
+            if not raw:
+                if isinstance(part_cache, dict):part_cache[cache_key]=[]
+                return [],{'available':0,'selected':0,'complete':False}
+            if not raw.lstrip().startswith(b'<'):
+                for mode in (zlib.MAX_WBITS,-zlib.MAX_WBITS):
+                    try:
+                        decoder=zlib.decompressobj(mode);decoded=decoder.decompress(raw,512*1024)
+                        if decoder.eof and not decoder.unconsumed_tail:raw=decoded;break
+                    except zlib.error:continue
+            if b'<!DOCTYPE' in raw.upper() or b'<!ENTITY' in raw.upper():
+                notes.append('弹幕含不允许的XML结构，未读取')
+                if isinstance(part_cache, dict):part_cache[cache_key]=[]
+                return [],{'available':0,'selected':0,'complete':False}
+            try:root=ET.fromstring(raw)
+            except ET.ParseError:
+                notes.append('弹幕格式未确认，未冒充完整弹幕')
+                if isinstance(part_cache, dict):part_cache[cache_key]=[]
+                return [],{'available':0,'selected':0,'complete':False}
+            entries=[]
+            for node in root.iter('d'):
+                try:stamp=float(node.attrib.get('p','').split(',')[0])
+                except ValueError:continue
+                value=self.valid_comment(node.text);fingerprint=re.sub(r'(.)\1{3,}',r'\1\1\1',re.sub(r'\s+','',value))
+                if not math.isfinite(stamp) or not value:continue
+                entries.append((stamp,value,fingerprint))
+            if isinstance(part_cache, dict):
+                part_cache[cache_key]=entries
         groups={};seen=set();available=0
-        for node in root.iter('d'):
-            try:stamp=float(node.attrib.get('p','').split(',')[0])
-            except ValueError:continue
-            value=self.valid_comment(node.text);fingerprint=re.sub(r'(.)\1{3,}',r'\1\1\1',re.sub(r'\s+','',value))
-            if not math.isfinite(stamp) or not start<=stamp<min(end,duration+5) or not value:continue
+        upper=min(end,duration+5)
+        for stamp,value,fingerprint in entries:
+            if not start<=stamp<upper:continue
             available+=1
             if fingerprint in seen:continue
             seen.add(fingerprint);tags=self.reaction_tags(value);bucket=int((stamp-start)/max(1,(end-start)/12))
@@ -213,7 +291,7 @@ class VideoReader:
         return chosen,{'available_in_window':available,'distinct_in_window':len(seen),'selected':len(chosen),
             'temporal_buckets':12,'complete':False,'selection':'时间窗、表达差异与粗略情绪标签；标签不是观众真实心理定论'}
 
-    async def read(self,bvid,budget,settings,*,metadata=None,page=None,start=0,config=None):
+    async def read(self,bvid,budget,settings,*,metadata=None,page=None,start=0,config=None,player_data=None,require_subtitles=False,part_cache=None):
         self.optional_exhausted=False;meta=metadata or await self.metadata(bvid,budget)
         if meta.get('bvid')!=bvid:raise BiliError('source_mismatch','视频元信息与所选编号不符')
         pages=meta.get('pages') or []
@@ -229,26 +307,45 @@ class VideoReader:
             if not math.isfinite(start) or start<0 or start>=duration:raise ValueError()
         except (TypeError,ValueError,KeyError):raise BiliError('video_unavailable','视频身份、时长或阅读窗口无效') from None
         end=min(duration,start+settings.bilibili_segment_seconds);notes=[];segments=[];frames=[];frame_analysis={};comments=[];danmaku=[]
-        player=await self.optional(self.client.api('/x/player/wbi/v2',{'bvid':bvid,'cid':cid},wbi=True,budget=budget),'字幕列表',notes)
+        player_key=('player',bvid,cid)
+        sub_key=('subtitles',bvid,cid)
+        if player_data is not None:
+            player=player_data
+        elif isinstance(part_cache, dict) and player_key in part_cache:
+            player=part_cache[player_key]
+        else:
+            player=await self.subtitle_listing(bvid,cid,budget,notes)
+            if isinstance(part_cache, dict) and player is not None:
+                part_cache[player_key]=player
         if player:
             for key,expected in (('bvid',bvid),('cid',cid),('aid',aid)):
                 if player.get(key) is not None and str(player[key])!=str(expected):raise BiliError('source_mismatch','字幕身份与视频/分P不符')
-            tracks=[row for row in (player.get('subtitle') or {}).get('subtitles',[]) if isinstance(row,dict) and isinstance(row.get('subtitle_url'),str) and row['subtitle_url'].strip()]
-            tracks.sort(key=lambda row:not str(row.get('lan','')).startswith('zh'))
-            if tracks:
-                url=tracks[0]['subtitle_url'].strip();url='https:'+url if url.startswith('//') else url
-                fetched=await self.optional(self.client.get(url,kind='subtitle',budget=budget),'字幕正文',notes)
-                if fetched:segments=[row for row in subtitle_segments(fetched[0].get('body') or [],duration) if row['end']>start and row['start']<end]
+            if isinstance(part_cache, dict) and sub_key in part_cache:
+                all_segments=part_cache[sub_key]
+                segments=[row for row in all_segments if row['end']>start and row['start']<end]
+            else:
+                tracks=[row for row in (player.get('subtitle') or {}).get('subtitles',[]) if isinstance(row,dict) and isinstance(row.get('subtitle_url'),str) and row['subtitle_url'].strip()]
+                tracks.sort(key=lambda row:not str(row.get('lan','')).startswith('zh'))
+                all_segments=[]
+                if tracks:
+                    url=tracks[0]['subtitle_url'].strip();url='https:'+url if url.startswith('//') else url
+                    fetched=await self.optional(self.client.get(url,kind='subtitle',budget=budget),'字幕正文',notes)
+                    if fetched:
+                        all_segments=subtitle_segments(fetched[0].get('body') or [],duration)
+                        segments=[row for row in all_segments if row['end']>start and row['start']<end]
+                if isinstance(part_cache, dict) and (not tracks or all_segments):
+                    part_cache[sub_key]=all_segments
         if not segments:notes.append('未取得本窗口有效字幕，没有本地ASR，不声称听懂音频')
+        if require_subtitles and not segments:raise BiliError('subtitle_missing','候选视频没有可读取的本窗口字幕，跳过以避免无效视觉与反思成本')
         if settings.bilibili_visual_enabled:
             if config:
-                candidates=await self.optional(media_frames(self.client,config,bvid,cid,start,end,budget),'合法低清媒体/FFmpeg',notes)
+                candidates=await self.optional(media_frames(self.client,config,bvid,cid,start,end,budget,part_cache=part_cache),'合法低清媒体/FFmpeg',notes)
                 if candidates:
                     rows,frame_analysis=candidates;frames,analysis=await asyncio.to_thread(select_frames,rows,settings.bilibili_keyframes_limit);frame_analysis.update(analysis)
             if not frames or frame_analysis.get('decoder_completed') is False:
                 attempt=dict(frame_analysis) if frames else None
                 if attempt:notes.append('轻量解码未完成，只取得局部帧；尝试官方快照覆盖整个窗口，未取得部分不冒充理解')
-                fetched=await self.optional(self.frames(bvid,cid,duration,budget,start=start,end=end,limit=settings.bilibili_keyframes_limit),'动态快照选帧',notes)
+                fetched=await self.optional(self.frames(bvid,cid,duration,budget,start=start,end=end,limit=settings.bilibili_keyframes_limit,part_cache=part_cache),'动态快照选帧',notes)
                 if fetched:
                     frames,frame_analysis=fetched
                     if attempt:frame_analysis['ffmpeg_attempt']=attempt
@@ -257,7 +354,7 @@ class VideoReader:
             fetched=await self.optional(self.comments(aid,bvid,budget,settings,notes),'评论讨论',notes)
             if fetched:comments,discussion_coverage=fetched
         if settings.bilibili_danmaku_enabled:
-            fetched=await self.optional(self.danmaku(cid,duration,start,end,budget,settings,notes),'分场景弹幕',notes)
+            fetched=await self.optional(self.danmaku(cid,duration,start,end,budget,settings,notes,part_cache=part_cache),'分场景弹幕',notes)
             if fetched:danmaku,danmaku_coverage=fetched
         for row in danmaku:
             closest=min((frame['time'] for frame in frames),key=lambda value:abs(value-row['time'])) if frames else None

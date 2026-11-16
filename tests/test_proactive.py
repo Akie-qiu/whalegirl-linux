@@ -255,6 +255,24 @@ class ProactiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.get(event['key'])['state'], 'skipped')
         self.assertEqual(self.calls, 0)
 
+    async def test_overnight_gap_passes_topic_gap_seconds_and_anti_guess_prompt(self):
+        now = time.time()
+        self.store.observe([
+            {**self.message(2), 'content': '昨晚打瓦还是打lol', 'timestamp': now - 28800},
+            {**self.message(3), 'content': '我已经卸载了', 'timestamp': now - 180},
+        ])
+        captured = []
+        class InspectEngine(Engine):
+            async def chat(inner, messages, **kwargs):
+                captured.append((messages, kwargs.get('system_prompt', '')))
+                return json.dumps({'should_reply': False, 'reason': '拿不准先跳过', 'actions': []}, ensure_ascii=False)
+        self.runtime.engine_factory = lambda **kwargs: InspectEngine(None)
+        await self.service.run_once()
+        self.assertEqual(len(captured), 1)
+        prompt_text = json.dumps(captured[0][0], ensure_ascii=False)
+        self.assertIn('topic_gap_seconds', prompt_text)
+        self.assertIn('绝不瞎猜坐实其中某一个', captured[0][1])
+
 
 class ProactiveApiTests(unittest.TestCase):
     def test_config_requires_auth_and_cannot_authorize_unselected_contact(self):

@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 from .learning import POISON_PATTERN
 from .memory import own_text
-from .topic_relevance import current_query, related_topic
+from .topic_relevance import current_query, related_topic, retrieval_focus
 
 
 STATIC_PROMPT = '''
@@ -160,8 +160,13 @@ class ExperienceService:
                 break
         return result
 
-    def interaction_prompt(self, first):
+    def interaction_prompt(self, first, batch=()):
         rows = self.current_events(first)
+        if batch:
+            focus=retrieval_focus(self.store,first,batch)
+            rows=[row for row in rows if row['source_key'] in {item.get('key') for item in batch}
+                  or related_topic(focus['query'],row['content'])
+                  or focus['continuation'] and row['source_key'] in focus['nearby_keys']]
         first['_interaction_versions'] = {r['id']:r['version'] for r in rows if not r['locked']}
         if not rows:
             return ''
@@ -216,7 +221,7 @@ class ExperienceService:
         return {'exchange':exchange,'learnable_keys':list(dict.fromkeys(r['key'] for r in humans)),
                 'confirmed_actions':confirmed}
 
-    def emotional_context(self, first, *, now=None):
+    def emotional_context(self, first, *, now=None, batch=()):
         """Keep a fading mood's actual cause, without assigning it to a new speaker.
 
         Use the existing mood clock and event ledger. Observing more messages must
@@ -249,6 +254,14 @@ class ExperienceService:
             return ''
         cause = {'来源发言者':source['sender_id'], '原话':own_text(source)[:100],
                  '当时感受':mood['reason'][:80], '距今秒':round(max(0, now-mood['updated']))}
+        if batch:
+            focus=retrieval_focus(self.store,first,batch)
+            if (source['key'] not in {item.get('key') for item in batch}
+                    and not related_topic(focus['query'],own_text(source))
+                    and not (focus['continuation'] and source['key'] in focus['nearby_keys'])):
+                # Preserve the existing emotion clock, without appending the
+                # old subject/quotation to a new conversation topic.
+                return '\n【当前情绪余韵｜不是当前话题】'+json.dumps({'mood':mood['mood']},ensure_ascii=False)
         return '\n【互动余韵｜已发生的来由，不是当前新消息】' + json.dumps(cause, ensure_ascii=False)
 
     def capture(self, first, batch, value, *, observed=False):

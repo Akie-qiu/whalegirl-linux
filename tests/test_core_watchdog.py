@@ -1,9 +1,36 @@
+import tempfile
+from pathlib import Path
 import unittest
+from unittest.mock import patch
 
-from deploy.core_watchdog import FAILURE_THRESHOLD, RESTART_COOLDOWN, should_reap_process, transition
+from deploy.core_watchdog import (
+    FAILURE_THRESHOLD,
+    RESTART_COOLDOWN,
+    health_verdict,
+    maintain_native_memory,
+    protect_wechat_oom,
+    should_reap_process,
+    transition,
+)
 
 
 class CoreWatchdogTests(unittest.TestCase):
+    def test_pinned_client_health_and_version_alert_are_separate(self):
+        current = {'status': 'ok', 'wechat_version': '4.1.13.26', 'failed_background_tasks': 0}
+        good = health_verdict(current, '4.1.13.26')
+        self.assertTrue(good['healthy'])
+        self.assertTrue(good['version_matches'])
+        mismatch = health_verdict(current, '4.1.1.8')
+        self.assertTrue(mismatch['healthy'])
+        self.assertFalse(mismatch['version_matches'])
+        state, action = transition({'consecutive_failures': 815, 'restart_attempts': 168}, 1000, mismatch['healthy'])
+        self.assertEqual(action, 'recovered')
+        self.assertEqual(state['restart_attempts'], 168)
+
+    def test_failed_background_task_or_down_core_remains_unhealthy(self):
+        self.assertFalse(health_verdict({'status': 'ok', 'failed_background_tasks': 1})['healthy'])
+        self.assertFalse(health_verdict({'status': 'degraded'})['healthy'])
+
     def test_restart_requires_three_consecutive_health_failures(self):
         state, action = transition({}, 1000, False)
         self.assertEqual(action, 'waiting')
@@ -51,16 +78,65 @@ class CoreWatchdogTests(unittest.TestCase):
         self.assertEqual(action, 'waiting')
         self.assertEqual(state['consecutive_failures'], 1)
 
-    def test_should_reap_hung_helpers_and_webview_children_only(self):
-        self.assertFalse(should_reap_process(5, 'python3 /opt/tools/a11y-dump --format json'))
-        self.assertTrue(should_reap_process(25, 'python3 /opt/tools/a11y-dump --format json'))
-        self.assertFalse(should_reap_process(10, 'xclip -selection clipboard -t image/png -i /tmp/a.png'))
-        self.assertTrue(should_reap_process(120, 'xclip -selection clipboard -t image/png -i /tmp/a.png'))
-        self.assertFalse(should_reap_process(60, '/opt/whalegirl-linux/venv/bin/python -m unittest discover'))
-        self.assertTrue(should_reap_process(360, '/opt/whalegirl-linux/venv/bin/python -m unittest discover'))
-        self.assertTrue(should_reap_process(2, '/opt/wechat/RadiumWMPF/runtime/WeChatAppEx --type=renderer'))
-        self.assertFalse(should_reap_process(3600, '/usr/bin/wechat'))
-        self.assertFalse(should_reap_process(3600, '/opt/whalegirl-linux/venv/bin/python -m whalegirl_linux'))
+    def test_watchdog_never_auto_kills_wechat_or_helpers(self):
+        for cmd in (
+            'python3 /opt/tools/a11y-dump --format json',
+            'xclip -selection clipboard -t image/png -i /tmp/a.png',
+            '/opt/whalegirl-linux/venv/bin/python -m unittest discover',
+            '/opt/wechat/RadiumWMPF/runtime/WeChatAppEx --type=renderer',
+            '/opt/wechat/crashpad_handler --no-rate-limit',
+            '/usr/bin/wechat',
+            '/opt/whalegirl-linux/venv/bin/python -m whalegirl_linux',
+        ):
+            self.assertFalse(should_reap_process(3600, cmd), cmd)
+
+    def test_protect_wechat_oom_and_unbounded_cgroup_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proc = root / 'proc'
+            cg = root / 'cg'
+            proc.mkdir()
+            cg.mkdir()
+            (cg / 'memory.high').write_text('123456789\n')
+
+            # Fake WeChat main PID + helper PIDs inside container cgroup.
+            cid = '58760f6c647d'
+            for pid, comm, cmdline, adj in (
+                ('101', 'wechat', b'/usr/bin/wechat\0', '0'),
+                ('102', 'agent-server', b'/opt/agent-server/agent-server\0', '0'),
+                ('103', 'crashpad_handle', b'/opt/wechat/crashpad_handler\0--annotation=ext_info={"app_path":"/opt/wechat/wechat"}\0', '0'),
+            ):
+                p = proc / pid
+                p.mkdir()
+                (p / 'cgroup').write_text(f'0::/system.slice/docker-{cid}.scope\n')
+                (p / 'comm').write_text(comm + '\n')
+                (p / 'cmdline').write_bytes(cmdline)
+                (p / 'oom_score_adj').write_text(adj + '\n')
+
+            protected = protect_wechat_oom(cid, proc=proc)
+            self.assertEqual((proc / '101' / 'oom_score_adj').read_text().strip(), '-900')
+            self.assertEqual((proc / '102' / 'oom_score_adj').read_text().strip(), '-600')
+            self.assertEqual((proc / '103' / 'oom_score_adj').read_text().strip(), '0')
+            self.assertEqual(len(protected), 2)
+
+            fake_sample = {
+                'at': 1.0,
+                'container_id': cid,
+                'cgroup': str(cg),
+                'memory_current': 300_000_000,
+                'memory_limit': None,
+                'working_bytes': 250_000_000,
+                'ratio': 0.0,
+                'pressure': False,
+            }
+            with (
+                patch('deploy.core_watchdog.native_resources', return_value=dict(fake_sample)),
+                patch('deploy.core_watchdog.publish_native_resources') as pub,
+            ):
+                result = maintain_native_memory({}, 100.0)
+            self.assertEqual((cg / 'memory.high').read_text().strip(), 'max')
+            self.assertEqual(result['high_bytes'], 'max')
+            pub.assert_called_once()
 
 
 if __name__ == '__main__':

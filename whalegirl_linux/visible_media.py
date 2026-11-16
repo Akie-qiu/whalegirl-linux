@@ -29,13 +29,13 @@ def correct_chat(root,name,is_group):
     return row and header
 
 
-async def capture_message_image(gateway,chat,local_id,kind, *, message_time=None,server_id=''):
+async def capture_message_image(gateway,chat,local_id,kind, *, message_time=None,server_id='',navigate=True):
     chats=await gateway.chats();targets=[c for c in chats if c.get('id')==chat]
     if len(targets)!=1:return {}
     name=normal(targets[0].get('remark') or targets[0].get('name'))
-    if gateway.ui_jobs_directory:
+    if navigate and gateway.ui_jobs_directory:
         await gateway.ui_job('open_chat',chat,scroll='latest')
-    else:
+    elif navigate:
         response=await gateway.client.post(f'/api/chats/{chat}/open',json={})
         response.raise_for_status()
         if response.json().get('ok') is not True:return {}
@@ -50,7 +50,7 @@ async def capture_message_image(gateway,chat,local_id,kind, *, message_time=None
         raw=await gateway.messages(chat,limit=200,before_time=message_time+1,before_id=2147483647)
     raw=sorted(raw,key=lambda r:(str(r.get('timestamp') or ''),r.get('localId',0)))
     match=locate_image(raw,nodes,local_id,kind,server_id)
-    for _ in range(8 if gateway.ui_jobs_directory and match is None else 0):
+    for _ in range(8 if navigate and gateway.ui_jobs_directory and match is None else 0):
         gateway.media_history_moved=True
         await gateway.ui_job('open_chat',chat,scroll='up')
         before=await gateway.client.get('/api/debug/a11y');before.raise_for_status();root=before.json().get('tree') or {}
@@ -95,7 +95,7 @@ async def capture_message_image(gateway,chat,local_id,kind, *, message_time=None
         if run_right-run_left>=40 and bounds and bounds[3]-bounds[1]>=60:
             click_xy=[left+(run_left+run_right)/2,top+(bounds[1]+bounds[3])/2]
             cropped=cropped.crop((max(0,run_left-2),max(0,bounds[1]-2),min(cropped.width,run_right+2),min(cropped.height,bounds[3]+2)))
-    if click_xy and gateway.ui_jobs_directory and kind==3:
+    if navigate and click_xy and gateway.ui_jobs_directory and kind==3:
         try:
             result=await gateway.ui_job('copy_image',chat,node_name=match.get('name'),bounds=match.get('bounds'),xy=click_xy,local_id=local_id)
         except (OSError, ValueError, httpx.HTTPError):

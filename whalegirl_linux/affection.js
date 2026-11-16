@@ -16,11 +16,14 @@
   const rulePrivateUnreserved=el('input');rulePrivateUnreserved.id='affection-private-unreserved-enabled';rulePrivateUnreserved.type='checkbox';
   const rulePrivateUnreservedLabel=el('label','check-label');
   rulePrivateUnreservedLabel.append(rulePrivateUnreserved,document.createTextNode('与其他人的私聊也保持“毫无保留 · 只娇不傲”（不嘴硬推拉，坦率软糯回应）'));
+  const parseIds=input=>input.value.split(/[,，\s]+/).map(s=>s.trim()).filter(Boolean).slice(0,20);
   const ownerIdsInput=el('input');ownerIdsInput.type='text';ownerIdsInput.id='affection-owner-ids';ownerIdsInput.maxLength=400;ownerIdsInput.placeholder='例如：wxid_xxx（多个用逗号分隔）';
   const ownerIdsLabel=el('label','','主人专属微信 ID（仅私聊放开亲昵与敏感边界）');ownerIdsLabel.append(ownerIdsInput);
+  const intimateIdsInput=el('input');intimateIdsInput.type='text';intimateIdsInput.id='affection-intimate-friend-ids';intimateIdsInput.maxLength=400;intimateIdsInput.placeholder='例如：wxid_xxx（多个用逗号分隔）';
+  const intimateIdsLabel=el('label','','特别亲近好友微信 ID（群里也偏心听话 · 私聊完全放开有求必应）');intimateIdsLabel.append(intimateIdsInput);
   const settingsBox=el('details','settings-drawer');settingsBox.append(el('summary','','好感度计分规则与主人设置'));
   const settingsGrid=el('div','two-fields');settingsGrid.style.marginTop='10px';
-  settingsGrid.append(privateLabel,privateUnreservedLabel,ownerIdsLabel,rulePrivateUnreservedLabel);
+  settingsGrid.append(privateLabel,privateUnreservedLabel,ownerIdsLabel,intimateIdsLabel,rulePrivateUnreservedLabel);
   const inputs={};for(const [name,title,min,max] of [
     ['affection_initial_score','未建立记录的新人物初始好感度',0,100],
     ['affection_daily_gain','每人每天最多增加',0,20],['affection_daily_loss','每人每天最多降低',0,20],
@@ -28,8 +31,9 @@
     const label=el('label','',title),input=el('input');input.type='number';input.min=min;input.max=max;input.step=1;inputs[name]=input;label.append(input);settingsGrid.append(label);
   }
   const saveRuleBtn=button('保存好感度规则',async()=>{
-    const ownerIds=ownerIdsInput.value.split(/[,，\s]+/).map(s=>s.trim()).filter(Boolean).slice(0,20);
-    const values={owner_ids:ownerIds,private_unreserved_enabled:rulePrivateUnreserved.checked};
+    const ownerIds=parseIds(ownerIdsInput);
+    const intimateIds=parseIds(intimateIdsInput);
+    const values={owner_ids:ownerIds,intimate_friend_ids:intimateIds,private_unreserved_enabled:rulePrivateUnreserved.checked};
     for(const [n,input] of Object.entries(inputs))values[n]=Number(input.value);
     await saveSubset(values);await load();notice('好感度规则已保存');
   });
@@ -65,7 +69,7 @@
   }
   privateUnreserved.onchange=()=>toggleUnreserved(privateUnreserved);
   rulePrivateUnreserved.onchange=()=>toggleUnreserved(rulePrivateUnreserved);
-  function populate(){if(!cfg)return;syncEnabled();privateStyle.value=cfg.affection_private_style;privateUnreserved.checked=!!cfg.private_unreserved_enabled;rulePrivateUnreserved.checked=!!cfg.private_unreserved_enabled;ownerIdsInput.value=Array.isArray(cfg.owner_ids)?cfg.owner_ids.join(', '):'';for(const [n,input] of Object.entries(inputs))input.value=cfg[n];}
+  function populate(){if(!cfg)return;syncEnabled();privateStyle.value=cfg.affection_private_style;privateUnreserved.checked=!!cfg.private_unreserved_enabled;rulePrivateUnreserved.checked=!!cfg.private_unreserved_enabled;ownerIdsInput.value=Array.isArray(cfg.owner_ids)?cfg.owner_ids.join(', '):'';intimateIdsInput.value=Array.isArray(cfg.intimate_friend_ids)?cfg.intimate_friend_ids.join(', '):'';for(const [n,input] of Object.entries(inputs))input.value=cfg[n];}
   async function history(person,box){
     const r=await api('affection/revisions?subject='+encodeURIComponent(person.subject));box.replaceChildren();
     if(!r.revisions.length)box.append(el('p','hint','还没有变化记录'));

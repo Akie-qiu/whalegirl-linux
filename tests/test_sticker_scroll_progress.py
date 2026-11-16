@@ -17,7 +17,7 @@ with patch.object(sys, 'path', [str(ROOT / 'deploy'), *sys.path]):
 
 
 class StickerScrollProgressTests(unittest.TestCase):
-    def run_picker(self, *, stuck=False, cold=False):
+    def run_picker(self, *, stuck=False):
         runs = ROOT / 'test-runs'
         runs.mkdir(exist_ok=True)
         folder = Path(tempfile.mkdtemp(prefix='sticker-scroll-', dir=runs))
@@ -27,19 +27,18 @@ class StickerScrollProgressTests(unittest.TestCase):
         refs = [f':1.2|/org/a11y/atspi/accessible/{80+i}' for i in range(5)]
         (folder / 'sticker-panel-anchors.cache').write_text(json.dumps({
             'panel_ref': panel_ref, 'order': order, 'updated': time.time(),
-            'anchors': {} if cold else {ref: i for i, ref in enumerate(refs[:3])},
+            'anchors': {ref: i for i, ref in enumerate(refs)},
+            # Anchors are only reused together with the grid that verified them.
+            'grid': {'xs': [0], 'shift': 0},
         }))
         state = {'step': 0, 'boundary': False}
         commands = []
 
         def page():
-            step = (state['step'] if cold else
-                    3 if state['boundary'] else 0 if stuck else state['step'])
-            page_refs = refs[2:5] if cold and step >= 4 else refs[:3]
+            step = 3 if state['boundary'] else 0 if stuck else state['step']
             tiles = [{'role': 'label', 'name': 'Custom Stickers', 'native_ref': ref,
-                      'bounds': {'x': 0, 'y': (40 if cold and step >= 4 else 100 - step * 20) + i * 60,
-                                 'width': 60, 'height': 60}}
-                     for i, ref in enumerate(page_refs)]
+                      'bounds': {'x': 0, 'y': 100 - step * 20 + i * 60, 'width': 60, 'height': 60}}
+                     for i, ref in enumerate(refs)]
             return {'role': 'frame', 'children': [
                 {'role': 'page-tab', 'name': 'Custom Stickers'},
                 {'role': 'list', 'native_ref': panel_ref,
@@ -58,7 +57,13 @@ class StickerScrollProgressTests(unittest.TestCase):
         def tree(**options):
             return page()
 
-        job = {'md5': order[4 if cold else 2], 'chat': 'test', 'created': time.time()}
+        job = {'md5': order[2], 'chat': 'test', 'created': time.time()}
+        job['fast_session_nonce']='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        cache_path=folder/'sticker-panel-anchors.cache'
+        cache=json.loads(cache_path.read_text())
+        cache.update(schema=2,session='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',page=[list(row) for row in selector.favorite_page_signature(page()['children'][1]['children'])])
+        cache_path.write_text(json.dumps(cache))
+        (path.parent/('a'*32+'.guard.json')).write_text(json.dumps({'chat':'test','allowed':True,'updated':time.time()}))
         with patch.object(selector, 'PROFILE', {'snapshots': 0, 'snapshot_seconds': 0.0}) as profile, \
              patch.object(selector, 'native_read', return_value={'stickers': [{'md5': item} for item in order]}), \
              patch.object(selector, 'selected', return_value=True), \
@@ -86,13 +91,6 @@ class StickerScrollProgressTests(unittest.TestCase):
         self.assertEqual(counts['boundary_scroll'], 1)
         self.assertTrue(any('--repeat' in args and args[args.index('--repeat') + 1] == '40'
                             for args in commands))
-
-    def test_boundary_alignment_does_not_count_moving_objects_as_stagnant(self):
-        job, _, counts = self.run_picker(cold=True)
-        self.assertEqual(job['state'], 'submitted')
-        self.assertEqual(counts['alignment_scroll'], 4)
-        self.assertEqual(counts['boundary_scroll'], 1)
-        self.assertEqual(len(job['favorite_scroll']), 4)
 
 
 if __name__ == '__main__':

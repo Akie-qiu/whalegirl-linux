@@ -7,8 +7,11 @@ import time
 import uuid
 
 from .settings import private_write
+from .ui_lock import acquire_for_send
 
 CURRENT=ContextVar('whalegirl_fast_send',default=None)
+PREWARM_MAX_SECONDS=20.0
+PREWARM_POLL_SECONDS=.1
 
 
 def current(gateway,chat):
@@ -29,6 +32,19 @@ class FastSendSession:
         except (OSError,ValueError):pass
         if not self.available:self.stats['fallback']='native_capability_unavailable'
 
+    def is_usable(self,max_age=12.0):
+        return not self.unusable_reason(max_age)
+
+    def unusable_reason(self,max_age=12.0):
+        if self.closed:return 'closed'
+        if self.cancelled:return 'cancelled'
+        if not self.available:return 'unavailable'
+        if not self.started:return 'not_started'
+        if self.rpc is not None and self.rpc.done():return 'native_session_finished'
+        if max_age is not None and time.monotonic()-self.started>float(max_age):return 'age_limit'
+        if callable(self.allowed) and not self.allowed():return 'permission_changed'
+        return ''
+
     def read(self):
         try:return json.loads(self.path.read_text(encoding='utf-8'))
         except (OSError,ValueError):return {}
@@ -47,7 +63,7 @@ class FastSendSession:
     async def start(self):
         if self.rpc:return True
         self.started=time.monotonic()
-        await self.gateway.ui_lock.acquire();self.locked=True
+        await acquire_for_send(self.gateway.ui_lock);self.locked=True
         try:self.guard()
         except OSError:
             self.stats['fallback']='guard_file_unavailable'
@@ -59,9 +75,13 @@ class FastSendSession:
             value=self.read()
             if value.get('state')=='ready':
                 self.ready_profile=value.get('ready_profile') or {}
-                self.stats.update(used=True,start_seconds=round(time.monotonic()-self.started,3))
+                self.stats.update(used=True,start_seconds=round(time.monotonic()-self.started,3),
+                    ready_at=time.time(),preparation_timing=dict(self.ready_profile))
                 return True
-            if self.rpc.done():break
+            if self.rpc.done():
+                if not self.rpc.cancelled() and self.rpc.exception() is not None:
+                    self.stats['native_error_type']=type(self.rpc.exception()).__name__
+                break
             await asyncio.sleep(.025)
         # No command has been published, so there was no send to repeat.
         self.stats['fallback']='session_not_ready_before_any_command'
@@ -83,8 +103,6 @@ class FastSendSession:
             if part:
                 result=dict(part);result.update(fast_session=True,job_id=self.nonce,part_index=index)
                 timing=result.setdefault('ui_timing',{})
-                if index==0:
-                    for key,value in self.ready_profile.items():timing[key]=round(timing.get(key,0)+value,3)
                 timing.update(compact_snapshot=True,fast_session=True)
                 return result
             if self.rpc.done() or job.get('state')=='done':
@@ -98,16 +116,20 @@ class FastSendSession:
     async def close(self):
         if self.closed:return
         self.closed=True
-        if self.rpc:
-            self.cancelled=True
+        try:
+            if self.rpc:
+                self.cancelled=True
+                try:
+                    self.guard()
+                    private_write(self.path.with_name(self.nonce+'.command.json'),json.dumps({'close':True}))
+                except OSError:pass
+                try:await asyncio.wait_for(asyncio.shield(self.rpc),5)
+                except (Exception,asyncio.CancelledError):
+                    self.rpc.add_done_callback(lambda task:None if task.cancelled() else task.exception())
+        finally:
             try:
-                self.guard()
-                private_write(self.path.with_name(self.nonce+'.command.json'),json.dumps({'close':True}))
-            except OSError:pass
-            try:await asyncio.wait_for(asyncio.shield(self.rpc),5)
-            except (Exception,asyncio.CancelledError):
-                self.rpc.add_done_callback(lambda task:None if task.cancelled() else task.exception())
-        if self.monitor:
-            self.monitor.cancel();await asyncio.gather(self.monitor,return_exceptions=True)
-        if self.locked:self.gateway.ui_lock.release();self.locked=False
-        if self.started:self.stats['lease_seconds']=round(time.monotonic()-self.started,3)
+                if self.monitor:
+                    self.monitor.cancel();await asyncio.gather(self.monitor,return_exceptions=True)
+            finally:
+                if self.locked:self.gateway.ui_lock.release();self.locked=False
+                if self.started:self.stats['lease_seconds']=round(time.monotonic()-self.started,3)

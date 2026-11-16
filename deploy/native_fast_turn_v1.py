@@ -28,7 +28,7 @@ def check_guard(part,path):
         raise ValueError('Fast session cancelled before submission')
 
 
-def execute_part(job,path,root,target_id,name,is_group,command,tree,selected,text_sender,sticker_sender,profile):
+def execute_part(job,path,root,target_id,name,is_group,command,tree,selected,text_sender,sticker_sender,profile,pat_sender=None):
     index=command['index'];kind=command.get('kind')
     part_path=path.parent/(path.stem+'-part-'+str(index)+'.json')
     part={'operation':'send_'+str(kind),'chat':target_id,'created':command.get('created',0),
@@ -38,20 +38,24 @@ def execute_part(job,path,root,target_id,name,is_group,command,tree,selected,tex
                 fast_session_nonce=path.stem,state='pending')
     before=dict(profile);started=time.monotonic()
     try:
-        if kind not in ('text','sticker') or command.get('chat')!=target_id:
+        if kind not in ('text','sticker','pat') or command.get('chat')!=target_id:
             raise ValueError('Invalid fast command destination or kind')
         if not 0<=time.time()-part['created']<5:raise ValueError('Fast command expired before submission')
         check_guard(part,part_path)
-        if root is None:root=tree()
+        if root is None or kind!='text' and root.get('send_controls_only'):root=tree()
         if not selected(root,name,is_group):raise ValueError('Fast command destination changed')
         write(part_path,part)
         if kind=='text':
             root=text_sender(part,part_path,root,name,is_group,target_id)
+        elif kind=='pat':
+            if pat_sender is None:raise ValueError('Native pat sender is not configured')
+            root=pat_sender(part,part_path,root,name,is_group,target_id)
         else:
             sticker_sender(part,part_path,root,name,is_group)
             # Escape closes the picker; never reuse its old tile coordinates.
             root=None
-        if part.get('state')!='submitted':raise ValueError('Native action did not report submission')
+        valid_states=('submitted','done') if kind=='pat' else ('submitted',)
+        if part.get('state') not in valid_states:raise ValueError('Native action did not report submission')
     except Exception as exc:
         try:part=json.loads(part_path.read_text(encoding='utf-8'))
         except (OSError,ValueError):pass
@@ -63,12 +67,13 @@ def execute_part(job,path,root,target_id,name,is_group,command,tree,selected,tex
     part['ui_seconds']=round(time.monotonic()-started,3)
     write(part_path,part)
     result={k:part[k] for k in ('state','error','cancelled','ui_timing','ui_seconds','favorite_seconds',
-                               'quote_fallback','mention_fallback','mentions_applied') if k in part}
+                               'quote_fallback','mention_fallback','mentions_applied',
+                               'pat_skipped','pat_confirmed','pat_local_id','reason','submitted_at') if k in part}
     job.setdefault('parts',{})[str(index)]=result;write(path,job)
     return root
 
 
-def run_session(job,path,root,target_id,name,is_group,tree,selected,text_sender,sticker_sender,profile,window_signature):
+def run_session(job,path,root,target_id,name,is_group,tree,selected,text_sender,sticker_sender,profile,window_signature,pat_sender=None):
     command_path=path.parent/(path.stem+'.command.json')
     expected=0;signature=window_signature()
     job.update(state='ready',parts={},ready_profile=dict(profile));write(path,job)
@@ -84,7 +89,7 @@ def run_session(job,path,root,target_id,name,is_group,tree,selected,text_sender,
         try:current_signature=window_signature()
         except Exception:current_signature=None
         if not current_signature or current_signature!=signature:root=None
-        root=execute_part(job,path,root,target_id,name,is_group,command,tree,selected,text_sender,sticker_sender,profile)
+        root=execute_part(job,path,root,target_id,name,is_group,command,tree,selected,text_sender,sticker_sender,profile,pat_sender=pat_sender)
         signature=current_signature
         expected+=1
     job.update(state='done',session_complete=True,completed_parts=expected);write(path,job)

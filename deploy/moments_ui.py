@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import time
 import unicodedata
 
@@ -95,7 +96,7 @@ def authorize(account, kind=None, payload=None):
     return native_read('/moments'), value
 
 
-def open_moments():
+def open_moments(*, minimize_existing_editor=True):
     root = tree()
     # A failed favorite selection can leave this popup above the sidebar.
     # The first sidebar click would merely dismiss it and never open Moments.
@@ -104,6 +105,20 @@ def open_moments():
         time.sleep(.08)
         root = tree()
     existing = [n for n in walk(root) if n.get('role') == 'frame' and n.get('name') == 'Moments']
+    if any(editors(n) for n in existing):
+        # A read/probe can hide a real unsent draft without touching its
+        # controls. A publish must stop instead of opening a competing draft.
+        if len(existing) != 1:
+            raise ValueError('Multiple Moments windows are open; preserve drafts for manual handling')
+        if not minimize_existing_editor:
+            raise ValueError('Moments has an existing editor; preserve the draft for manual handling')
+        import chat_select_linux as native_ui
+        from native_recovery import minimize_moments_editor
+        minimize_moments_editor(native_ui, existing[0])
+        root = tree()
+        existing = [n for n in walk(root) if n.get('role') == 'frame' and n.get('name') == 'Moments']
+        if any(editors(n) for n in existing):
+            raise ValueError('Moments editor remains open; preserve the draft for manual handling')
     if not existing:
         click_node(button(root, 'Moments'))
     wait_for(lambda r: frame(r), stage='open window')
@@ -129,16 +144,47 @@ def open_moments():
     return frame()
 
 
-def close_moments():
-    try:
-        f = frame()
-        cancel = [n for n in walk(f) if n.get('role') == 'push-button' and n.get('name') == 'Cancel']
-        if len(cancel) == 1:
-            click_node(cancel[0])
-        command('xdotool', 'key', '--clearmodifiers', 'Escape')
-        click_node(button(frame(), 'Close'))
-    except (ValueError, subprocess.SubprocessError):
-        pass
+DISCARD_LABELS = ("Don't Save", 'Discard', 'Discard Changes', 'Discard Draft', '不保存', '放弃')
+
+
+def close_moments(*, owned_editor=False):
+    """Close our surface and verify it; never Escape away a discard question."""
+    root=tree()
+    frames=[n for n in walk(root) if n.get('role')=='frame' and n.get('name')=='Moments']
+    if not frames:return
+    if len(frames)!=1:raise ValueError('Moments cleanup has ambiguous windows')
+    f=frames[0]
+    if owned_editor:
+        try:dialog=image_file_dialog(root)
+        except ValueError:dialog=None
+        if dialog:
+            cancel=[n for n in walk(dialog) if n.get('role')=='push-button' and n.get('name') in ('Cancel','取消')]
+            if len(cancel)!=1:raise ValueError('Moments file picker cannot be cancelled safely')
+            click_node(cancel[0]);time.sleep(.12);root=tree();f=frame(root)
+    if editors(f):
+        if not owned_editor:raise ValueError('Moments cleanup preserved an unowned editor')
+        def signature(n):return (n.get('name'),json.dumps(n.get('bounds') or {},sort_keys=True))
+        previous={signature(n) for n in walk(root) if n.get('role')=='push-button' and n.get('name') in DISCARD_LABELS}
+        click_node(button(composer(root),'Cancel'))
+        end=time.monotonic()+3;discarded=False
+        while True:
+            root=tree()
+            remaining=[n for n in walk(root) if n.get('role')=='frame' and n.get('name')=='Moments']
+            if not remaining:return
+            f=frame(root)
+            if not editors(f):break
+            discard=[n for n in walk(root) if n.get('role')=='push-button' and n.get('name') in DISCARD_LABELS
+                     and signature(n) not in previous and 'DISABLED' not in (n.get('states') or [])]
+            if len(discard)>1:raise ValueError('Moments discard confirmation is ambiguous')
+            if discard and not discarded:
+                click_node(discard[0]);discarded=True
+            if time.monotonic()>=end:raise ValueError('Moments owned editor did not close')
+            time.sleep(.12)
+    click_node(button(f,'Close'))
+    end=time.monotonic()+2
+    while any(n.get('role')=='frame' and n.get('name')=='Moments' for n in walk(tree())):
+        if time.monotonic()>=end:raise ValueError('Moments window did not close')
+        time.sleep(.12)
 
 
 def put_text(editor, text):
@@ -149,24 +195,37 @@ def put_text(editor, text):
     time.sleep(.12)
 
 
+FILE_DIALOG_TITLES = ('Open', 'Open File', 'Select File', '打开', '选择文件', '选择图片')
+FILE_OPEN_LABELS = ('Open', '打开', '打开(O)', '打开(&O)')
+
+
 def image_file_dialog(root):
-    dialogs = [n for n in walk(root) if n.get('role') == 'dialog' and n.get('name') == 'Open']
+    dialogs = [n for n in walk(root) if n.get('role') in ('dialog', 'file chooser', 'file-chooser', 'frame')
+               and n.get('name') in FILE_DIALOG_TITLES
+               and not set(n.get('states') or ()).intersection({'DEFUNCT', 'INVISIBLE', 'HIDDEN'})
+               and (not n.get('bounds') or n['bounds'].get('width', 0) > 0 and n['bounds'].get('height', 0) > 0)]
+    if len(dialogs) > 1:
+        active = [n for n in dialogs if 'ACTIVE' in (n.get('states') or ())]
+        if len(active) == 1:
+            dialogs = active
     if len(dialogs) != 1:
         raise ValueError('Moments image file dialog is not unique')
     return dialogs[0]
 
 
-def select_publish_images(paths):
-    dialog = wait_for(image_file_dialog, stage='image file dialog')
+def select_publish_images(paths,session=None):
+    dialog = wait_for(image_file_dialog, seconds=5, stage='image file dialog')
     # Qt can restore this modal to coordinates beyond the Xvfb screen. The
     # accessible Open button still exists there, but a pointer click misses it.
     width, height = map(int, command('xdotool', 'getdisplaygeometry').stdout.split())
     bounds = dialog['bounds']
     if bounds['width'] > width or bounds['height'] > height:
         raise ValueError('Moments image file dialog is larger than the display')
-    windows = command('xdotool', 'search', '--onlyvisible', '--name', '^Open$').stdout.decode().split()
+    windows = command('xdotool', 'search', '--onlyvisible', '--name',
+                      '^(' + '|'.join(FILE_DIALOG_TITLES) + ')$').stdout.decode().split()
     if len(windows) != 1:
         raise ValueError('Moments image file window is not unique')
+    if session:session.picker(windows[0])
     command('xdotool', 'windowactivate', '--sync', windows[0])
     command('xdotool', 'windowmove', '--sync', windows[0],
             str((width-bounds['width'])//2), str((height-bounds['height'])//2))
@@ -180,18 +239,28 @@ def select_publish_images(paths):
 
     dialog = wait_for(visible_dialog, stage='image file dialog placement')
     fields = [n for n in walk(dialog) if n.get('role') == 'text' and
-              n.get('name') == 'File name:' and 'EDITABLE' in (n.get('states') or [])]
+              n.get('name') in ('File name:', '文件名:', '文件名：', '文件名(N):')
+              and 'EDITABLE' in (n.get('states') or [])]
     if len(fields) != 1:
         raise ValueError('Moments image file name field is not unique')
     put_text(fields[0], ' '.join('"' + p + '"' for p in paths))
 
     def ready_open(root):
-        control = button(visible_dialog(root), 'Open')
+        controls = [n for n in walk(visible_dialog(root)) if n.get('role') == 'push-button'
+                    and n.get('name') in FILE_OPEN_LABELS]
+        if len(controls) != 1:
+            raise ValueError('Moments image Open control is not unique')
+        control = controls[0]
         if 'DISABLED' in (control.get('states') or []):
             raise ValueError('Moments image files are not ready')
         return control
 
     click_node(wait_for(ready_open, stage='image file selection'))
+    def selected(root):
+        if any(n.get('name') in FILE_DIALOG_TITLES and n.get('role') in ('dialog','file chooser','file-chooser','frame') for n in walk(root)):
+            raise ValueError('Image file picker is still open')
+        return composer(root)
+    wait_for(selected,seconds=5,stage='selected images in editor')
 
 
 def readable_publish_images(paths):
@@ -212,7 +281,7 @@ def readable_publish_images(paths):
     return result
 
 
-def prepare_publish(payload):
+def prepare_publish(payload,session=None):
     f = frame()
     post = button(f, 'Post')
     assets = payload.get('assets') or []
@@ -227,14 +296,19 @@ def prepare_publish(payload):
             if not p.is_file():
                 raise ValueError('Moments image is unavailable')
             paths.append(str(p))
+        paths=readable_publish_images(paths)
+        if session:session.claim()
         click_node(post)
-        select_publish_images(readable_publish_images(paths))
+        select_publish_images(paths,session)
     else:
+        if session:session.claim()
         b = post['bounds']
         command('xdotool', 'mousemove', str(round(b['x'] + b['width']/2)), str(round(b['y'] + b['height']/2)), 'click', '3')
         menu = wait_for(lambda r: button(r, 'Post Text', 'menu-item'), stage='Post Text menu')
         click_node(menu)
-    return wait_for(composer, stage='publish editor')
+    container=wait_for(composer,stage='publish editor')
+    if session:session.checkpoint('')
+    return container
 
 
 def matching_post(snapshot, source, kind):
@@ -251,6 +325,11 @@ def matching_post(snapshot, source, kind):
                     and c['text'] == expected.get('text') and not c.get('own')]
         if len(comments) != 1:
             raise ValueError('Source comment changed or is no longer available')
+        if any(c.get('own') and not c.get('local') and c.get('reply_to') == comments[0]['id']
+               for c in post['comments']):
+            raise ValueError('Source comment already has a native reply; no duplicate reply sent')
+    elif any(c.get('own') and not c.get('local') for c in post['comments']):
+        raise ValueError('Source post already has a native comment; no duplicate comment sent')
     return post
 
 
@@ -314,8 +393,18 @@ def capture_area(bounds, name):
 
 def copied_comment_matches(value, target):
     expected = norm(target['text'])
-    return norm(value) == expected or norm(value) in {
-        norm(target.get('name', '')+separator+target['text']) for separator in (':', '：')}
+    variants = {expected}
+    # WeChat's Copy adds [Photo] (4.1.13.26) / [Image] / [图片] for an attached image,
+    # while SNS content contains only its caption. Permit only the count
+    # confirmed by this comment's fresh native XML, never arbitrary suffixes.
+    count = target.get('image_count', 0)
+    if isinstance(count, int) and not isinstance(count, bool) and 1 <= count <= 9:
+        variants.update(expected + marker*count for marker in ('[Photo]', '[Image]', '[图片]'))
+    copied = norm(value)
+    if copied in variants:
+        return True
+    return copied in {norm(target.get('name', '')+separator)+text
+                      for separator in (':', '：') for text in variants}
 
 
 def comment_detail(post,expected_height=None):
@@ -330,8 +419,10 @@ def comment_detail(post,expected_height=None):
     # Qt removes the off-screen post accessible after scrolling. The opaque
     # comment block keeps its full logical height, previously bound to this post.
     if expected_height is not None:
+        from moments_layout import comment_width
         matches=[n for n in rows if n.get('role')=='list-item' and
-                 (n.get('bounds') or {}).get('width')==548 and
+                 comment_width((n.get('bounds') or {}).get('width')) and
+                 abs(n['bounds']['width']-lists[0]['bounds']['width']) <= 2 and
                  (n.get('bounds') or {}).get('height')==expected_height]
         if len(matches)==1:return matches[0]['bounds'],lists[0]['bounds']
     raise ValueError('Source post is not confirmed in comment detail')
@@ -535,7 +626,12 @@ def select_notification_comment(post, target):
 
 def reply_comment(post, source, *, snapshot=None):
     """Reply directly under the verified post; notifications are not durable history."""
-    target = source['comment']
+    expected = source['comment']
+    targets = [c for c in post['comments'] if all(c.get(k) == expected.get(k)
+               for k in ('id', 'author', 'text')) and not c.get('own')]
+    if len(targets) != 1:
+        raise ValueError('Source comment changed or is no longer available')
+    target = targets[0]  # Fresh attachment metadata, including for older drafts.
     try:
         if snapshot is not None:
             locate_post(post, snapshot, allow_partial=True)
@@ -552,7 +648,7 @@ def reply_comment(post, source, *, snapshot=None):
     def signature(values):
         prefix = []
         for c in sorted(values, key=lambda c: (c['created'], int(c['id']))):
-            prefix.append((c['id'], c['author'], c['text']))
+            prefix.append((c['id'], c['author'], c['text'], c.get('image_count', 0)))
             if c['id'] == target['id']:
                 return prefix
         return None
@@ -639,9 +735,23 @@ def run(path, account):
     kind = job.get('kind') if sending else None
     source = job.get('source') or {}
     snapshot, authority = authorize(account, kind, source)
+    from moments_session import ComposerSession
+    session=ComposerSession(sys.modules[__name__],account,path)
     opened = False
     try:
-        open_moments()
+        recovery=session.recover()
+        root=tree()
+        existing=[n for n in walk(root) if n.get('role')=='frame' and n.get('name')=='Moments']
+        blocked=any(editors(n) for n in existing) or any(n.get('name') in FILE_DIALOG_TITLES and
+            n.get('role') in ('dialog','file chooser','file-chooser','frame') for n in walk(root))
+        if blocked:
+            if sending:raise ValueError('Moments has an existing editor; preserve the draft for manual handling')
+            # A hidden draft is restored when Moments is opened again. Read
+            # the existing synchronized cache instead of minimizing/reopening it.
+            job.update(snapshot,state='done',refreshed=False,capabilities={'read':True},
+                       ui_surface={'state':'blocked','code':(recovery or {}).get('code','unowned_editor')})
+            path.write_text(json.dumps(job,ensure_ascii=False));return
+        open_moments(minimize_existing_editor=False)
         opened = True
         if operation == 'moments_reply_probe':
             # Exercise selection through the existing GUI guard, never type or submit.
@@ -666,12 +776,12 @@ def run(path, account):
             if operation == 'moments_probe':
                 capabilities['text_publish'] = False
                 try:
-                    prepare_publish({})
+                    prepare_publish({},session)
                     capabilities['text_publish'] = True
-                    click_node(button(composer(tree()), 'Cancel'))
                 except ValueError:
                     pass
-            job.update(snapshot, capabilities=capabilities, state='done')
+            job.update(snapshot, capabilities=capabilities, state='done',refreshed=True,
+                       ui_surface={'state':'ready','recovered':bool(recovery and recovery.get('state')=='recovered')})
         else:
             text = job.get('text')
             if not isinstance(text, str) or not text.strip() or len(text) > (180 if kind == 'publish' else 100):
@@ -683,11 +793,13 @@ def run(path, account):
                     approved.update(image_authority.get('assets', []))
                 if any(a not in approved for a in source.get('assets', [])):
                     raise ValueError('Moments image is not enabled for publishing')
-                container = prepare_publish(source)
+                container = prepare_publish(source,session)
                 fields = editors(container)
                 if len(fields) != 1:
                     raise ValueError('Moments publish editor is not unique')
+                session.expect(text)
                 put_text(fields[0], text)
+                session.checkpoint(text)
                 submit = button(composer(tree()), 'Post')
                 before = {p['id'] for p in snapshot['posts'] if p['own']}
             else:
@@ -699,8 +811,11 @@ def run(path, account):
                 before = {c['id'] for c in post['comments']}
                 submit = None
             # Recheck switches/account immediately before the non-idempotent click.
-            authorize(account, kind, source)
+            final_snapshot, _ = authorize(account, kind, source)
+            if kind != 'publish':
+                matching_post(final_snapshot, source, kind)
             job['state'] = 'sending'
+            session.submitting()
             path.write_text(json.dumps(job, ensure_ascii=False))
             if submit:
                 click_node(submit)
@@ -727,4 +842,15 @@ def run(path, account):
         path.write_text(json.dumps(job, ensure_ascii=False))
     finally:
         if opened:
-            close_moments()
+            primary=sys.exc_info()[0]
+            try:
+                close_moments(owned_editor=session.can_close())
+                session.closed()
+                job['ui_cleanup']={'state':'closed'}
+            except Exception:
+                # A confirmed publish remains confirmed; failed cleanup is a
+                # separate condition, never a reason to resubmit the post.
+                job['ui_cleanup']={'state':'blocked','code':'cleanup_failed'}
+                job['ui_surface']={'state':'blocked','code':'cleanup_failed'}
+                if primary is None and not sending:job.update(state='done',refreshed=False)
+            path.write_text(json.dumps(job,ensure_ascii=False))

@@ -16,12 +16,18 @@ import httpx
 from PIL import Image, ImageOps
 
 from .stickers import parse_json
-from .settings import private_write
-from .image_references import ReferenceLibrary, character_request, reference_request, reference_mode
+from .settings import UNRESTRICTED_IMAGE_MAX_PER_DAY, private_write
+from .image_references import (
+    ReferenceLibrary,
+    character_request,
+    reference_request,
+    reference_mode,
+    sanitize_image_persona,
+)
 from .image_tools import ImageTools, generation_words, library_words, CHARACTER
 from .image_retention import ImageRetention, SOURCES
 from .resources import native_pressure
-from .image_canvas import canvas, reference_required
+from .image_canvas import MAX_EDGE, MAX_GENERATED_PIXELS, canvas, reference_required
 
 TZ = timezone(timedelta(hours=8))
 ACTIVE = ('queued', 'generating', 'ready', 'sending')
@@ -39,17 +45,53 @@ def explicit_image_request(text):
     return None
 
 
-def normalize_image(raw, *, max_edge=2048, max_bytes=24_000_000):
+def normalize_image(raw, *, max_edge=2048, max_bytes=24_000_000, max_pixels=25_000_000):
     if len(raw) > max_bytes:
         raise ValueError('图片文件超过' + str(max_bytes // 1_000_000) + 'MB')
     with Image.open(io.BytesIO(raw)) as source:
-        if source.format not in ('PNG', 'JPEG', 'WEBP') or source.width * source.height > 25_000_000:
-            raise ValueError('仅支持2500万像素以内的 PNG / JPG / WebP')
-        image = ImageOps.exif_transpose(source).convert('RGB')
-        image.thumbnail((max_edge, max_edge))
-        out = io.BytesIO()
-        image.save(out, format='PNG')
-        return out.getvalue(), image.width, image.height
+        if source.format not in ('PNG', 'JPEG', 'WEBP') or source.width * source.height > max_pixels:
+            raise ValueError(f'仅支持{max_pixels}像素以内的 PNG / JPG / WebP')
+        # Avoid two full-size copies for the common RGB/no-rotation 8K result.
+        image = ImageOps.exif_transpose(source) if source.getexif().get(274) in range(2, 9) else source
+        if image.mode != 'RGB':
+            converted = image.convert('RGB')
+            if image is not source:
+                image.close()
+            image = converted
+        try:
+            image.thumbnail((max_edge, max_edge))
+            out = io.BytesIO()
+            image.save(out, format='PNG')
+            return out.getvalue(), image.width, image.height
+        finally:
+            if image is not source:
+                image.close()
+
+
+def _http_error_detail(response) -> str:
+    """Extract a short secret-free error detail from an HTTP 4xx response."""
+    raw = ''
+    try:
+        data = response.json()
+        if isinstance(data, dict):
+            err = data.get('error')
+            if isinstance(err, dict):
+                raw = str(err.get('message') or err.get('code') or err.get('type') or '')
+            elif isinstance(err, str):
+                raw = err
+            if not raw:
+                raw = str(data.get('message') or data.get('detail') or data.get('msg') or '')
+    except (ValueError, TypeError, AttributeError):
+        text = (response.text or '').strip()
+        if text and not text.lstrip().startswith('<'):
+            raw = text.splitlines()[0]
+    if not raw:
+        return ''
+    cleaned = re.sub(r'Bearer\s+[A-Za-z0-9._-]+', 'Bearer ***', raw, flags=re.I)
+    cleaned = re.sub(r'sk-[A-Za-z0-9_-]{8,}', 'sk-***', cleaned)
+    cleaned = re.sub(r'https?://\S+', '[url]', cleaned)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned[:140]
 
 
 class GenerationUncertain(ValueError):
@@ -77,6 +119,7 @@ class ImageService:
         self.references = ReferenceLibrary(self.config)
         self.generating = ''
         self.dispatching = ''
+        self._moments_model_checks = {}
         self.generation_lock = asyncio.Lock()
         self.dispatch_lock = asyncio.Lock()
         self.error = ''
@@ -105,6 +148,8 @@ class ImageService:
                 self.store.db.execute("ALTER TABLE picture_jobs ADD COLUMN reference_json TEXT NOT NULL DEFAULT '{}'")
             if 'diagnostics_json' not in {r[1] for r in self.store.db.execute('PRAGMA table_info(picture_jobs)')}:
                 self.store.db.execute("ALTER TABLE picture_jobs ADD COLUMN diagnostics_json TEXT NOT NULL DEFAULT '{}'")
+            if 'unrestricted' not in {r[1] for r in self.store.db.execute('PRAGMA table_info(picture_jobs)')}:
+                self.store.db.execute("ALTER TABLE picture_jobs ADD COLUMN unrestricted INTEGER NOT NULL DEFAULT 0")
             # Never repeat a paid request or send interrupted at a non-idempotent boundary.
             self.store.db.execute("UPDATE picture_jobs SET state='uncertain',error='服务重启时请求尚未确认，不自动重新生成或发送' WHERE state IN ('generating','sending')")
             self.store.db.execute("UPDATE picture_assets SET state='pending' WHERE state='tagging'")
@@ -116,7 +161,7 @@ class ImageService:
         self.tools = ImageTools(self)
 
     def change(self, identity, **fields):
-        allowed = {'state', 'asset_id', 'error', 'receipt', 'model', 'usage_json', 'api_started', 'moment_id', 'notice_state', 'diagnostics_json'}
+        allowed = {'state', 'asset_id', 'error', 'receipt', 'model', 'usage_json', 'api_started', 'moment_id', 'notice_state', 'diagnostics_json', 'unrestricted'}
         if not fields or set(fields) - allowed:
             raise ValueError('Invalid picture job patch')
         with self.store.lock:
@@ -205,7 +250,8 @@ class ImageService:
                    character_id='', character_variant=''):
         if source not in SOURCES:
             raise ValueError('无效图库来源')
-        data, width, height = normalize_image(raw, max_edge=4096, max_bytes=64_000_000) if source == 'generated' else normalize_image(raw)
+        data, width, height = normalize_image(raw, max_edge=MAX_EDGE, max_bytes=64_000_000,
+            max_pixels=MAX_GENERATED_PIXELS) if source == 'generated' else normalize_image(raw)
         account = account or self.config.settings.account_id
         # Identical bytes with different provenance must not widen an existing scope.
         identity = hashlib.sha256(account.encode()+source.encode()+scope.encode()+scope_chat.encode()+data).hexdigest()
@@ -226,7 +272,7 @@ class ImageService:
                     state='pending',error='' WHERE id=?""", (time.time(), identity))
             self.store.db.execute('''INSERT OR IGNORE INTO picture_assets
                 (id,account,source,name,width,height,prompt,model,created) VALUES(?,?,?,?,?,?,?,?,?)''',
-                (identity, account, source, '待AI整理的图片', width, height, prompt[:3000], model, time.time()))
+                (identity, account, source, '待AI整理的图片', width, height, prompt, model, time.time()))
             if hasattr(self, 'tools'):
                 self.store.db.execute('UPDATE picture_assets SET scope=?,scope_chat=?,character_id=?,character_variant=? WHERE id=?',
                     (scope, scope_chat, character_id, character_variant, identity))
@@ -373,41 +419,98 @@ class ImageService:
         return {'score':score, 'coverage':sum(4*min(len(w), 4) for w in terms)+len(characters),
                 'terms':terms[:8], 'characters':characters}
 
-    def generation_count(self, *, pending=True, now=None):
+    def generation_count(self, *, pending=True, now=None, unrestricted=False):
         since = datetime.fromtimestamp(time.time() if now is None else now,TZ).replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
-        return self.store.db.execute("""SELECT count(*) FROM picture_jobs WHERE account=? AND kind='generate' AND
+        if unrestricted is None:
+            return self.store.db.execute("""SELECT count(*) FROM picture_jobs WHERE account=? AND kind='generate' AND
+                (api_started>=? OR (? AND api_started=0 AND state IN ('queued','generating')))""",
+                (self.config.settings.account_id,since,int(pending))).fetchone()[0]
+        return self.store.db.execute("""SELECT count(*) FROM picture_jobs WHERE account=? AND kind='generate' AND unrestricted=? AND
             (api_started>=? OR (? AND api_started=0 AND state IN ('queued','generating')))""",
-            (self.config.settings.account_id,since,int(pending))).fetchone()[0]
+            (self.config.settings.account_id,int(bool(unrestricted)),since,int(pending))).fetchone()[0]
+
+    def unrestricted_daily_limit(self, settings=None):
+        s = settings or self.config.settings
+        return min(UNRESTRICTED_IMAGE_MAX_PER_DAY, max(0, int(getattr(s, 'image_unrestricted_per_day', 2))))
+
+    def _generation_route(self, settings, *, unrestricted=False):
+        if unrestricted:
+            if not settings.image_generation_enabled:
+                raise ValueError('生图接口尚未配置或已关闭，请先在后台图片设置开启允许生成新图片')
+            if not settings.image_unrestricted_enabled:
+                raise ValueError('无限制生图开关尚未开启，请先在后台图片设置打开开关')
+            key = self.config.unrestricted_image_api_key()
+            url = settings.image_unrestricted_api_url
+            model = settings.image_unrestricted_model
+            if not key or not url or not model:
+                raise ValueError('无限制生图接口尚未配置完整，请先在后台图片设置填写地址、模型和密钥')
+            return url, key, model, self.unrestricted_daily_limit(settings)
+        key = self.config.image_api_key()
+        if not settings.image_generation_enabled or not key:
+            raise ValueError('生图接口尚未配置或已关闭，请先在后台图片设置填写密钥')
+        return settings.image_api_url, key, settings.image_model, settings.image_per_day
 
     def enqueue(self, *, kind, prompt='', asset_id='', chat='', source_key='', destination='library', moment_id='',
                    reference_ids=None, character=False, character_variant='', mode='auto', chat_reference_plan=None, admin_authorized=False,
-                   aspect_ratio='auto', cast_ids=None):
+                   aspect_ratio='auto', cast_ids=None, unrestricted=False):
         with self.store.lock:
             return self._enqueue(kind=kind, prompt=prompt, asset_id=asset_id, chat=chat, source_key=source_key,
                 destination=destination, moment_id=moment_id, reference_ids=reference_ids, character=character,
                 character_variant=character_variant, mode=mode, chat_reference_plan=chat_reference_plan,
-                admin_authorized=admin_authorized, aspect_ratio=aspect_ratio, cast_ids=cast_ids)
+                admin_authorized=admin_authorized, aspect_ratio=aspect_ratio, cast_ids=cast_ids, unrestricted=unrestricted)
+
+    def _image_persona(self, settings, character: bool, destination: str) -> str:
+        """Keep brief sanitized temperament for chat prompts; drop chat-policy text before saving."""
+        if not character or destination == 'moments':
+            return ''
+        persona = settings.system_prompt_override
+        if not persona and hasattr(self.runtime, 'styles'):
+            persona = self.runtime.styles.get_active().system_prompt
+        return sanitize_image_persona(persona)
+
+    def _attach_comic_example(self, inputs, *, destination, story, actors, variant, prompt):
+        """Attach at most one comic layout example only when panels & cast align safely."""
+        if destination != 'moments' or not self.config.settings.image_references_enabled:
+            return inputs
+        panels = (story or {}).get('panels') or []
+        is_comic = len(panels) >= 2 or bool(re.search(r'[2-4二两三四]格(?:漫画|分镜)', str(prompt or '')))
+        if not is_comic or len(inputs) >= 5:
+            return inputs
+        matched = (
+            ('whalegirl' in actors and 'claude' in actors)
+            or (variant == 'chibi' and 'whalegirl' in actors)
+            or bool(re.search(r'示例|分镜排版', str(prompt or '')))
+        )
+        if not matched:
+            return inputs
+        existing = {v.get('id') for v in inputs}
+        for ex in self.references.selected_examples('comic_example', limit=1):
+            if ex['id'] not in existing:
+                inputs.append({'id': ex['id'], 'source': 'comic_example', 'name': ex['name'], 'role': ex['role']})
+        return inputs
 
     def _enqueue(self, *, kind, prompt='', asset_id='', chat='', source_key='', destination='library', moment_id='',
                    reference_ids=None, character=False, character_variant='', mode='auto', chat_reference_plan=None, admin_authorized=False,
-                   aspect_ratio='auto', cast_ids=None):
+                   aspect_ratio='auto', cast_ids=None, unrestricted=False):
         s = self.config.settings
+        unrestricted = bool(unrestricted)
         if source_key:
             prior = self.store.db.execute('SELECT id FROM picture_jobs WHERE source_key=? AND account=?', (source_key,s.account_id)).fetchone()
             if prior:
                 return prior[0]
         if destination not in ('library','chat','moments') or kind not in ('generate','send'):
             raise ValueError('无效图片任务')
+        if unrestricted and destination == 'moments':
+            raise ValueError('朋友圈配图不使用无限制生图')
         if destination == 'chat' and (not s.enabled or not s.images_chat_enabled or chat not in s.allowed_chat_ids or
                 s.images_allowed_chat_ids and chat not in s.images_allowed_chat_ids):
             raise ValueError('这个会话尚未允许图片功能')
         if kind == 'generate':
-            if not s.image_generation_enabled or not self.config.image_api_key():
-                raise ValueError('生图接口尚未配置或已关闭，请先在后台图片设置填写密钥')
+            _, _, _, daily_limit = self._generation_route(s, unrestricted=unrestricted)
             if not prompt.strip():
                 raise ValueError('请描述需要生成的图片')
-            if self.generation_count() >= s.image_per_day:
-                raise ValueError('今日生图任务已达上限')
+            if self.generation_count(unrestricted=unrestricted) >= daily_limit:
+                raise ValueError(f'今日无限制生图任务已达上限（当前每日上限 {daily_limit} 张）' if unrestricted else '今日生图任务已达上限')
         if asset_id:
             self.stage(asset_id, chat=chat if destination == 'chat' else '', admin=admin_authorized or destination == 'library')
         plan = {}
@@ -437,7 +540,7 @@ class ImageService:
                     raise ValueError('参考图功能已关闭，请在后台开启')
                 inputs = self.references.catalog_items(reference_ids or [])
                 if character:
-                    chosen = self.references.selected(variant)
+                    chosen = self.references.selected(variant, prompt=prompt, multi_character=bool(story))
                     if not chosen:
                         raise ValueError('这套角色参考图尚未配置，请先在后台上传')
                     inputs += [{**v, 'source': 'character'} for v in chosen]
@@ -456,36 +559,39 @@ class ImageService:
                     if not world:
                         raise ValueError('生活漫画的角色参考尚未就绪')
                     inputs += world.references(story['cast_ids'], self.references)
+                actors = list((story or {}).get('cast_ids') or (['whalegirl'] if character else []))
+                inputs = self._attach_comic_example(inputs, destination=destination, story=story,
+                                                    actors=actors, variant=variant, prompt=prompt)
                 if len(inputs) + len((chat_reference_plan or {}).get('sources', [])) > 8:
                     raise ValueError('一次最多使用8张参考图')
-                persona = s.system_prompt_override
-                if character and not persona and hasattr(self.runtime,'styles'):
-                    persona = self.runtime.styles.get_active().system_prompt
                 plan = {**(chat_reference_plan or {}), 'inputs': inputs, 'character': bool(character),
                         'destination': destination,
                         'variant': variant, 'mode': mode if mode != 'auto' else reference_mode(prompt, s.image_reference_mode),
                         'appearance': self.references.appearance(variant) if character else '',
-                        'persona': persona if character else ''}
+                        'persona': self._image_persona(s, bool(character), destination)}
                 if story:
                     plan['world_episode'] = story
                     plan['world_canon'] = world.image_context(story['cast_ids'])
             if cast_ids:
                 plan = self.bind_cast({**plan, 'destination': destination,
-                    'mode': plan.get('mode', reference_mode(prompt, s.image_reference_mode))}, cast_ids, variant)
+                    'mode': plan.get('mode', reference_mode(prompt, s.image_reference_mode))}, cast_ids, variant, prompt=prompt)
             plan['canvas'] = canvas(s.image_size, aspect_ratio)
+            if unrestricted:
+                plan['unrestricted'] = True
         identity = uuid.uuid4().hex
         with self.store.lock:
             self.store.db.execute('''INSERT OR IGNORE INTO picture_jobs
-                (id,account,chat,destination,kind,prompt,asset_id,source_key,created,updated,moment_id,reference_json)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''', (identity,s.account_id,chat,destination,kind,prompt[:3000],asset_id,
-                    source_key or identity,time.time(),time.time(),moment_id,json.dumps(plan,ensure_ascii=False)))
+                (id,account,chat,destination,kind,prompt,asset_id,source_key,created,updated,moment_id,reference_json,unrestricted)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''', (identity,s.account_id,chat,destination,kind,prompt,asset_id,
+                    source_key or identity,time.time(),time.time(),moment_id,json.dumps(plan,ensure_ascii=False),
+                    int(unrestricted and kind == 'generate')))
             if admin_authorized:
                 self.store.db.execute('UPDATE picture_jobs SET tool_json=? WHERE id=?', (json.dumps({'admin_authorized':True}),identity))
             self.store.db.commit()
         row = self.store.db.execute('SELECT id FROM picture_jobs WHERE source_key=?',(source_key or identity,)).fetchone()
         return row[0]
 
-    def bind_cast(self, plan, cast_ids, variant=None):
+    def bind_cast(self, plan, cast_ids, variant=None, prompt=''):
         """Bind declared characters to the same pixels in chats and Moments."""
         from .moments_world import CAST_IDS
         if (not isinstance(cast_ids, list) or not cast_ids or len(cast_ids) > 4 or
@@ -496,12 +602,13 @@ class ImageService:
         if not s.image_references_enabled:
             raise ValueError('参考图功能已关闭，请在后台开启')
         world = getattr(getattr(self.runtime, 'moments', None), 'world', None)
+        destination = plan.get('destination', 'library')
         inputs = [v for v in plan.get('inputs', [])
-                  if v.get('source') not in ('character', 'story_character', 'character_generated')]
+                  if v.get('source') not in ('character', 'story_character', 'character_generated', 'comic_example')]
         variant = variant or plan.get('variant') or s.image_character_variant
         character = 'whalegirl' in actors
         if character:
-            chosen = self.references.selected(variant)
+            chosen = self.references.selected(variant, prompt=prompt or plan.get('prompt', ''), multi_character=len(actors) > 1)
             if not chosen:
                 raise ValueError('这套角色参考图尚未配置，请先在后台上传')
             inputs += [{**v, 'source': 'character'} for v in chosen]
@@ -509,14 +616,20 @@ class ImageService:
             if not world:
                 raise ValueError('生活漫画的角色参考尚未就绪')
             inputs += world.references(actors, self.references)
+        inputs = self._attach_comic_example(
+            inputs,
+            destination=destination,
+            story=plan.get('world_episode'),
+            actors=actors,
+            variant=variant,
+            prompt=prompt or plan.get('prompt', ''),
+        )
         if len(inputs) + len(plan.get('sources', [])) > 8:
             raise ValueError('一次最多使用8张参考图')
-        persona = s.system_prompt_override
-        if character and not persona and hasattr(self.runtime, 'styles'):
-            persona = self.runtime.styles.get_active().system_prompt
         return {**plan, 'inputs': inputs, 'cast_ids': actors, 'character': character,
                 'variant': variant, 'appearance': self.references.appearance(variant) if character else '',
-                'persona': persona if character else '', 'world_canon': world.image_context(actors) if world else {}}
+                'persona': self._image_persona(s, character, destination),
+                'world_canon': world.image_context(actors) if world else {}}
 
     async def chat_request(self, first, batch):
         # Compatibility for callers of the former pre-model shortcut. Only the
@@ -702,18 +815,48 @@ class ImageService:
             if response.status_code >= 300:
                 raise GenerationUncertain('供应商图片任务查询未确认（HTTP '+str(response.status_code)+'），已保留任务编号，未重复生成')
 
+    async def check_moments_model(self, client, endpoint, key, model):
+        """Cheap catalog check for unattended posts, before a billable request.
+
+        Providers without a model-list endpoint retain their existing protocol.
+        The cache includes the key digest, so an account/config change is adopted.
+        """
+        identity = hashlib.sha256((endpoint + '\0' + model + '\0' + key).encode()).hexdigest()
+        cached = self._moments_model_checks.get(identity)
+        if cached and cached['until'] > time.monotonic():
+            if cached['error']:
+                raise ValueError(cached['error'])
+            return
+        error = ''
+        try:
+            response = await client.get(endpoint + '/models', headers={'Authorization': 'Bearer ' + key},
+                timeout=8, follow_redirects=False)
+            if response.status_code in (401, 403, 429):
+                error = '生图模型检查 HTTP ' + str(response.status_code) + '，未提交生成；请核对授权或稍后再试'
+            elif response.status_code == 200 and len(response.content) < 1024**2:
+                value = response.json()
+                items = value.get('data') if isinstance(value, dict) else None
+                if (isinstance(items, list) and items and not value.get('has_more')
+                        and all(isinstance(x, dict) and isinstance(x.get('id'), str) for x in items)):
+                    if model not in {x['id'] for x in items}:
+                        error = '当前生图模型不在接口可用列表中，未提交生成；请在生图设置中选择可用型号'
+        except (httpx.HTTPError, ValueError):
+            # An unsupported/temporarily unavailable metadata endpoint does not
+            # authorize a different model or change the established image API.
+            pass
+        self._moments_model_checks = {identity: {'until': time.monotonic() + (60 if error else 300), 'error': error}}
+        if error:
+            raise ValueError(error)
+
     async def generate(self, job):
         s = self.config.settings
-        key = self.config.image_api_key()
-        if not key or not s.image_generation_enabled:
-            raise ValueError('生图接口未配置或已关闭')
         if job['account'] != s.account_id:
             raise ValueError('账号已变化，未发起生图请求')
-        endpoint = s.image_api_url.rstrip('/')
-        endpoint = re.sub(r'/images/(?:generations|edits)$','',endpoint)
-        if not endpoint.endswith('/v1'):
-            endpoint += '/v1'
         plan = json.loads(job.get('reference_json') or '{}')
+        unrestricted = bool(job.get('unrestricted') or plan.get('unrestricted'))
+        if unrestricted and job['destination'] == 'moments':
+            raise ValueError('朋友圈配图不使用无限制生图')
+        self._generation_route(s, unrestricted=unrestricted)
         if reference_required(plan) and not s.image_references_enabled:
             raise ValueError('参考图功能已关闭，任务未调用生图接口')
         library = ReferenceLibrary(self.config, account=job['account'])
@@ -722,37 +865,67 @@ class ImageService:
             fresh = self.get(job['id'])
             if fresh['state'] == 'cancelled':
                 raise ValueError('任务已取消，未调用生图接口')
-            if fresh['prompt'] == job['prompt'] and fresh['reference_json'] == job['reference_json']:
+            fresh_plan = json.loads(fresh.get('reference_json') or '{}')
+            fresh_unrestricted = bool(fresh.get('unrestricted') or fresh_plan.get('unrestricted'))
+            if fresh['prompt'] == job['prompt'] and fresh['reference_json'] == job['reference_json'] and fresh_unrestricted == unrestricted:
                 break
             # Amendments during slow reference retrieval still belong to this one request.
             job = fresh
-            plan = json.loads(job.get('reference_json') or '{}')
-        references.sort(key=lambda v:v['source']=='character')
-        if self.config.settings.account_id != job['account']:
+            plan = fresh_plan
+            unrestricted = fresh_unrestricted
+        # Anchor whalegirl first (图1), partners next, historical generated ref & layout example last.
+        references.sort(key=lambda v: {'character': 0, 'story_character': 1, 'character_generated': 3, 'comic_example': 4}.get(v.get('source'), 2))
+        s = self.config.settings
+        if s.account_id != job['account']:
             raise ValueError('账号已变化，未发起生图请求')
-        if not self.config.settings.image_generation_enabled or reference_required(plan) and not self.config.settings.image_references_enabled:
+        if reference_required(plan) and not s.image_references_enabled:
             raise ValueError('图片功能已关闭，未发起生图请求')
         if self.get(job['id'])['state'] == 'cancelled':
             raise ValueError('任务已取消，未调用生图接口')
+        raw_url, key, model_used, daily_limit = self._generation_route(s, unrestricted=unrestricted)
+        endpoint = raw_url.rstrip('/')
+        endpoint = re.sub(r'/images/(?:generations|edits)$', '', endpoint)
+        if not endpoint.endswith('/v1'):
+            endpoint += '/v1'
         self.check_proactive_permission(job)
-        prompt = library.request_prompt(job['prompt'],plan,references) if plan else job['prompt']
+        prompt = library.request_prompt(job['prompt'], plan, references) if plan else job['prompt']
         files = library.upload_parts(references) if references else None
         endpoint += '/images/edits' if references else '/images/generations'
-        if self.generation_count(pending=False) >= self.config.settings.image_per_day:
-            raise ValueError('今日生图任务已达上限，未调用图片接口')
-        self.change(job['id'],state='generating',api_started=time.time(),model=s.image_model)
-        self.diagnose(job['id'], phase='submit')
+        if self.generation_count(pending=False, unrestricted=unrestricted) >= daily_limit:
+            raise ValueError(f'今日无限制生图任务已达上限（当前每日上限 {daily_limit} 张），未调用图片接口' if unrestricted else '今日生图任务已达上限，未调用图片接口')
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(s.image_timeout,connect=15),trust_env=False) as client:
+                if job['destination'] == 'moments':
+                    self.diagnose(job['id'], phase='model_check')
+                    await self.check_moments_model(client, endpoint.rsplit('/images/', 1)[0], key, model_used)
+                self.change(job['id'],state='generating',api_started=time.time(),model=model_used)
+                self.diagnose(job['id'], phase='submit')
                 deadline = time.monotonic()+s.image_timeout
-                params = {'model':s.image_model,'prompt':prompt,'n':1,'size':(plan.get('canvas') or {}).get('size', s.image_size)}
+                canvas_plan = plan.get('canvas') or {}
+                requested_canvas = canvas(canvas_plan.get('base_size', s.image_size),
+                                          canvas_plan.get('aspect_ratio', 'auto'))
+                params = {'model': model_used, 'prompt': prompt, 'n': 1, 'size': requested_canvas['size']}
                 options = {'data':{k:str(v) for k,v in params.items()},'files':files} if files else {'json':params}
                 response = await client.post(endpoint,headers={'Authorization':'Bearer '+key},**options)
                 self.diagnose(job['id'], phase='response', http_status=response.status_code)
                 if response.status_code >= 500:
                     raise GenerationUncertain('生图服务异常，可能已接单，不自动再次扣费生成')
                 if response.status_code >= 400:
-                    raise ValueError('生图接口返回 HTTP '+str(response.status_code)+'，请检查模型、密钥或额度')
+                    code = ''
+                    try:
+                        data = response.json()
+                        err = data.get('error') if isinstance(data, dict) else None
+                        if isinstance(err, dict):
+                            raw_code = str(err.get('code') or err.get('type') or '')
+                            if re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', raw_code):
+                                code = raw_code
+                    except (ValueError, TypeError, AttributeError):
+                        pass
+                    if code:
+                        self.diagnose(job['id'], provider_error_code=code)
+                    detail = _http_error_detail(response)
+                    msg = f'生图接口返回 HTTP {response.status_code}'
+                    raise ValueError(f'{msg}：{detail}' if detail else f'{msg}，请检查模型、密钥或额度')
                 value, item = await self.generation_result(client, response, job, endpoint, key, deadline)
                 if item.get('b64_json'):
                     self.diagnose(job['id'], phase='decode')
@@ -776,7 +949,9 @@ class ImageService:
                 (plan.get('world_episode') or plan.get('character') and
                  all(v.get('source') == 'character' for v in plan.get('inputs', []))))
             self.diagnose(job['id'], phase='save')
-            asset = await asyncio.to_thread(self.save_asset,raw,'generated',prompt=job['prompt'],model=s.image_model,account=job['account'],
+            # All destinations share save_asset's 8K normalization; do not decode
+            # and recompress a large Moments result a second time before saving.
+            asset = await asyncio.to_thread(self.save_asset,raw,'generated',prompt=job['prompt'],model=model_used,account=job['account'],
                 scope='global' if public else 'chat' if job['chat'] else 'admin', scope_chat='' if public else job['chat'],
                 character_id=CHARACTER if plan.get('character') and not plan.get('world_episode') and
                     not any(c != 'whalegirl' for c in plan.get('cast_ids', [])) else '',
@@ -850,7 +1025,7 @@ class ImageService:
                     self.store.action_finish(action['id'], 'uncertain', error=error)
         self.diagnose(job['id'], error_type=type(exc).__name__, original_error=error)
         self.change(job['id'],state='uncertain' if uncertain else 'failed',error=error)
-        self.moment_failed(job,error if uncertain else '图片处理失败，原文保留')
+        self.moment_failed(job,error if uncertain else '图片处理失败，原文保留：' + error)
 
     async def generate_once(self):
         """Only submit generation jobs; API waiting never occupies the dispatcher."""
@@ -963,17 +1138,32 @@ class ImageService:
             job['usage']=json.loads(job.pop('usage_json'))
             job['diagnostics']=json.loads(job.pop('diagnostics_json') or '{}')
             plan=json.loads(job.pop('reference_json') or '{}')
+            job['unrestricted'] = bool(job.get('unrestricted') or plan.get('unrestricted'))
             job['canvas'] = plan.get('canvas', {})
             job['references']={'count':len(plan.get('inputs',[]))+len(plan.get('sources',[])),
                                'variant':plan.get('variant','') if plan.get('character') else '',
                                'mode':plan.get('mode','')}
         used = self.generation_count(pending=False)
         reserved = self.generation_count() - used
+        unrestricted_limit = self.unrestricted_daily_limit()
+        unrestricted_used = self.generation_count(pending=False, unrestricted=True)
+        unrestricted_reserved = self.generation_count(unrestricted=True) - unrestricted_used
         return {'assets':self.assets(),'jobs':jobs,'decisions':self.tools.decisions(),'busy':self.busy,'error':self.error,
                 'generation_budget':{'limit':self.config.settings.image_per_day,'submitted':used,'reserved':reserved,
                                      'remaining':max(0,self.config.settings.image_per_day-used-reserved),'timezone':'Asia/Shanghai'},
+                'unrestricted_generation_budget':{
+                    'enabled':bool(self.config.settings.image_unrestricted_enabled),
+                    'configured':bool(self.config.settings.image_unrestricted_api_url and self.config.settings.image_unrestricted_model and self.config.unrestricted_image_api_key()),
+                    'limit':unrestricted_limit,
+                    'submitted':unrestricted_used,
+                    'reserved':unrestricted_reserved,
+                    'remaining':max(0,unrestricted_limit-unrestricted_used-unrestricted_reserved),
+                    'timezone':'Asia/Shanghai',
+                },
                 'workers':{'generation':self.generating,'dispatch':self.dispatching},
-                'image_api_key_configured':bool(self.config.image_api_key()),'references':self.references.public(),
+                'image_api_key_configured':bool(self.config.image_api_key()),
+                'image_unrestricted_api_key_configured':bool(self.config.unrestricted_image_api_key()),
+                'references':self.references.public(),
                 'retention':self.retention.snapshot()}
 
     async def loop(self):

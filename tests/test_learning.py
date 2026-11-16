@@ -157,6 +157,21 @@ class LearningTests(unittest.IsolatedAsyncioTestCase):
         service.offer(source, [source], [proposal(source)])
         self.assertTrue(service.queue.empty())
 
+    async def test_context_excludes_already_loaded_memory_ids(self):
+        source = event()
+        self.add(source)
+        loaded_ctx, loaded_recalled = self.runtime.learning.context(source, [source], '猫')
+        self.assertIn('喜欢猫', loaded_ctx)
+        row = self.runtime.memory_hub.recall('account', self.config.settings.allowed_chat_ids,
+                                             source['sender_id'], '猫', chat=source['chat'],
+                                             subjects=(source['sender_id'],))[0]
+        dedup_ctx, dedup_recalled = self.runtime.learning.context(
+            source, [source], '猫', exclude_memory_ids=[row['id']]
+        )
+        self.assertNotIn('已采纳的学习经验', dedup_ctx)
+        self.assertEqual(dedup_recalled, [])
+        self.assertTrue(loaded_recalled)
+
     async def test_normal_reply_uses_one_call_and_preserves_static_cache_prefix(self):
         source = event()
         self.store.insert(source)

@@ -11,7 +11,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from .conversation import anti_formula_check, habit_static_prompt, pair_sticker, plan_actions, sticker_dynamic_prompt, sticker_static_prompt, sticker_usage_prompt, warmth_prompt
+from .conversation import anti_formula_check, habit_static_prompt, pair_sticker, pat_target_options, plan_actions, plan_pat_targets, sticker_dynamic_prompt, sticker_static_prompt, sticker_usage_prompt, warmth_prompt
 from .memory import memory_parts
 from .mentions import apply_mentions, mention_dynamic_prompt, mention_options, mention_static_prompt
 from .stickers import parse_json
@@ -19,7 +19,9 @@ from .resources import native_pressure
 from .context import build_context, vision_reply
 from .search import DeepSeekSearch, search_static_prompt
 from .proactive_tools import resolve_tools
+from .usage_context import scoped_usage, set_usage_context
 from .settings import reply_temperature
+from .model_reply import guarded_chat, ToolReplyFormatError
 
 BEIJING = timezone(timedelta(hours=8))
 
@@ -171,6 +173,54 @@ class ProactiveService:
         lock = getattr(gateway, 'ui_lock', None)
         return (lock is not None and lock.locked()) or bool(getattr(gateway, 'inflight_sends', 0))
 
+    def decision_gap(self):
+        s = self.config.settings
+        return s.proactive_decision_minutes * 60 * {'quiet': 2, 'balanced': 1, 'active': .5}[s.proactive_level]
+
+    def private_idle_at(self, chat, state, last):
+        """An opted-in private chat can become an idle opportunity without a new anchor.
+
+        Count from both real conversation activity and the last decision, so a
+        silent model decision cannot turn into repeated timer calls. This does
+        not grant contact permission or bypass the unanswered-opener check.
+        """
+        if chat.endswith('@chatroom') or not last:
+            return None
+        s = self.config.settings
+        gap = max(self.decision_gap(), s.proactive_cooldown_minutes * 60,
+                  s.proactive_idle_minutes * 60)
+        previous = self.store.db.execute('SELECT state,created FROM proactive_runs WHERE account=? AND chat=? '
+            'ORDER BY created DESC LIMIT 1', (s.account_id, chat)).fetchone()
+        # An opener cancelled for foreground work is not an AI choice to stay
+        # silent. It may be reconsidered at the normal decision interval.
+        decision_gap = self.decision_gap() if previous and previous['state'] == 'skipped' and (
+            previous['created'] >= state['last_decision'] - .001) else gap
+        return max(state['last_decision'] + decision_gap,
+                   max(state['last_start'], last['timestamp'], self.store.latest_sent(s.account_id, chat)) + gap)
+
+    async def private_send_slot(self, first, generation, diagnostics, *, timeout=30):
+        """Wait without a UI/chat lock; discard immediately if this chat changes."""
+        started = time.monotonic()
+        outcome = 'cancelled'
+        try:
+            anchor = json.loads(first.get('payload_json') or '{}').get('anchor')
+            while True:
+                if generation != self.config.generation or not self.send_allowed(first, started=True):
+                    outcome = 'permission_changed';return False
+                if anchor != self.source_anchor(first['chat']):
+                    outcome = 'context_changed';return False
+                if not self.quota(first['chat'], time.time()):
+                    outcome = 'quota';return False
+                if self.send_allowed(first) and not self.blocked():
+                    outcome = 'ready';return True
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    outcome = 'timeout';return False
+                await asyncio.sleep(min(1, remaining))
+        finally:
+            diagnostics['proactive_send_wait'] = {'outcome':outcome,
+                'elapsed_ms':round((time.monotonic()-started)*1000)}
+
     def eligible(self, chat, now):
         s = self.config.settings
         if not self.permitted(chat, now) or not active_hour(s, now) or not self.quota(chat, now):
@@ -181,14 +231,23 @@ class ProactiveService:
         last = self.latest_human(chat)
         if not last or (not chat.endswith('@chatroom') and last['sender_id'] in self.muted_people(chat, now)):
             return False
+        if chat.endswith('@chatroom'):
+            import re
+            last_txt = str(last.get('content') or '').strip()
+            self_names = {s.account_id, '沃不明白', '小鲸鱼', '大肥鱼', *getattr(s, 'keywords', ())}
+            if last.get('sender_id') in getattr(s, 'fishtalk_excluded_sender_ids', ()):
+                return False
+            if re.search(r'(?<![A-Za-z0-9._%+-])@\S+', last_txt) and not any(k and k in last_txt for k in self_names):
+                return False
         if self.runtime.autonomy.active() and not self.runtime.autonomy.opportunity(chat, anchor=last['key'], now=now):
-            return False
+            idle_at = self.private_idle_at(chat, state, last)
+            if idle_at is None or now < idle_at:
+                return False
         due = self.runtime.autonomy.pending(s.account_id, chat, due=True, now=now)
         # Do not message unfamiliar contacts or repeatedly ping an unanswered opener.
         if (not due and state['waiting_after'] and last['timestamp'] <= state['waiting_after']):
             return False
-        decision_gap = s.proactive_decision_minutes * 60 * {'quiet': 2, 'balanced': 1, 'active': .5}[s.proactive_level]
-        return (now >= max(state['last_decision'] + decision_gap,
+        return (now >= max(state['last_decision'] + self.decision_gap(),
                            state['last_start'] + s.proactive_cooldown_minutes * 60,
                            last['timestamp'] + s.proactive_idle_minutes * 60,
                            self.store.latest_sent(s.account_id, chat) + s.proactive_idle_minutes * 60))
@@ -235,6 +294,7 @@ class ProactiveService:
         self.execute('UPDATE proactive_runs SET '+','.join(k+'=?' for k in fields)+' WHERE id=?',
                      (*fields.values(), identity))
 
+    @scoped_usage
     async def run_once(self):
         r, s = self.runtime, self.config.settings
         now = time.time()
@@ -247,8 +307,7 @@ class ProactiveService:
                          key=lambda c: (self.chat_state(c)['last_decision'], c))
         last_probe = self.store.db.execute('SELECT max(last_decision) FROM proactive_chats WHERE account=?',
                                           (s.account_id,)).fetchone()[0] or 0
-        decision_gap = s.proactive_decision_minutes*60*{'quiet':2, 'balanced':1, 'active':.5}[s.proactive_level]
-        if not targets or now-last_probe < decision_gap:
+        if not targets or now-last_probe < self.decision_gap():
             return False
         chat = targets[0]
         generation = self.config.generation
@@ -269,6 +328,7 @@ class ProactiveService:
                      content='[系统自主开聊候选，不是真实收到的微信消息]',
                      payload_json=json.dumps({'anchor': self.source_anchor(chat)}))
         due_intents = r.autonomy.pending(s.account_id, chat, due=True, now=now)
+        set_usage_context(s.account_id, chat, key)
         r.autonomy.considered(first, self.source_anchor(chat))
         self.busy = True
         engine = None
@@ -283,7 +343,10 @@ class ProactiveService:
             base_image_ids = {item['id'] for item in base_image_catalog}
             used = r.sticker_library.excluded(s.account_id, chat)
             history = self.store.sticker_selection_history(s.account_id, chat, s.sticker_cooldown_seconds) if s.stickers_enabled else {}
-            choices = r.stickers.candidates(query, s.sticker_candidate_limit, used, history) if s.stickers_enabled else {}
+            if s.stickers_enabled:
+                r.sticker_library.apply_inflight_cooldown(s.account_id, chat, s.sticker_cooldown_seconds, history)
+            fresh_bonus = r.sticker_library.fresh_collected_bonus(s.account_id, chat) if s.stickers_enabled else {}
+            choices = r.stickers.candidates(query, s.sticker_candidate_limit, used, history, fresh_bonus=fresh_bonus) if s.stickers_enabled else {}
             mentions_enabled = s.proactive_mentions_enabled and s.group_mentions_enabled and chat.endswith('@chatroom')
             mentions = {}
             if mentions_enabled:
@@ -293,6 +356,11 @@ class ProactiveService:
                                                [m['sender_id'] for m in humans])
                 except Exception:
                     pass
+            pat_cooldown_ids = {
+                *(getattr(self.store, 'recent_pat_targets', lambda *a, **k: ())(s.account_id, chat, getattr(s, 'pat_cooldown_seconds', 45))),
+                *(r.recent_pat_targets(s.account_id, chat) if hasattr(r, 'recent_pat_targets') else ()),
+            }
+            pat_options = pat_target_options(humans[-12:], account_id=s.account_id, excluded={*muted, *pat_cooldown_ids})
             source_ids = {m['key'] for m in recent} | {'memory:'+str(i) for i in recall.get('ids', [])+recall.get('joke_ids', [])}
             tieba_evidence = {}
             system = ((s.system_prompt_override.strip() or r.styles.get_active().system_prompt)
@@ -304,30 +372,41 @@ class ProactiveService:
                 + r.tieba.tools.static_prompt()
                 + r.bilibili.tools.static_prompt()
                 + '\n【主动聊天】你现在有一次自主发起聊天的机会，并没有人刚向你提问。'
-                  '结合人设、关系、当前北京时间和真实话题，顺着第一直觉决定是否值得开口；没具体想说的就沉默。'
-                  '可分享有依据的兴趣见闻、接续尚未解决的话题、关心近况或找一个具体群友搭话。'
-                  '先分清是正在接话还是隔了一段时间重新开聊：已结束的旧话题不再逐句点评；隔得久时只有确有新意或值得关心才开口，不固定打招呼或催促回复。'
-                  '像一个在场的年轻女孩自然抛出一句短话或表情，不当话题主持人或总结员；忙碌人员不可点名或@。'
+                  '结合人设、关系、当前北京时间和真实话题，顺着第一直觉决定是否值得开口；没具体想说的或群友正在呼叫其他机器人/别人时直接沉默（should_reply=false）。'
+                  '可分享刚刷到的贴吧/B站趣事见闻、接续尚未解决的话题、或找一个熟人俏皮搭话吐槽。'
+                  '先分清是正在接话还是隔了一段时间（或隔夜）重新开聊：如果最近几句和前文隔了很久（topic_gap_seconds较大）或last_human_age_seconds已超过10分钟，闲聊多半已凉；群友说了句没点明对象的短句（如“我也卸载了/没时间玩”）而早先曾同时提过多个不同事物，绝不瞎猜坐实其中某一个，拿不准就直接顺着自然反问一句“你把哪个卸了呀”或直接沉默（should_reply=false）；已结束的旧话题不再逐句点评；隔得久时只有确有新意（例如data.surf_discoveries里刚看过还没在本群聊过的B站有趣视频/帖子）或未完事项才开口，若顺带聊到surf_discoveries里的某个视频可在JSON写"shared_bilibili_id":"对应id"（别像机器播报一样照抄视频标题），不固定打招呼、不当居委会劝架圆场或催促回复。如果上下文含[合并转发聊天记录]，务必看清框内每条原日期、时间和原说话人，几周或几个月前的旧截图或别人互称（哪怕出现熟人或亲密称呼）不是此刻刚说的话，也不是对着你说的，绝不误认或翻旧截图搭话。'
+                  '像一个在场的年轻女孩自然抛出一句干脆鲜活的短话，或直接只甩1个贴合当下气氛的原生sticker表情包（有合拍候选且没正经问题要答时，actions只放那1个sticker不补客套文字也非常自然），不当话题主持人或总结员；保留甜软可爱的少女口吻（适度用日常语气词即可，不必句句硬贴尾音），不用句首机械挂“唔/呜”，忙碌人员不可点名或@。'
                   '可按需使用已授权工具（联网搜索、贴吧、B站异步探索、记忆、表情库、图库与生图）；记忆和收藏的source_key只用真实群友消息，不因自己准备开口而改好感度。'
                   '输出JSON：{"should_reply":false,"reason":"供管理员查看的简短依据，不含内部推理",'
-                  '"sources":["确切消息key或memory:ID"],"actions":[],"image_request":null,"tieba_request":null,"bilibili_request":null,"tieba_used_meme_ids":[],"search_query":"","fetch_url":"","memory_ops":[],"memory_used_ids":[],"sticker_ops":[],"image_descriptions":[]}。'
-                  'actions为有序发送计划，文字为{"type":"text","text":"自然短句","mentions":[]}，表情为{"type":"sticker","id":"目录ID"}；每轮最多'+str(s.reply_max_parts)+'个动作，沉默时actions=[]且image_request=null。')
-            system += r.autonomy.static_prompt()
+                  '"sources":["确切消息key或memory:ID"],"actions":[],"pat_targets":[],"image_request":null,"tieba_request":null,"bilibili_request":null,"shared_bilibili_id":"","tieba_used_meme_ids":[],"search_query":"","fetch_url":"","memory_ops":[],"memory_used_ids":[],"sticker_ops":[],"image_descriptions":[]}。'
+                  'actions为有序发送计划，文字为{"type":"text","text":"自然短句","mentions":[]}，表情为{"type":"sticker","id":"目录ID"}；若想俏皮主动拍一拍某个熟人逗TA，可在pat_targets填1个代号如["p1"]（每轮最多1人）；每轮actions最多'+str(s.reply_max_parts)+'个动作，沉默时actions=[]、pat_targets=[]且image_request=null。')
+            system += r.autonomy.static_prompt() + r.statistics_tools.prompt()
             # Chat-specific catalog and venue belong after all common rules;
             # changing the roster must not split the reusable system prefix.
             system += r.affection.venue_prompt(first, s)
             if chat.endswith('@chatroom'):system += mention_static_prompt(mentions_enabled)
             system += r.images.tools.catalog_prompt(base_image_catalog)
+            recent_ts = [float(row.get('timestamp') or 0) for row in humans[-8:] if row.get('timestamp')]
+            max_gap = max((b - a for a, b in zip(recent_ts, recent_ts[1:])), default=0)
             data = {'chat': r.chat_labels.get(chat, chat), 'initiative': s.proactive_level,
                     'do_not_address': sorted(muted),
                     'last_human_age_seconds': round(max(0,now-humans[-1]['timestamp'])),
                     'last_bot_age_seconds': round(max(0,now-self.store.latest_sent(s.account_id,chat)))
                         if self.store.latest_sent(s.account_id,chat) else None}
+            if max_gap >= 1800:
+                data['topic_gap_seconds'] = round(max_gap)
+            surf_discoveries = r.bilibili.unshared_readings(chat, limit=2) if s.bilibili_enabled else []
+            surf_discovery_ids = {item['id'] for item in surf_discoveries}
+            if surf_discoveries:
+                data['surf_discoveries'] = surf_discoveries
             growth_context={}
             growth_prompt=r.growth.prompt(first,humans,growth_context,proactive=True)
             loaded_memory_ids.update(growth_context.get('ids',[]))
-            dynamic = (memory_dynamic + growth_prompt + r.images.tools.dynamic_prompt(image_context, base_image_ids)
-                       + r.fishtalk.dynamic_prompt(first)
+            bili_meme_recall = {}
+            dynamic = (memory_dynamic + growth_prompt
+                       + r.bilibili.meme_prompt(query, bili_meme_recall, chat=chat, proactive=True)
+                       + r.images.tools.dynamic_prompt(image_context, base_image_ids)
+                       + r.fishtalk.dynamic_prompt(first,humans[-6:])
                        + sticker_dynamic_prompt(choices, r.stickers.details(choices)))
             if choices:
                 dynamic+=sticker_usage_prompt(self.store,s,first)
@@ -339,17 +418,21 @@ class ProactiveService:
                 source_ids.add('memory:'+str(first['_reading_offered']))
             dynamic += r.affection.dynamic_prompt(first, humans[-6:], s)
             dynamic += mention_dynamic_prompt(mentions,mentions_enabled)
-            if s.anti_formula_guard_enabled and not s.fishtalk_enabled:
+            if pat_options:
+                dynamic += '\n可主动轻拍对象（每轮最多填1个代号进pat_targets，不可自造ID）：' + json.dumps(
+                    {k: v['name'] for k, v in pat_options.items()}, ensure_ascii=False) + '。'
+            if s.anti_formula_guard_enabled:
                 dynamic += anti_formula_check(self.store,s.account_id,chat,
                     gentle=r.autonomy.experience.active())['prompt']
             # Offer real recent sticker sources without embedding the full
             # management catalog because an old message mentioned collection.
             dynamic += r.sticker_library.dynamic_prompt(first, [first], s)
             # Separate bounded request: a slow opener cannot occupy the regular reply worker.
+            proactive_max_tokens = max(720, s.max_tokens + 480)
             engine = r.engine_factory(api_url=s.api_url, api_key=self.config.api_key(), model=s.model,
                                       api_style=s.api_style,
                                       reasoning_effort=s.reasoning_effort, stream_enabled=s.model_stream_enabled,
-                                      max_tokens=s.max_tokens+400, temperature=reply_temperature(s, proactive=True), timeout=12, max_retries=0)
+                                      max_tokens=proactive_max_tokens, temperature=reply_temperature(s, proactive=True), timeout=25, max_retries=0)
             engine.usage_callback = lambda event: r.token_ledger.record(s.account_id, event)
             tool_messages, image_keys, context_counts = await build_context(
                 self.store,r.gateway,s,first,[],r.chat_labels,initiative=True)
@@ -366,19 +449,25 @@ class ProactiveService:
             if isinstance(content,list):content[0]['text']+=suffix
             else:tool_messages[0]['content']+=suffix
             search_tools = DeepSeekSearch.tools(engine, s) if self.native_tools_disabled_generation != generation else []
-            options = dict(system_prompt=system, max_tokens=s.max_tokens+400,
+            options = dict(system_prompt=system, max_tokens=proactive_max_tokens,
                            response_format={'type':'json_object'}, operation='proactive')
             if search_tools:
-                result = await asyncio.wait_for(engine.chat_with_tools(tool_messages, search_tools, **options), timeout=15)
+                result = await asyncio.wait_for(engine.chat_with_tools(tool_messages, search_tools, **options), timeout=30)
                 requested = DeepSeekSearch.native_decision(result)
                 raw = json.dumps(requested, ensure_ascii=False) if requested else result.get('content') or ''
                 if not raw and str(getattr(engine,'last_error','')).startswith('HTTP 400'):
                     self.native_tools_disabled_generation = generation
-                    raw = await asyncio.wait_for(engine.chat(tool_messages, **options), timeout=15)
+                    raw = await asyncio.wait_for(engine.chat(tool_messages, **options), timeout=30)
             else:
-                raw = await asyncio.wait_for(engine.chat(tool_messages, **options), timeout=15)
+                raw = await asyncio.wait_for(engine.chat(tool_messages, **options), timeout=30)
             if not raw or not raw.strip():
                 raise ValueError(getattr(engine, 'last_error', '') or '模型未返回内容')
+            format_diagnostics = {'proactive': True, **context_counts}
+            try:
+                raw = await asyncio.wait_for(guarded_chat(engine, tool_messages, diagnostics=format_diagnostics,
+                    stage='proactive_decision', initial_raw=raw, **options), timeout=30)
+            finally:
+                self.store.metrics(key, format_diagnostics)
             decision = parse_json(raw or '')
             if not isinstance(decision, dict) or not isinstance(decision.get('should_reply'), bool):
                 raise ValueError('Invalid proactive decision')
@@ -411,7 +500,15 @@ class ProactiveService:
             actions, diagnostics['sticker_pairing'] = pair_sticker(decision, actions, choices, s)
             for action in actions:
                 action['quote_local_id'] = 0
-            if (generation != self.config.generation or not self.send_allowed(first) or self.blocked()
+            pat_actions = plan_pat_targets(decision, pat_options, s, recent_targets=pat_cooldown_ids)
+            if pat_actions:
+                diagnostics['pat_planned'] = pat_actions[0]['target_id']
+                actions = [*actions, *pat_actions]
+            send_ready = True
+            if not chat.endswith('@chatroom'):
+                send_ready = await self.private_send_slot(first, generation, diagnostics)
+                self.store.metrics(key, diagnostics)
+            if (not send_ready or generation != self.config.generation or not self.send_allowed(first) or self.blocked()
                     or not self.quota(chat, time.time())):
                 self.finish(identity, 'skipped', error='有新消息、权限变化或正在处理其他聊天，本轮未发送')
                 return True
@@ -434,8 +531,12 @@ class ProactiveService:
                     sent = record['state'] in ('sent', 'partial') if actions else False
                     if sent and s.memory_enabled:
                         r.memory_hub.mark_used(s.account_id, decision.get('memory_used_ids'), loaded_memory_ids)
-                    r.tieba.tools.record_usage(first, decision, tieba_evidence, '\n'.join(
-                        a['reply'] for a in self.store.actions(key) if a['state'] == 'sent'))
+                    sent_text = '\n'.join(a['reply'] for a in self.store.actions(key) if a['state'] == 'sent')
+                    r.tieba.tools.record_usage(first, decision, tieba_evidence, sent_text)
+                    r.bilibili.record_meme_usage(first, bili_meme_recall, sent_text)
+                    shared_bili_id = str(decision.get('shared_bilibili_id') or '').strip()
+                    if sent and shared_bili_id and shared_bili_id in surf_discovery_ids:
+                        r.bilibili.record_share(chat, shared_bili_id)
                     image_result = None
                     if ((not actions or sent) and generation == self.config.generation and self.send_allowed(first, started=sent)):
                         image_result = r.images.tools.execute(decision.get('image_request'), first, [first], image_context)
@@ -484,6 +585,8 @@ class ProactiveService:
                 self.last_error = '主动判断超时，本轮未发送'
             elif isinstance(exc, json.JSONDecodeError):
                 self.last_error = '模型未返回有效 JSON，本轮未发送'
+            elif isinstance(exc, ToolReplyFormatError):
+                self.last_error = '主动回复格式恢复失败，本轮未发送'
             elif isinstance(exc, ValueError) and str(exc) == (getattr(engine, 'last_error', '') or '模型未返回内容'):
                 self.last_error = str(exc)[:180]
             else:
@@ -519,9 +622,18 @@ class ProactiveService:
                 if row['image_job']:
                     job = self.runtime.images.get(row['image_job'])
                     row['image_state'] = job['state'] if job else 'missing'
+        chats = {}
+        for chat in self.config.settings.proactive_chat_ids:
+            state = self.chat_state(chat)
+            if not chat.endswith('@chatroom'):
+                last = self.latest_human(chat)
+                state['private_idle_at'] = self.private_idle_at(chat, state, last)
+                state['waiting_for_reply'] = bool(last and state['waiting_after'] and
+                                                 last['timestamp'] <= state['waiting_after'])
+            chats[chat] = state
         return {'enabled': self.config.settings.proactive_enabled, 'busy': self.busy, 'last_error': self.last_error,
                 'quiet':self.runtime.chat_control.snapshot(),
-                'runs': rows, 'chats': {chat: self.chat_state(chat) for chat in self.config.settings.proactive_chat_ids}}
+                'runs': rows, 'chats': chats}
 
     async def loop(self):
         while True:

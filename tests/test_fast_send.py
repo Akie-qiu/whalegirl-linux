@@ -127,5 +127,146 @@ class FastSendTests(unittest.IsolatedAsyncioTestCase):
             {'snapshots':0,'snapshot_seconds':0})
         self.assertEqual(called,[]);self.assertTrue(job['parts']['0']['cancelled'])
 
+    async def test_fast_send_session_is_usable_age_and_state(self):
+        from whalegirl_linux.fast_send import FastSendSession
+        gateway=self.lease_gateway()
+        allowed_flag={'ok':True}
+        session=FastSendSession(gateway,'chat',lambda:allowed_flag['ok'])
+        self.assertFalse(session.is_usable())
+        session.started=time.monotonic()
+        self.assertTrue(session.is_usable(max_age=12.0))
+        allowed_flag['ok']=False
+        self.assertFalse(session.is_usable(max_age=12.0))
+        allowed_flag['ok']=True
+        session.started=time.monotonic()-12.5
+        self.assertFalse(session.is_usable(max_age=12.0))
+        session.started=time.monotonic()
+        session.closed=True
+        self.assertFalse(session.is_usable(max_age=12.0))
+
+    async def test_send_turn_reuses_fresh_prewarmed_session_and_replaces_expired(self):
+        from whalegirl_linux.fast_send import FastSendSession
+        gateway=self.lease_gateway()
+        prewarmed=FastSendSession(gateway,'chat',lambda:True)
+        self.assertTrue(await prewarmed.start())
+        async with gateway.send_turn('chat',lambda:True,prewarmed=prewarmed) as active:
+            self.assertIs(active,prewarmed)
+            self.assertTrue(active.stats.get('prewarmed'))
+            res=await active.submit('text',{'text':'预热直发'})
+            self.assertEqual(res['state'],'submitted')
+        self.assertTrue(prewarmed.closed)
+        self.assertEqual(gateway.ui_calls,['send_session'])
+        self.assertFalse(gateway.ui_lock.locked())
+
+        stale=FastSendSession(gateway,'chat',lambda:True)
+        self.assertTrue(await stale.start())
+        stale.started=time.monotonic()-20.5
+        async with gateway.send_turn('chat',lambda:True,prewarmed=stale) as replacement:
+            self.assertIsNot(replacement,stale)
+            self.assertTrue(stale.closed)
+            self.assertTrue(replacement.stats.get('prewarmed_expired'))
+        self.assertFalse(gateway.ui_lock.locked())
+
+    async def test_group_members_cache_300s_and_stale_refresh(self):
+        gw=AgentGateway('http://127.0.0.1:1','token')
+        gw.ui_jobs_directory=self.folder
+        calls=[]
+        async def fake_native(path,**params):
+            calls.append((path,params))
+            return {'members':[{'username':'u1','nickname':f'n{len(calls)}'}]}
+        gw.native_request=fake_native
+        rows1=await gw.group_members('room@chatroom')
+        self.assertEqual(len(calls),1)
+        ts,cached_rows=gw._members_cache['room@chatroom']
+        gw._members_cache['room@chatroom']=(ts-250,cached_rows)
+        rows2=await gw.group_members('room@chatroom')
+        self.assertEqual(rows2,rows1)
+        self.assertEqual(len(calls),1)
+        gw._members_cache['room@chatroom']=(ts-350,cached_rows)
+        rows3=await gw.group_members('room@chatroom')
+        self.assertEqual(rows3,rows1)
+        await asyncio.sleep(0.02)
+        self.assertEqual(len(calls),2)
+
+    async def test_recent_messages_uses_limit_25_and_falls_back_on_legacy_mock(self):
+        from whalegirl_linux.delivery import _recent_messages
+        seen=[]
+        class ModernGateway:
+            async def messages(self,chat,limit=100):
+                seen.append((chat,limit))
+                return [{'localId':1}]
+        class LegacyGateway:
+            async def messages(self,chat):
+                seen.append((chat,None))
+                return [{'localId':2}]
+        self.assertEqual(await _recent_messages(ModernGateway(),'c1'),[{'localId':1}])
+        self.assertEqual(await _recent_messages(LegacyGateway(),'c2'),[{'localId':2}])
+        self.assertEqual(seen,[('c1',25),('c2',None)])
+
+    async def test_multi_bubble_gap_anchors_to_submitted_at(self):
+        from whalegirl_linux import runtime as rt_mod
+        from whalegirl_linux.gateway import Receipt
+        gateway=self.lease_gateway()
+        self.config.save(self.config.settings.model_copy(update={'reply_part_interval':0.5,'chat_habits_enabled':True}))
+        recorded_sleeps=[]
+        orig_sleep=rt_mod.asyncio.sleep
+        async def fake_sleep(delay,*args,**kwargs):
+            recorded_sleeps.append(delay)
+            return await orig_sleep(0)
+        async def fake_send(chat,text,**kwargs):
+            return Receipt(True,message_id='101',details={'submitted_at':time.time()-0.45})
+        gateway.send=fake_send
+        rt_mod.asyncio.sleep=fake_sleep
+        try:
+            row=self.event();self.queue(row)
+            await self.runtime._send_plan(row,[row],row,[
+                {'type':'text','text':'hi','display':'hi'},
+                {'type':'text','text':'ok','display':'ok'},
+            ],{},self.config.generation,{})
+        finally:
+            rt_mod.asyncio.sleep=orig_sleep
+        # part_gap for len('ok')==2 with base_gap=0.5 is 0.5s; submitted_at was 0.45s ago so sleep <= ~0.1s, NOT ~0.5s!
+        self.assertTrue(recorded_sleeps)
+        self.assertLess(recorded_sleeps[0],0.2)
+
+    async def test_delayed_prewarm_fires_during_generating_turn_and_reuses_session(self):
+        gateway=self.lease_gateway()
+        row=self.event();self.queue(row);engine=await self.runtime.model()
+        async def slow_chat(messages,**options):
+            deadline=time.monotonic()+5
+            while not gateway.ui_calls and time.monotonic()<deadline:
+                await asyncio.sleep(0.025)
+            await asyncio.sleep(0.08)
+            return json.dumps({'should_reply':True,'actions':[{'type':'text','text':'预热全链路成功'}]})
+        engine.chat=slow_chat
+        pipeline_task=asyncio.create_task(self.runtime.pipeline.loop())
+        try:
+            await self.runtime.process_next(defer_delivery=True)
+            await asyncio.wait_for(self.runtime.pipeline.queue.join(),timeout=5)
+        finally:
+            pipeline_task.cancel()
+            await asyncio.gather(pipeline_task,return_exceptions=True)
+        self.assertEqual(self.store.get(row['key'])['state'],'sent')
+        self.assertEqual(gateway.ui_calls,['send_session'])
+        self.assertEqual(gateway.sent,[('text','预热全链路成功')])
+        self.assertTrue(self.runtime.last_timing['fast_send'].get('prewarmed'))
+        self.assertFalse(gateway.ui_lock.locked())
+
+    async def test_delayed_prewarm_closes_cleanly_when_model_declines_reply(self):
+        gateway=self.lease_gateway()
+        row=self.event();self.queue(row);engine=await self.runtime.model()
+        async def slow_silent_chat(messages,**options):
+            deadline=time.monotonic()+5
+            while not gateway.ui_calls and time.monotonic()<deadline:
+                await asyncio.sleep(0.025)
+            await asyncio.sleep(0.08)
+            return json.dumps({'should_reply':False,'actions':[]})
+        engine.chat=slow_silent_chat
+        await self.runtime.process_next()
+        self.assertEqual(self.store.get(row['key'])['state'],'ignored')
+        self.assertEqual(gateway.ui_calls,['send_session'])
+        self.assertEqual(gateway.sent,[])
+        self.assertFalse(gateway.ui_lock.locked())
+
 
 if __name__=='__main__':unittest.main()

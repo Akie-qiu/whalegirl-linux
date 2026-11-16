@@ -95,6 +95,43 @@ class StickerPreferenceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             invalid=client.post('/api/proactive/config',headers={'Authorization':'Bearer '+c.admin_token},json={'values':{'sticker_usage_target':101}})
             self.assertEqual(invalid.status_code,400)
 
+    async def test_incoming_sticker_treated_as_auxiliary_mood_and_selectively_replied(self):
+        self.config.save(self.config.settings.model_copy(update={
+            'sticker_aggressiveness': 'normal',
+            'sticker_usage_target': 25,
+        }))
+        self.runtime.stickers.entries['b' * 32] = '开心，轻快雀跃'
+        self.runtime.stickers.profiles['b' * 32] = {'emotion': '开心', 'tone': '轻快', 'intensity': '低'}
+        self.runtime.stickers.available = ['b' * 32]
+        self.store.observe([
+            self.event(mid=10, content='今天账怎么对不上呀'),
+        ])
+        sticker_row = {
+            **self.event(
+                mid=11,
+                content='[原生表情包]（辅助情绪：开心；轻快；低）',
+            ),
+            'kind': 47,
+            'payload_json': json.dumps({'sticker': {'md5': 'b' * 32}}, ensure_ascii=False),
+        }
+        self.queue(sticker_row)
+        engine = await self.runtime.model()
+        seen = []
+        async def chat(messages, **options):
+            engine.calls += 1
+            seen.append(options['system_prompt'])
+            return json.dumps({
+                'should_reply': True,
+                'actions': [{'type': 'text', 'text': '说不定剩下那截账还在路上呢'}],
+            })
+        engine.chat = chat
+        await self.runtime.process_next()
+        self.assertEqual(engine.calls, 1)
+        self.assertIn('【表情只作情感辅助·不作聊天主体】', seen[0])
+        self.assertIn('并非收到表情就不回', seen[0])
+        self.assertIn('在没有着重提到的情况下不作为聊天主体', seen[0])
+        self.assertEqual(self.gateway.sent, [('text', '说不定剩下那截账还在路上呢')])
+
 
 from whalegirl_linux.app import create_app
 if __name__=='__main__':unittest.main()

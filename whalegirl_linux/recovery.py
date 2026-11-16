@@ -41,7 +41,7 @@ class RecoveryService:
         if (s.enabled and s.send_auto_recovery_enabled
                 and state.get('hold_code') in SEND_HOLDS
                 and not state.get('recovery_used')):
-            self.save(s.account_id, hold_code='', hold_reason='', hold_since=None,
+            self.save(s.account_id, hold_code='', hold_reason='', hold_scope='', hold_since=None,
                       recovery_status='pending', recovery_used=True,
                       recovery_requested_at=time.time(), recovery_error='')
 
@@ -99,7 +99,7 @@ class RecoveryService:
                     values = dict(recovery_status='awaiting_send', recovery_completed_at=time.time(),
                                   recovery_error='', recovery_used=True)
                     if resume:
-                        values.update(hold_reason='', hold_code='', hold_since=None)
+                        values.update(hold_reason='', hold_code='', hold_scope='', hold_since=None)
                         if manual:
                             r.paused_reason = ''
                     else:

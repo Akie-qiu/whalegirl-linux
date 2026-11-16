@@ -4,6 +4,7 @@ import re
 import time
 
 from .stickers import parse_json
+from .upstream.ai_engine import ContentFilteredResponse, content_filter_error
 
 
 class ToolReplyFormatError(ValueError):
@@ -40,14 +41,20 @@ def direct_text_decision(raw, *, explicit=False, image_keys=(), tool_calls=(), r
     return {'should_reply':True,'actions':[{'type':'text','text':raw}]}
 
 
-async def guarded_chat(engine,messages,*,diagnostics,stage,**options):
+_UNSET = object()
+
+
+async def guarded_chat(engine,messages,*,diagnostics,stage,initial_raw=_UNSET,**options):
     """No additional model request on valid output; never execute a tool here."""
     options={**options,'response_format':{'type':'json_object'}}
     started=time.monotonic()
-    raw=await engine.chat(messages,**options)
+    raw=await engine.chat(messages,**options) if initial_raw is _UNSET else initial_raw
     attempt={'stage':stage,'seconds':round(time.monotonic()-started,3),
              'reply_chars':len(raw or ''),'ok':False}
     diagnostics.setdefault('tool_reply_stages',[]).append(attempt)
+    if not raw and content_filter_error(engine):
+        diagnostics['model_blocked']={'code':'content_filter','stage':stage,'retryable':False}
+        raise ContentFilteredResponse(stage)
     try:
         value=decision(raw)
     except (TypeError,ValueError) as exc:
@@ -67,6 +74,10 @@ async def guarded_chat(engine,messages,*,diagnostics,stage,**options):
                 '未执行的图片选择仍可从已给出的候选中选；工具已经返回结果时不要重复该请求。')}]
         repair_options={**options,'operation':'tool_followup'}
         repaired=await engine.chat(repair_messages,**repair_options)
+        if not repaired and content_filter_error(engine):
+            attempt['repair_ok']=False
+            diagnostics['model_blocked']={'code':'content_filter','stage':stage,'retryable':False}
+            raise ContentFilteredResponse(stage)
         try:
             value=decision(repaired)
         except (TypeError,ValueError) as repair_error:

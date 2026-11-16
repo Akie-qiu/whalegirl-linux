@@ -542,5 +542,41 @@ class ImageToolTests(unittest.IsolatedAsyncioTestCase):
         _, context = self.images.tools.context(followup, [followup])
         self.assertEqual(context['search_query'], source['content'])
 
+    def test_detailed_prompt_and_unlimited_text_length_for_all_generation_requests(self):
+        from whalegirl_linux.app import ImageTaskRequest
+        from whalegirl_linux.moments import _reconcile_world_image_prompt
+
+        static = self.images.tools.static_prompt(include_catalog=False)
+        self.assertIn('【全部生图请求·精细画面描述】', static)
+        self.assertIn('【去掉生图文字与字数限制】', static)
+        self.assertIn('不限制图内文字的字数或语种', static)
+
+        long_prompt = '海边暮色蓝发少女穿针织开衫回眸微笑，海风吹起发丝与裙摆，金色晚霞与霓虹招牌写着长段欢迎光临标语。' * 120
+        self.assertGreater(len(long_prompt), 4500)
+
+        # 1. Chat generate_image accepts >3000-char fine prompts without scene_unclear or truncation
+        first = self.message('画一张超精细长描述插画')
+        res = self.execute(first, {'tool': 'generate_image', 'subject_type': 'other', 'scene_prompt': long_prompt})
+        self.assertTrue(res['ok'], res)
+        job = self.images.get(res['job_id'])
+        self.assertEqual(job['prompt'], long_prompt)
+
+        # 2. Console API request model accepts >3000-char prompts
+        req_model = ImageTaskRequest(kind='generate', prompt=long_prompt, unrestricted=True)
+        self.assertEqual(len(req_model.prompt), len(long_prompt))
+
+        # 3. request_prompt avoids 14000-char truncation and keeps fine-detail & text-unlimited instructions
+        super_long = long_prompt * 4
+        self.assertGreater(len(super_long), 18000)
+        plan = {'canvas': {'size': '1024x1024', 'aspect_ratio': '1:1'}, 'mode': 'auto'}
+        rendered = self.images.references.request_prompt(super_long, plan, [])
+        self.assertGreater(len(rendered), 18000)
+        self.assertIn(super_long, rendered)
+        self.assertIn('【精细刻画要求】', rendered)
+
+        # 4. Moments world prompt reconciliation no longer caps at 500 chars
+        reconciled = _reconcile_world_image_prompt('两格漫画，' + long_prompt, {'panels': [{'shot': '中景'}, {'shot': '近景'}]})
+        self.assertGreater(len(reconciled), 4500)
+
 
 if __name__=='__main__':unittest.main()

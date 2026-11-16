@@ -98,6 +98,50 @@ class StickerLibrary:
             (account,md5,actor,operation,reason,before_json,after_json,created) VALUES(?,?,?,?,?,?,?,?)''',
             (account, md5, actor, operation, reason, json.dumps(old), json.dumps(value), time.time()))
 
+    def fresh_collected_bonus(self, account, chat='', *, max_age_hours=72):
+        if not account:
+            return {}
+        since = time.time() - max(1, int(max_age_hours)) * 3600
+        try:
+            rows = self.store.db.execute(
+                '''SELECT md5, chat FROM sticker_candidates
+                   WHERE account=? AND state='collected' AND created>=?
+                   ORDER BY (chat=?) DESC, created DESC LIMIT 36''',
+                (account, since, chat or ''),
+            ).fetchall()
+        except Exception:
+            return {}
+        bonus = {}
+        for row in rows:
+            md5 = row['md5']
+            if md5 not in bonus:
+                bonus[md5] = 2 if (chat and row['chat'] == chat) else 1
+        return bonus
+
+    def apply_inflight_cooldown(self, account, chat, cooldown, history):
+        if not account or not chat or not cooldown or float(cooldown) <= 0:
+            return history
+        since = time.time() - max(float(cooldown), 60.0)
+        try:
+            rows = self.store.db.execute(
+                '''SELECT details_json, sent_at FROM outbound_actions
+                   WHERE account=? AND chat=? AND kind='sticker' AND state IN ('sending','uncertain','sent')
+                     AND sent_at>=?''',
+                (account, chat, since),
+            ).fetchall()
+        except Exception:
+            return history
+        for row in rows:
+            try:
+                md5 = str((json.loads(row['details_json'] or '{}')).get('md5') or '').strip()
+            except (ValueError, TypeError, AttributeError):
+                md5 = ''
+            if md5:
+                item = history.setdefault(md5, {'count': 1, 'last': float(row['sent_at'] or 0), 'recent': True})
+                item['recent'] = True
+                item['last'] = max(float(item.get('last') or 0), float(row['sent_at'] or 0))
+        return history
+
     def change(self, account, md5, operation, reason='', *, actor='admin', version=None, settings=None, chat=''):
         if operation not in ('enable','disable','pin','unpin') or not re.fullmatch('[0-9a-f]{32}', md5):
             raise ValueError('表情操作或身份无效')
@@ -379,7 +423,7 @@ class StickerLibrary:
                             '"tone":"语气/反讽","use_when":"具体适用场景","avoid_when":"易误用场景",'
                             '"example":"适合回应的话","persona_fit":"与当前人设的契合点",'
                             '"usage_scope":"群聊/私聊/均可，具体边界"}}。各项不超过100字，不能辨认就说不能辨认。'),
-                            max_tokens=850,response_format={'type':'json_object'}, operation='sticker')
+                            max_tokens=1600,response_format={'type':'json_object'}, operation='sticker')
                         result=parse_json(answer)
                         profile=result.get('profile') or {}
                         if not isinstance(profile,dict) or not str(profile.get('meaning','')).strip():

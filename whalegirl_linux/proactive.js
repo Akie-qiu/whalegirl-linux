@@ -148,6 +148,17 @@
       });
       const advanced = document.createElement('details'), summary = document.createElement('summary');
       summary.textContent = '单独暂停主动联系';advanced.append(summary,p,button);
+      const privateState = latest?.chats?.[id];
+      if (!id.endsWith('@chatroom') && privateState) {
+        const initiative = document.createElement('p'); initiative.className = 'hint';
+        const next = Number(privateState.private_idle_at || 0) * 1000;
+        initiative.textContent = paused ? '主动私聊当前已暂停' : privateState.waiting_for_reply ?
+          '上次主动联系尚未收到回复，暂不追发；已安排的后续事项仍可判断' : !next ?
+          '等待这个私聊的真实交流记录' : next > Date.now() ?
+          '空闲判断时间：' + new Date(next).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'}) + ' · 到时由 AI 决定是否开口' :
+          '已到私聊空闲判断时间 · 仍遵守时段、额度和暂停规则，AI 可以选择沉默';
+        row.append(initiative);
+      }
       row.append(quietLine,quietButton,advanced); box.append(row);
     }
     if (!cfg.allowed_chat_ids.length) box.textContent = '先在“会话与唤醒”授权群聊或联系人';

@@ -4,6 +4,8 @@ import json
 import math
 import time
 import uuid
+from .usage_context import CURRENT_USAGE
+from .usage_pricing import quote
 
 TZ=timezone(timedelta(hours=8))
 FIELDS=('input_tokens','output_tokens','total_tokens','cached_tokens','uncached_tokens','cache_write_tokens','reasoning_tokens')
@@ -19,6 +21,8 @@ def normalize_usage(raw,style='openai'):
     output=count(raw.get('completion_tokens',raw.get('output_tokens')))
     details=raw.get('prompt_tokens_details') or raw.get('input_tokens_details') or {}
     completion=raw.get('completion_tokens_details') or raw.get('output_tokens_details') or {}
+    details=details if isinstance(details,dict) else {}
+    completion=completion if isinstance(completion,dict) else {}
     cached=count(raw.get('prompt_cache_hit_tokens',details.get('cached_tokens',raw.get('cache_read_input_tokens'))))
     write=count(raw.get('cache_creation_input_tokens',details.get('cache_write_tokens',details.get('cache_creation_tokens'))))
     miss=count(raw.get('prompt_cache_miss_tokens'))
@@ -29,7 +33,11 @@ def normalize_usage(raw,style='openai'):
         miss=max(0,prompt-cached-(write or 0))
     total=count(raw.get('total_tokens'))
     if total is None and prompt is not None and output is not None:total=prompt+output
-    result=dict(zip(FIELDS,(prompt,output,total,cached,miss,write,count(completion.get('reasoning_tokens')))))
+    reasoning=count(completion.get('reasoning_tokens'))
+    if reasoning is None:reasoning=count(raw.get('reasoning_tokens'))
+    # Reasoning is already part of completion/output. A configured thinking
+    # budget is a limit, never evidence of tokens consumed or an extra charge.
+    result=dict(zip(FIELDS,(prompt,output,total,cached,miss,write,reasoning)))
     details=raw.get('cost_details') if isinstance(raw.get('cost_details'),dict) else {}
     cost=raw.get('cost',details.get('total_cost'))
     if isinstance(cost,(int,float)) and not isinstance(cost,bool) and math.isfinite(cost) and cost>=0:
@@ -53,6 +61,10 @@ class TokenLedger:
                 CREATE TABLE IF NOT EXISTS model_token_details(id TEXT PRIMARY KEY,
                     estimated_fields TEXT NOT NULL DEFAULT '[]',cost_value REAL,
                     cost_currency TEXT NOT NULL DEFAULT '',cost_estimated INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS model_usage_context(id TEXT PRIMARY KEY,
+                    account TEXT NOT NULL,chat TEXT NOT NULL DEFAULT '',decision_id TEXT NOT NULL DEFAULT '',
+                    stage TEXT NOT NULL DEFAULT '',pricing_json TEXT NOT NULL DEFAULT '{}');
+                CREATE INDEX IF NOT EXISTS model_usage_context_chat ON model_usage_context(account,chat);
             ''')
             store.db.execute('INSERT OR IGNORE INTO model_token_meta VALUES(?,?)',('started_at',time.time()))
             columns={row[1] for row in store.db.execute('PRAGMA table_info(model_token_usage)')}
@@ -65,6 +77,10 @@ class TokenLedger:
     def record(self,account,event):
         values=[event.get(k) for k in FIELDS]
         identity=event.get('id') or uuid.uuid4().hex
+        try:
+            price=quote(event)
+        except (TypeError,ValueError,OverflowError):
+            price={'status':'unknown','reason':'计价字段异常，保留原始用量，不猜测金额'}
         with self.store.lock,self.store.db:
             self.store.db.execute('INSERT INTO model_token_usage(id,account,created,provider,model,operation,status,elapsed_ms,'+
                 ','.join(FIELDS)+') VALUES('+','.join('?' for _ in range(15))+')',
@@ -75,6 +91,12 @@ class TokenLedger:
                 self.store.db.execute('INSERT INTO model_token_details VALUES(?,?,?,?,?)',
                     (identity,json.dumps(event.get('estimated_fields') or []),event.get('cost_value'),
                      str(event.get('cost_currency') or '')[:24],int(bool(event.get('cost_estimated')))))
+            context=CURRENT_USAGE.get()
+            context=context if context.get('account')==account else {}
+            self.store.db.execute('INSERT INTO model_usage_context VALUES(?,?,?,?,?,?)',
+                (identity,account,str(context.get('chat') or '')[:200],context.get('decision_id',''),
+                 str(event.get('stage') or event.get('operation') or 'chat')[:100],
+                 json.dumps(price,ensure_ascii=False)))
             self._cache.clear()
         return identity
 

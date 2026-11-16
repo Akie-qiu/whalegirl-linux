@@ -24,11 +24,11 @@ def folder(prefix):
 class ReplyExpressionTests(unittest.TestCase):
     def test_style_controls_preserve_scope_and_respect_single_action_limit(self):
         settings=Settings()
-        self.assertIn('温暖、愿意搭话',warmth_prompt(settings))
-        self.assertIn('群聊用公开场合的朋友语气',warmth_prompt(settings))
+        self.assertIn('温暖',warmth_prompt(settings))
+        self.assertIn('具体关系',warmth_prompt(settings))
         self.assertNotIn('也可只回“？”',habit_prompt(settings,{}))
         choices={'a'*32:'一起庆祝'}
-        self.assertIn('直接写入actions',sticker_prompt(settings,choices,{}))
+        self.assertIn('"type":"sticker"',sticker_prompt(settings,choices,{}))
         self.assertEqual(sticker_prompt(settings,{},{}),'')
         self.assertNotIn('客户端在有合适候选时按',sticker_prompt(settings,choices,{}))
         self.assertIn('只能选择文字或表情',sticker_prompt(settings.model_copy(update={'reply_max_parts':1}),choices,{}))
@@ -91,7 +91,8 @@ class ReplyExpressionRuntimeTests(unittest.IsolatedAsyncioTestCase):
             engine.chat=chat
             await runtime.process_next()
             self.assertEqual(engine.calls,1)
-            self.assertIn('温暖、愿意搭话',seen[0]);self.assertIn('直接写入actions',seen[0])
+            self.assertIn('温暖',seen[0]);self.assertIn('"type":"sticker"',seen[0])
+            self.assertIn('当前是公开群聊',seen[0])
             self.assertEqual([s[0] for s in gateway.sent],['text'])
             metrics=json.loads(store.db.execute('SELECT metrics FROM reply_metrics WHERE key=?',(event['key'],)).fetchone()[0])
             self.assertEqual(metrics['sticker_pairing']['result'],'model_planned')

@@ -13,6 +13,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 from websockets.asyncio.client import connect
+from .ui_lock import PriorityUILock
 
 
 @dataclass
@@ -28,6 +29,20 @@ class Receipt:
     attempts: int = 1
     retryable: bool = True
     details: dict = field(default_factory=dict)
+
+    @property
+    def sticker_pre_send_failure(self):
+        """An optional sticker picker failed before any native send click."""
+        return (self.definite_failure and isinstance(self.details, dict)
+                and self.details.get('kind') == 'sticker'
+                and self.details.get('submit_state') == 'failed_before_send')
+
+    @property
+    def sticker_misdelivered(self):
+        """WeChat sent a different favorite than requested; it is already visible."""
+        return (self.definite_failure and isinstance(self.details, dict)
+                and self.details.get('kind') == 'sticker'
+                and bool(self.details.get('wrong_sticker_md5')))
 
 
 class UIJobError(ValueError):
@@ -61,12 +76,14 @@ class AgentGateway:
         self.login = {"state": "idle", "qrDataUrl": "", "message": "点击获取二维码"}
         self.login_task = None
         self.control_directory = Path(control_directory) if control_directory else None
-        self.ui_lock = asyncio.Lock()
+        self.ui_lock = PriorityUILock()
         self.inflight_sends = set()
         job_path=os.environ.get('WHALEGIRL_UI_JOBS_DIR')
         self.ui_jobs_directory=Path(job_path) if job_path else None
         self.native_reader = None
         self.native_reader_endpoint = None
+        self.native_requests = set()
+        self._closing = False
         self._status_task = None
         self._status_cache = None
         self._status_at = 0.0
@@ -85,21 +102,39 @@ class AgentGateway:
         if value.get('ok') is not True:
             completed=(operation=='reset_ui' and result.get('state')=='recovered' and result.get('main_ready') is True
                        or operation=='open_chat' and result.get('state')=='done'
-                       or operation=='send_session' and result.get('state')=='done' and result.get('session_complete') is True)
+                       or operation=='send_session' and result.get('state')=='done' and result.get('session_complete') is True
+                       or operation in ('send_text','send_sticker','send_image','send_pat') and result.get('state') in ('submitted','done'))
             if (value.get('error')=='No action selected' and completed and result.get('operation')==operation
                     and result.get('chat')==chat and not result.get('error')):
                 # Native completion can precede the planner. Session completion
                 # is transport-only; every message still needs its DB receipt.
-                result['transport_warning']='planner_exhausted_after_native_completion'
+                result['transport_warning']=('planner_exhausted_after_native_submission'
+                    if result.get('state')=='submitted' else 'planner_exhausted_after_native_completion')
             else:
                 raise UIJobError(str(result.get('error') or value.get('error') or 'Native UI job failed')[:200],result.get('state',''))
         result['job_id'] = nonce
         return result
 
     @asynccontextmanager
-    async def send_turn(self,chat,allowed):
+    async def send_turn(self,chat,allowed,prewarmed=None,max_age=20.0):
         from .fast_send import CURRENT,FastSendSession
-        session=FastSendSession(self,chat,allowed);token=CURRENT.set(session)
+        session=None
+        rejection='destination_changed'
+        if prewarmed is not None:
+            if getattr(prewarmed,'chat','')==chat:
+                prewarmed.allowed=allowed
+                rejection=prewarmed.unusable_reason(max_age)
+                if not rejection:
+                    session=prewarmed
+                    session.stats['prewarmed']=True
+            if session is None:
+                await prewarmed.close()
+        if session is None:
+            session=FastSendSession(self,chat,allowed)
+            if prewarmed is not None:
+                session.stats['prewarmed_expired']=True
+                session.stats['prewarm_rejection']=rejection
+        token=CURRENT.set(session)
         try:yield session
         finally:
             try:await session.close()
@@ -204,16 +239,44 @@ class AgentGateway:
         rows=await self.messages(chat,limit=1,server_id=str(server_id))
         return next((m for m in rows if str(m.get('serverId'))==str(server_id)),None)
 
+    async def _refresh_group_members(self,chat):
+        try:
+            value = await self.native_request('/members',chat=chat)
+            if isinstance(value,dict) and 'members' in value:
+                self._members_cache[chat] = (time.monotonic(),value.get('members',[]))
+        except Exception:
+            pass
+        finally:
+            tasks=getattr(self,'_members_refresh_tasks',None)
+            if isinstance(tasks,dict):tasks.pop(chat,None)
+
     async def group_members(self,chat):
         if not chat.endswith('@chatroom') or not self.ui_jobs_directory:return []
+        now = time.monotonic()
         cached = self._members_cache.get(chat)
-        if cached and time.monotonic()-cached[0]<60:return cached[1]
+        if cached:
+            age = now - cached[0]
+            if age < 300:return cached[1]
+            if age < 1800:
+                tasks=getattr(self,'_members_refresh_tasks',None)
+                if not isinstance(tasks,dict):
+                    tasks={}
+                    self._members_refresh_tasks=tasks
+                task=tasks.get(chat)
+                if task is None or task.done():
+                    try:
+                        tasks[chat]=asyncio.create_task(self._refresh_group_members(chat))
+                    except RuntimeError:
+                        pass
+                return cached[1]
         value = await self.native_request('/members',chat=chat)
         rows = value.get('members',[])
         self._members_cache[chat] = (time.monotonic(),rows)
         return rows
 
     async def native_request(self, route, **params):
+        if self._closing:
+            raise httpx.ReadError('Native reader is closing')
         if not self.ui_jobs_directory:return {}
         name=(self.ui_jobs_directory/'native-read.endpoint').read_text().strip()
         if not re.fullmatch(r'native-read-\d+\.sock',name):raise ValueError('Invalid native read socket')
@@ -223,7 +286,16 @@ class AgentGateway:
             self.native_reader=httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=endpoint),
                                                 base_url='http://localhost',timeout=6,trust_env=False)
             self.native_reader_endpoint=endpoint
-        response=await self.native_reader.get(route,params=params)
+        request = asyncio.create_task(self.native_reader.get(route, params=params))
+        self.native_requests.add(request)
+        def finished(task):
+            self.native_requests.discard(task)
+            if not task.cancelled():
+                task.exception()  # Also consume failures if the caller was cancelled.
+        request.add_done_callback(finished)
+        # Cancelling a poll at shutdown must not cancel a Unix-socket readiness
+        # future while its event-loop callback is already queued.
+        response = await asyncio.shield(request)
         response.raise_for_status()
         return response.json()
 
@@ -282,6 +354,17 @@ class AgentGateway:
             return Receipt(False,error='原生图片发送尚未配置',definite_failure=True)
         from .delivery import send_native
         return await send_native(self, 'image', chat, asset_id=asset_id)
+
+    async def send_pat(self, chat, target_id, target_name=''):
+        tid = str(target_id or '').strip()
+        if not tid:
+            return Receipt(False, error='无效的拍一拍目标', definite_failure=True, retryable=False,
+                           details={'kind': 'pat', 'pat_skipped': True})
+        if not self.ui_jobs_directory:
+            return Receipt(False, error='当前网关不支持原生拍一拍', definite_failure=True, retryable=False,
+                           details={'kind': 'pat', 'pat_skipped': True})
+        from .delivery import send_native
+        return await send_native(self, 'pat', chat, target_id=tid, target_name=str(target_name or '').strip()[:80])
 
     async def send(self, chat, text, *, quote_to=None, mentions=None):
         mentions = list(mentions or [])[:3] if chat.endswith('@chatroom') else []
@@ -477,6 +560,7 @@ class AgentGateway:
             self.login.update(state="error", message=f"登录通道异常：{type(exc).__name__}")
 
     async def close(self):
+        self._closing = True
         if self.login_task:
             self.login_task.cancel()
             await asyncio.gather(self.login_task, return_exceptions=True)
@@ -485,5 +569,11 @@ class AgentGateway:
         if self._status_task:
             await asyncio.gather(self._status_task, return_exceptions=True)
         if self.native_reader:
+            if self.native_requests:
+                _, pending = await asyncio.wait(tuple(self.native_requests), timeout=8)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
             await self.native_reader.aclose()
         await self.client.aclose()
